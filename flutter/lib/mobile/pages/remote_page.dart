@@ -1178,6 +1178,10 @@ void showOptions(
   List<TRadioMenu<String>> imageQualityRadios =
       await toolbarImageQuality(context, id, gFFI);
   List<TRadioMenu<String>> codecRadios = await toolbarCodec(context, id, gFFI);
+  List<TRadioMenu<String>> qualityMonitorRadios =
+      await toolbarQualityMonitorPosition(gFFI);
+  List<TRadioMenu<String>> clipboardRadios =
+      await toolbarClipboardDirection(gFFI);
   List<TToggleMenu> cursorToggles = await toolbarCursor(context, id, gFFI);
   List<TToggleMenu> displayToggles =
       await toolbarDisplayToggle(context, id, gFFI);
@@ -1199,6 +1203,25 @@ void showOptions(
         (imageQualityRadios.isNotEmpty ? imageQualityRadios[0].groupValue : '')
             .obs;
     var codec = (codecRadios.isNotEmpty ? codecRadios[0].groupValue : '').obs;
+    var qualityMonitor = (qualityMonitorRadios.isNotEmpty
+            ? qualityMonitorRadios[0].groupValue
+            : '')
+        .obs;
+    var clipboard =
+        (clipboardRadios.isNotEmpty ? clipboardRadios[0].groupValue : '').obs;
+    Widget radioSectionTitle(String label) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: Padding(
+          padding: const EdgeInsets.only(top: 4, bottom: 4),
+          child: Text(
+            translate(label),
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
+        ),
+      );
+    }
+
     final radios = [
       for (var e in viewStyleRadios)
         Obx(() => getRadio<String>(
@@ -1240,6 +1263,32 @@ void showOptions(
                   }
                 : null)),
       if (codecRadios.isNotEmpty) const Divider(color: MyTheme.border),
+      if (qualityMonitorRadios.isNotEmpty) radioSectionTitle('Quality monitor'),
+      for (var e in qualityMonitorRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            qualityMonitor.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) qualityMonitor.value = v;
+                  }
+                : null)),
+      if (qualityMonitorRadios.isNotEmpty) const Divider(color: MyTheme.border),
+      if (clipboardRadios.isNotEmpty) radioSectionTitle('Clipboard'),
+      for (var e in clipboardRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            clipboard.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) clipboard.value = v;
+                  }
+                : null)),
+      if (clipboardRadios.isNotEmpty) const Divider(color: MyTheme.border),
     ];
     final rxCursorToggleValues = cursorToggles.map((e) => e.value.obs).toList();
     final cursorTogglesList = cursorToggles
