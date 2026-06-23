@@ -14,6 +14,7 @@ What changed in this pass:
 - `rustadmin_revision.txt` was bumped to `015`.
 - Android release APK built successfully: `RustAdmin_Android_Release_2.0.2.015.apk`, size `26,495,371` bytes, sha256 `982d7214181a4570cc55ad423bcba975897e71591cc780c94a8adc6ad4356187`.
 - Android release ZIP built successfully: `RustAdmin_Android_Release_2.0.2.015.zip`, size `25,913,831` bytes, sha256 `6dba5aca60840b0c1d4fc1d214033b860777c2b5faa212644c6d5f03b58a2536`.
+- Windows release archive built successfully on VM `192.168.189.137`: `RustAdmin_Release_2.0.2.015.zip`, size `41,221,479` bytes, sha256 `c6e8413e722a7624ceb5d33973899dd32dac1b89236e044f914b0a2781f6ec0b`.
 - Follow-up from Android connection testing: revision `014` removes the remaining left-button release event from empty OS activation. Empty activation now sends only no-button wake/move events, so ordinary connects should not deliver either a right click or a left click to an unlocked host desktop.
 - `rustadmin_revision.txt` was bumped to `014`.
 - Android release APK built successfully: `RustAdmin_Android_Release_2.0.2.014.apk`, size `25,564,856` bytes, sha256 `4d3eabb7d156a69031fed4f4a25f8e273b50667a81f096e159a668c2e1a64138`.
@@ -65,10 +66,10 @@ Recent verification:
 - `dart analyze lib/consts.dart lib/common/widgets/toolbar.dart lib/models/model.dart lib/mobile/pages/remote_page.dart lib/mobile/pages/settings_page.dart`: passed with info/deprecation warnings only.
 - Android Rust library built for `aarch64-linux-android` with `flutter,hwcodec,mediacodec`, then copied and stripped into `flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so`.
 - Android revision `015` APK verified with `apksigner verify --verbose`; `aapt dump badging` reports `versionName='2.0.2'`, `versionCode='2202'`, native code `arm64-v8a`, and `unzip -l` shows `lib/arm64-v8a/librustdesk.so` and `lib/arm64-v8a/libc++_shared.so`.
-- Windows revision `011` archive copied back from the VM and verified with `unzip -t`; no compressed data errors.
+- Windows revision `015` archive copied back from the VM and verified with `unzip -t`; no compressed data errors. `librustdesk.dll` contains `2.0.2 rev 015`, `connection_type`, and the TCP-only local connection diagnostic string.
 - `cargo check --lib --no-default-features`: blocked by the same missing `gstreamer-1.0` pkg-config dependency.
 
-Latest Windows test build is `RustAdmin_Release_2.0.2.011.zip`; latest Android test build is `RustAdmin_Android_Release_2.0.2.015.apk`.
+Latest Windows test build is `RustAdmin_Release_2.0.2.015.zip`; latest Android test build is `RustAdmin_Android_Release_2.0.2.015.apk`.
 
 Earlier capture-backend menu test details:
 
