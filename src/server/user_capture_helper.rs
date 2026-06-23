@@ -9,7 +9,12 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
-use winapi::um::{handleapi::CloseHandle, processthreadsapi::GetCurrentProcessId, winnt::HANDLE};
+use winapi::um::{
+    handleapi::CloseHandle,
+    minwinbase::STILL_ACTIVE,
+    processthreadsapi::{GetCurrentProcessId, GetExitCodeProcess},
+    winnt::HANDLE,
+};
 
 pub const ARG: &str = "--user-capture-helper";
 pub const SHMEM_ARG_PREFIX: &str = "--user-capture-helper-shmem-name=";
@@ -455,6 +460,17 @@ pub mod client {
             let shmem_name = next_shmem_name();
             let shmem_size = shmem_size_for_display(width, height);
             let shmem = crate::portable_service::SharedMemory::create(&shmem_name, shmem_size)?;
+            if let Ok(flink) = shmem_flink_path(&shmem_name) {
+                if let Err(err) =
+                    crate::platform::windows::grant_user_capture_helper_shmem_file_access(&flink)
+                {
+                    log::warn!(
+                        "Failed to grant user capture helper shared-memory access for {:?}: {}",
+                        flink,
+                        err
+                    );
+                }
+            }
             unsafe {
                 libc::memset(shmem.as_ptr() as _, 0, shmem.len());
             }
@@ -528,6 +544,15 @@ pub mod client {
             command.current_display = self.current_display;
             write_command(&self.shmem, command);
         }
+
+        fn helper_exited(&self) -> bool {
+            if self.process.is_null() {
+                return true;
+            }
+            let mut exit_code = 0;
+            let ok = unsafe { GetExitCodeProcess(self.process, &mut exit_code) };
+            ok == 0 || exit_code != STILL_ACTIVE
+        }
     }
 
     impl Drop for UserCaptureHelperCapturer {
@@ -576,6 +601,10 @@ pub mod client {
                 STATUS_ERROR => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "user capture helper backend error",
+                )),
+                _ if self.helper_exited() => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "user capture helper exited",
                 )),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
