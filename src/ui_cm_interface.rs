@@ -186,6 +186,10 @@ pub trait InvokeUiCM: Send + Clone + 'static + Sized {
 
     fn new_message(&self, id: i32, text: String);
 
+    fn permission_update(&self, id: i32, name: String, enabled: bool);
+
+    fn permission_request(&self, id: i32, request_id: u64, name: String, enabled: bool);
+
     fn change_theme(&self, dark: String);
 
     fn change_language(&self);
@@ -209,6 +213,29 @@ impl<T: InvokeUiCM> DerefMut for ConnectionManager<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.ui_handler
     }
+}
+
+fn set_client_permission(client: &mut Client, name: &str, enabled: bool) -> bool {
+    match name {
+        "keyboard" => client.keyboard = enabled,
+        "clipboard" => client.clipboard = enabled,
+        "audio" => client.audio = enabled,
+        "file" => client.file = enabled,
+        "restart" => client.restart = enabled,
+        "recording" => client.recording = enabled,
+        "block_input" => client.block_input = enabled,
+        _ => return false,
+    }
+    true
+}
+
+fn update_client_permission(id: i32, name: &str, enabled: bool) -> bool {
+    CLIENTS
+        .write()
+        .unwrap()
+        .get_mut(&id)
+        .map(|client| set_client_permission(client, name, enabled))
+        .unwrap_or(false)
 }
 
 impl<T: InvokeUiCM> ConnectionManager<T> {
@@ -262,6 +289,18 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
             .unwrap()
             .retain(|_, c| !(c.disconnected && c.peer_id == client.peer_id));
         CLIENTS.write().unwrap().insert(id, client.clone());
+        log::info!(
+            "Connection manager added connection {}: authorized={}, permissions: keyboard={}, clipboard={}, audio={}, file={}, restart={}, recording={}, block_input={}",
+            id,
+            authorized,
+            keyboard,
+            clipboard,
+            audio,
+            file,
+            restart,
+            recording,
+            block_input
+        );
         self.ui_handler.add_connection(&client);
     }
 
@@ -398,6 +437,26 @@ pub fn switch_permission(id: i32, name: String, enabled: bool) {
 }
 
 #[inline]
+#[cfg(not(any(target_os = "ios")))]
+#[cfg_attr(not(feature = "flutter"), allow(dead_code))]
+pub fn respond_permission_request(
+    id: i32,
+    request_id: u64,
+    name: String,
+    enabled: bool,
+    approved: bool,
+) {
+    if let Some(client) = CLIENTS.read().unwrap().get(&id) {
+        allow_err!(client.tx.send(Data::PermissionRequestResult {
+            request_id,
+            name,
+            enabled,
+            approved,
+        }));
+    };
+}
+
+#[inline]
 #[cfg(target_os = "android")]
 pub fn switch_permission_all(name: String, enabled: bool) {
     for (_, client) in CLIENTS.read().unwrap().iter() {
@@ -424,7 +483,7 @@ pub fn get_clients_length() -> usize {
 
 #[inline]
 #[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn switch_back(id: i32) {
     if let Some(client) = CLIENTS.read().unwrap().get(&id) {
         allow_err!(client.tx.send(Data::SwitchSidesBack));
@@ -515,12 +574,15 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     break;
                                 }
                                 Data::Close => {
-                                    log::info!("cm ipc connection closed from connection request");
+                                    log::info!(
+                                        "cm ipc connection closed from connection request: conn_id={}",
+                                        self.conn_id
+                                    );
                                     break;
                                 }
                                 Data::Disconnected => {
                                     self.close = false;
-                                    log::info!("cm ipc connection disconnect");
+                                    log::info!("cm ipc connection disconnect: conn_id={}", self.conn_id);
                                     break;
                                 }
                                 Data::PrivacyModeState((_id, _, _)) => {
@@ -532,6 +594,14 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 }
                                 Data::ChatMessage { text } => {
                                     self.cm.new_message(self.conn_id, text);
+                                }
+                                Data::PermissionUpdate { name, enabled } => {
+                                    if update_client_permission(self.conn_id, &name, enabled) {
+                                        self.cm.permission_update(self.conn_id, name, enabled);
+                                    }
+                                }
+                                Data::PermissionRequest { request_id, name, enabled } => {
+                                    self.cm.permission_request(self.conn_id, request_id, name, enabled);
                                 }
                                 Data::FS(mut fs) => {
                                     if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {
@@ -604,7 +674,12 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 }
                                 #[cfg(target_os = "windows")]
                                 Data::ClipboardNonFile(_) => {
-                                    match crate::clipboard::check_clipboard_cm() {
+                                    let clipboard_result = crate::clipboard::check_clipboard_cm();
+                                    let debug_lines = crate::clipboard::take_clipboard_debug_lines();
+                                    if !debug_lines.is_empty() {
+                                        allow_err!(self.stream.send(&Data::ClipboardDebug(debug_lines)).await);
+                                    }
+                                    match clipboard_result {
                                         Ok(multi_clipoards) => {
                                             let mut raw_contents = bytes::BytesMut::new();
                                             let mut main_data = vec![];
@@ -1274,7 +1349,7 @@ async fn start_read_job(
 /// Process read jobs periodically, reading file blocks and sending them via IPC.
 ///
 /// NOTE: This is the CM-side equivalent of `handle_read_jobs()` in
-/// `libs/hbb_common/src/fs.rs`. The logic mirrors that implementation
+/// `../hbb_common/src/fs.rs`. The logic mirrors that implementation
 /// but communicates via IPC instead of direct network stream.
 /// When modifying job processing logic, ensure both implementations stay in sync.
 #[cfg(not(any(target_os = "ios")))]
@@ -1373,7 +1448,7 @@ async fn handle_read_jobs_tick(
 /// Initialize a read job's data stream and handle digest sending for overwrite detection.
 ///
 /// NOTE: This is the CM-side equivalent of `TransferJob::init_data_stream()` in
-/// `libs/hbb_common/src/fs.rs`. It calls `init_data_stream_for_cm()` and sends
+/// `../hbb_common/src/fs.rs`. It calls `init_data_stream_for_cm()` and sends
 /// digest via IPC instead of direct network stream.
 /// When modifying initialization or digest logic, ensure both paths stay in sync.
 #[cfg(not(any(target_os = "ios")))]

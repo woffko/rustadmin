@@ -33,6 +33,7 @@ use crate::{
 use hbb_common::{
     anyhow::anyhow,
     config,
+    message_proto::option_message::CaptureBackend,
     tokio::sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex as TokioMutex,
@@ -54,13 +55,25 @@ use scrap::{
 #[cfg(windows)]
 use std::sync::Once;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::ErrorKind::WouldBlock,
     ops::{Deref, DerefMut},
     time::{self, Duration, Instant},
 };
 
 pub const OPTION_REFRESH: &'static str = "refresh";
+const ENCODE_NO_VALID_FRAME: &str = "no valid frame";
+const HW_ENCODER_WARMUP_TIMEOUT: Duration = Duration::from_secs(3);
+const HOST_VIDEO_DIAG_INTERVAL: Duration = Duration::from_secs(5);
+const HOST_VIDEO_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+const VIDEO_FRAME_FETCH_WAIT_MAX: Duration = Duration::from_millis(50);
+const VIDEO_FRAME_FETCH_WAIT_MIN: Duration = Duration::from_millis(1);
+#[cfg(windows)]
+const DXGI_STARTUP_GDI_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(windows)]
+const DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(windows)]
+const WGC_STALLED_NO_FRAME_FALLBACK_TIMEOUT: Duration = Duration::from_secs(6);
 
 type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
 type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
@@ -75,9 +88,22 @@ lazy_static::lazy_static! {
     // 2. The client is closing.
     static ref DISPLAY_CONN_IDS: Arc<Mutex<HashMap<usize, HashSet<i32>>>> = Default::default();
     pub static ref VIDEO_QOS: Arc<Mutex<VideoQoS>> = Default::default();
+    pub static ref HOST_VIDEO_DIAG: Arc<Mutex<HostVideoDiagnosticsSnapshot>> = Default::default();
+    static ref CAPTURE_BACKEND_PREFERENCE: Mutex<CaptureBackend> =
+        Mutex::new(CaptureBackend::CaptureBackendAuto);
     pub static ref IS_UAC_RUNNING: Arc<Mutex<bool>> = Default::default();
     pub static ref IS_FOREGROUND_WINDOW_ELEVATED: Arc<Mutex<bool>> = Default::default();
     static ref SCREENSHOTS: Mutex<HashMap<usize, Screenshot>> = Default::default();
+}
+
+#[derive(Clone, Default)]
+pub struct HostVideoDiagnosticsSnapshot {
+    pub fps: String,
+    pub codec: String,
+    pub qos: String,
+    pub wait: String,
+    pub backend: String,
+    pub fallback: String,
 }
 
 struct Screenshot {
@@ -114,6 +140,18 @@ pub fn notify_video_frame_fetched_by_conn_id(conn_id: i32, frame_tm: Option<Inst
             notifier.0.send((conn_id, frame_tm)).ok();
         }
     }
+}
+
+pub fn set_capture_backend_preference(backend: CaptureBackend) {
+    let normalized = match backend {
+        CaptureBackend::CaptureBackendDxgi
+        | CaptureBackend::CaptureBackendWgc
+        | CaptureBackend::CaptureBackendWinMag
+        | CaptureBackend::CaptureBackendGdi => backend,
+        _ => CaptureBackend::CaptureBackendAuto,
+    };
+    *CAPTURE_BACKEND_PREFERENCE.lock().unwrap() = normalized;
+    log::info!("capture backend preference set to {:?}", normalized);
 }
 
 struct VideoFrameController {
@@ -189,6 +227,184 @@ impl VideoFrameController {
                 fetched_conn_ids.insert(id);
             }
         }
+    }
+}
+
+fn video_frame_fetch_wait_timeout_ms(spf: Duration) -> u64 {
+    let wait = if spf > VIDEO_FRAME_FETCH_WAIT_MAX {
+        VIDEO_FRAME_FETCH_WAIT_MAX
+    } else if spf < VIDEO_FRAME_FETCH_WAIT_MIN {
+        VIDEO_FRAME_FETCH_WAIT_MIN
+    } else {
+        spf
+    };
+    wait.as_millis().max(1) as u64
+}
+
+struct HostVideoDiagnostics {
+    last_monitor: Instant,
+    last_log: Instant,
+    valid_capture: usize,
+    invalid_capture: usize,
+    would_block: usize,
+    encode_calls: usize,
+    repeat_encode_calls: usize,
+    sent_batches: usize,
+    sent_targets: usize,
+    empty_send_results: usize,
+    wait_frames: usize,
+    wait_timeouts: usize,
+    wait_total_ms: u128,
+    wait_max_ms: u128,
+}
+
+impl HostVideoDiagnostics {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            last_monitor: now,
+            last_log: now,
+            valid_capture: 0,
+            invalid_capture: 0,
+            would_block: 0,
+            encode_calls: 0,
+            repeat_encode_calls: 0,
+            sent_batches: 0,
+            sent_targets: 0,
+            empty_send_results: 0,
+            wait_frames: 0,
+            wait_timeouts: 0,
+            wait_total_ms: 0,
+            wait_max_ms: 0,
+        }
+    }
+
+    fn record_send_result(&mut self, send_conn_count: usize) {
+        self.encode_calls += 1;
+        if send_conn_count == 0 {
+            self.empty_send_results += 1;
+            return;
+        }
+        self.sent_batches += 1;
+        self.sent_targets += send_conn_count;
+    }
+
+    fn record_wait(&mut self, expected: usize, fetched: usize, elapsed: Duration) {
+        if expected == 0 {
+            return;
+        }
+        let elapsed_ms = elapsed.as_millis();
+        self.wait_frames += 1;
+        self.wait_total_ms += elapsed_ms;
+        self.wait_max_ms = self.wait_max_ms.max(elapsed_ms);
+        if fetched < expected {
+            self.wait_timeouts += 1;
+        }
+    }
+
+    fn maybe_log(
+        &mut self,
+        service_name: &str,
+        source: VideoSource,
+        display_idx: usize,
+        negotiated_codec: CodecFormat,
+        hardware: bool,
+        bitrate: u32,
+        quality: f32,
+        spf: Duration,
+        gdi: bool,
+        backend: &str,
+        fallback: &str,
+    ) {
+        let elapsed = self.last_monitor.elapsed();
+        if elapsed < HOST_VIDEO_MONITOR_INTERVAL {
+            return;
+        }
+        let sample_secs = elapsed.as_secs_f64().max(0.001);
+        let target_fps = if spf.as_nanos() == 0 {
+            0.0
+        } else {
+            1.0 / spf.as_secs_f64()
+        };
+        let capture_fps = self.valid_capture as f64 / sample_secs;
+        let encode_fps = self.encode_calls as f64 / sample_secs;
+        let sent_fps = self.sent_batches as f64 / sample_secs;
+        let wait_avg_ms = if self.wait_frames == 0 {
+            0
+        } else {
+            self.wait_total_ms / self.wait_frames as u128
+        };
+        *HOST_VIDEO_DIAG.lock().unwrap() = HostVideoDiagnosticsSnapshot {
+            fps: format!(
+                "target:{target_fps:.1} cap:{capture_fps:.1} enc:{encode_fps:.1} sent:{sent_fps:.1}"
+            ),
+            codec: format!(
+                "{}#{} {:?} {}",
+                source.service_name_prefix(),
+                display_idx,
+                negotiated_codec,
+                if hardware { "hw" } else { "sw" }
+            ),
+            qos: format!("br:{bitrate} q:{quality:.2} gdi:{gdi}"),
+            wait: format!(
+                "wb:{} inv:{} rep:{} empty:{} wait:{}/{} avg:{} max:{}",
+                self.would_block,
+                self.invalid_capture,
+                self.repeat_encode_calls,
+                self.empty_send_results,
+                self.wait_timeouts,
+                self.wait_frames,
+                wait_avg_ms,
+                self.wait_max_ms
+            ),
+            backend: backend.to_owned(),
+            fallback: fallback.to_owned(),
+        };
+        if self.last_log.elapsed() >= HOST_VIDEO_DIAG_INTERVAL {
+            log::info!(
+                "diag host fps: service={}, source={:?}, display_idx={}, codec={:?}, hardware={}, bitrate={}, quality={:.3}, target_fps={:.1}, capture_fps={:.1}, encode_fps={:.1}, sent_fps={:.1}, gdi={}, backend={}, fallback={}, valid_capture={}, invalid_capture={}, would_block={}, encode_calls={}, repeat_encode_calls={}, sent_batches={}, sent_targets={}, empty_send_results={}, wait_frames={}, wait_timeouts={}, wait_avg_ms={}, wait_max_ms={}",
+                service_name,
+                source,
+                display_idx,
+                negotiated_codec,
+                hardware,
+                bitrate,
+                quality,
+                target_fps,
+                capture_fps,
+                encode_fps,
+                sent_fps,
+                gdi,
+                backend,
+                fallback,
+                self.valid_capture,
+                self.invalid_capture,
+                self.would_block,
+                self.encode_calls,
+                self.repeat_encode_calls,
+                self.sent_batches,
+                self.sent_targets,
+                self.empty_send_results,
+                self.wait_frames,
+                self.wait_timeouts,
+                wait_avg_ms,
+                self.wait_max_ms
+            );
+            self.last_log = Instant::now();
+        }
+        self.last_monitor = Instant::now();
+        self.valid_capture = 0;
+        self.invalid_capture = 0;
+        self.would_block = 0;
+        self.encode_calls = 0;
+        self.repeat_encode_calls = 0;
+        self.sent_batches = 0;
+        self.sent_targets = 0;
+        self.empty_send_results = 0;
+        self.wait_frames = 0;
+        self.wait_timeouts = 0;
+        self.wait_total_ms = 0;
+        self.wait_max_ms = 0;
     }
 }
 
@@ -529,6 +745,256 @@ fn get_capturer(
     }
 }
 
+#[cfg(windows)]
+fn display_for_current(c: &CapturerInfo) -> Option<Display> {
+    let mut displays = match Display::all() {
+        Ok(displays) => displays,
+        Err(err) => {
+            log::warn!("capture backend override failed to enumerate displays: {}", err);
+            return None;
+        }
+    };
+    if displays.len() <= c.current {
+        log::warn!(
+            "capture backend override failed: current={}, display_count={}",
+            c.current,
+            displays.len()
+        );
+        return None;
+    }
+    Some(displays.remove(c.current))
+}
+
+#[cfg(windows)]
+fn apply_capture_backend_preference(
+    c: &mut CapturerInfo,
+    capture_fallback_reason: &mut String,
+) {
+    if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID {
+        return;
+    }
+    let preference = *CAPTURE_BACKEND_PREFERENCE.lock().unwrap();
+    match preference {
+        CaptureBackend::CaptureBackendAuto | CaptureBackend::CaptureBackendNotSet => {}
+        CaptureBackend::CaptureBackendDxgi => {
+            let Some(display) = display_for_current(c) else {
+                return;
+            };
+            match scrap::Capturer::new(display) {
+                Ok(capturer) => {
+                    c.capturer = Box::new(capturer);
+                    *capture_fallback_reason = "manual_dxgi".to_owned();
+                    log::info!(
+                        "capture backend override applied: DXGI, effective_gdi={}",
+                        c.is_gdi()
+                    );
+                }
+                Err(err) => {
+                    log::warn!("capture backend override DXGI failed: {}", err);
+                }
+            }
+        }
+        CaptureBackend::CaptureBackendWgc => {
+            if !scrap::CapturerWgc::is_supported() {
+                log::warn!("capture backend override WGC skipped: unsupported");
+                return;
+            }
+            let Some(display) = display_for_current(c) else {
+                return;
+            };
+            match scrap::CapturerWgc::new(display) {
+                Ok(wgc) => {
+                    c.capturer = Box::new(wgc);
+                    *capture_fallback_reason = "manual_wgc".to_owned();
+                    log::info!("capture backend override applied: WGC");
+                }
+                Err(err) => {
+                    log::warn!("capture backend override WGC failed: {}", err);
+                }
+            }
+        }
+        CaptureBackend::CaptureBackendWinMag => {
+            match scrap::CapturerMag::new(c.origin, c.width, c.height) {
+                Ok(mag) => {
+                    c.capturer = Box::new(mag);
+                    *capture_fallback_reason = "manual_winmag".to_owned();
+                    log::info!(
+                        "capture backend override applied: WinMag, origin={:?}, width={}, height={}",
+                        c.origin,
+                        c.width,
+                        c.height
+                    );
+                }
+                Err(err) => {
+                    log::warn!("capture backend override WinMag failed: {}", err);
+                }
+            }
+        }
+        CaptureBackend::CaptureBackendGdi => {
+            if c.set_gdi() {
+                *capture_fallback_reason = "manual_gdi".to_owned();
+                log::info!("capture backend override applied: GDI");
+            } else {
+                log::warn!("capture backend override GDI failed");
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_set_wgc_fallback(
+    c: &mut CapturerInfo,
+    capture_fallback_reason: &mut String,
+    reason: &str,
+) -> bool {
+    if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID || c.is_wgc() {
+        return false;
+    }
+    if !scrap::CapturerWgc::is_supported() {
+        log::warn!(
+            "capture wgc fallback skipped: reason={}, unsupported",
+            reason
+        );
+        return false;
+    }
+
+    let mut displays = match Display::all() {
+        Ok(displays) => displays,
+        Err(err) => {
+            log::warn!(
+                "capture wgc fallback failed to enumerate displays: reason={}, err={}",
+                reason,
+                err
+            );
+            return false;
+        }
+    };
+    if displays.len() <= c.current {
+        log::warn!(
+            "capture wgc fallback failed: reason={}, current={}, display_count={}",
+            reason,
+            c.current,
+            displays.len()
+        );
+        return false;
+    }
+
+    let display = displays.remove(c.current);
+    match scrap::CapturerWgc::new(display) {
+        Ok(wgc) => {
+            c.capturer = Box::new(wgc);
+            *capture_fallback_reason = reason.to_owned();
+            log::info!("capture wgc fallback enabled: reason={}", reason);
+            true
+        }
+        Err(err) => {
+            log::warn!(
+                "capture wgc fallback failed to create capturer: reason={}, err={}",
+                reason,
+                err
+            );
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_set_magnifier_fallback(
+    c: &mut CapturerInfo,
+    capture_fallback_reason: &mut String,
+    reason: &str,
+) -> bool {
+    if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID || c.is_mag() {
+        return false;
+    }
+    match scrap::CapturerMag::new(c.origin, c.width, c.height) {
+        Ok(mag) => {
+            c.capturer = Box::new(mag);
+            *capture_fallback_reason = reason.to_owned();
+            log::info!(
+                "capture magnifier fallback enabled: reason={}, origin={:?}, width={}, height={}",
+                reason,
+                c.origin,
+                c.width,
+                c.height
+            );
+            true
+        }
+        Err(err) => {
+            log::warn!(
+                "capture magnifier fallback failed: reason={}, origin={:?}, width={}, height={}, err={}",
+                reason,
+                c.origin,
+                c.width,
+                c.height,
+                err
+            );
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_set_gdi_fallback(
+    c: &mut CapturerInfo,
+    capture_fallback_reason: &mut String,
+    reason: &str,
+) -> bool {
+    if c.is_gdi() {
+        *capture_fallback_reason = reason.to_owned();
+        return true;
+    }
+    if c.set_gdi() {
+        *capture_fallback_reason = reason.to_owned();
+        return true;
+    }
+
+    let mut displays = match Display::all() {
+        Ok(displays) => displays,
+        Err(err) => {
+            log::warn!(
+                "capture gdi fallback failed to enumerate displays: reason={}, err={}",
+                reason,
+                err
+            );
+            return false;
+        }
+    };
+    if displays.len() <= c.current {
+        log::warn!(
+            "capture gdi fallback failed: reason={}, current={}, display_count={}",
+            reason,
+            c.current,
+            displays.len()
+        );
+        return false;
+    }
+    let display = displays.remove(c.current);
+    match scrap::Capturer::new(display) {
+        Ok(mut capturer) => {
+            if !capturer.set_gdi() {
+                log::warn!(
+                    "capture gdi fallback failed to enable gdi on recreated capturer: reason={}",
+                    reason
+                );
+                return false;
+            }
+            c.capturer = Box::new(capturer);
+            *capture_fallback_reason = reason.to_owned();
+            log::info!("capture gdi fallback enabled: reason={}", reason);
+            true
+        }
+        Err(err) => {
+            log::warn!(
+                "capture gdi fallback failed to recreate capturer: reason={}, err={}",
+                reason,
+                err
+            );
+            false
+        }
+    }
+}
+
 fn run(vs: VideoService) -> ResultType<()> {
     let mut _raii = Raii::new(vs.idx, vs.sp.name());
     // Wayland only support one video capturer for now. It is ok to call ensure_inited() here.
@@ -564,10 +1030,36 @@ fn run(vs: VideoService) -> ResultType<()> {
     let sp = vs.sp;
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
     #[cfg(windows)]
+    let mut capture_fallback_reason = c.gdi_fallback_reason();
+    #[cfg(windows)]
     if !scrap::codec::enable_directx_capture() && !c.is_gdi() {
         log::info!("disable dxgi with option, fall back to gdi");
-        c.set_gdi();
+        if c.set_gdi() {
+            capture_fallback_reason = "directx_disabled".to_owned();
+        }
     }
+    #[cfg(windows)]
+    if c.is_gdi() && capture_fallback_reason.is_empty() {
+        capture_fallback_reason = "capturer_init_gdi".to_owned();
+    }
+    #[cfg(windows)]
+    apply_capture_backend_preference(&mut c, &mut capture_fallback_reason);
+    #[cfg(windows)]
+    let capturer_is_gdi = c.is_gdi();
+    #[cfg(not(windows))]
+    let capturer_is_gdi = false;
+    log::info!(
+        "diag video service capturer ready: service={}, source={:?}, display_idx={}, current={}, ndisplay={}, origin={:?}, width={}, height={}, gdi={}",
+        sp.name(),
+        vs.source,
+        display_idx,
+        c.current,
+        c.ndisplay,
+        c.origin,
+        c.width,
+        c.height,
+        capturer_is_gdi
+    );
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     let mut spf = video_qos.spf();
     let mut quality = video_qos.ratio();
@@ -610,6 +1102,23 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
     };
     #[cfg(feature = "vram")]
+    let encoder_input_texture = encoder.input_texture();
+    #[cfg(not(feature = "vram"))]
+    let encoder_input_texture = false;
+    log::info!(
+        "diag video service encoder ready: service={}, source={:?}, display_idx={}, negotiated={:?}, cfg={:?}, hardware={}, input_texture={}, bitrate={}, use_i444={}, quality={:?}",
+        sp.name(),
+        vs.source,
+        display_idx,
+        codec_format,
+        encoder_cfg,
+        encoder.is_hardware(),
+        encoder_input_texture,
+        encoder.bitrate(),
+        use_i444,
+        quality
+    );
+    #[cfg(feature = "vram")]
     c.set_output_texture(encoder.input_texture());
     #[cfg(target_os = "android")]
     if vs.source.is_monitor() {
@@ -636,6 +1145,18 @@ fn run(vs: VideoService) -> ResultType<()> {
     #[cfg(windows)]
     let mut try_gdi = 1;
     #[cfg(windows)]
+    let mut dxgi_first_valid_frame = c.is_gdi();
+    #[cfg(windows)]
+    let mut dxgi_startup_gdi_snapshot = false;
+    #[cfg(windows)]
+    let mut dxgi_startup_gdi_snapshot_done = c.is_gdi();
+    #[cfg(windows)]
+    let mut dxgi_no_frame_since: Option<Instant> = None;
+    #[cfg(windows)]
+    let mut wgc_first_valid_frame = c.is_wgc();
+    #[cfg(windows)]
+    let mut wgc_no_frame_since: Option<Instant> = None;
+    #[cfg(windows)]
     log::info!("gdi: {}", c.is_gdi());
     #[cfg(windows)]
     start_uac_elevation_check();
@@ -647,10 +1168,12 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut repeat_encode_counter = 0;
     let repeat_encode_max = 10;
     let mut encode_fail_counter = 0;
+    let mut hw_no_valid_frame_since: Option<Instant> = None;
     let mut first_frame = true;
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+    let mut host_diag = HostVideoDiagnostics::new();
 
     while sp.ok() {
         #[cfg(windows)]
@@ -671,11 +1194,19 @@ fn run(vs: VideoService) -> ResultType<()> {
             log::info!("switch to refresh");
             bail!("SWITCH");
         }
-        if codec_format != Encoder::negotiated_codec() {
+        let negotiated_codec = Encoder::negotiated_codec();
+        if codec_format != negotiated_codec {
             log::info!(
-                "switch due to codec changed, {:?} -> {:?}",
+                "diag video service codec switch requested: service={}, source={:?}, display_idx={}, {:?} -> {:?}, usable={:?}, current_cfg={:?}, hardware={}, bitrate={}",
+                sp.name(),
+                vs.source,
+                display_idx,
                 codec_format,
-                Encoder::negotiated_codec()
+                negotiated_codec,
+                Encoder::usable_encoding(),
+                encoder_cfg,
+                encoder.is_hardware(),
+                encoder.bitrate()
             );
             bail!("SWITCH");
         }
@@ -689,8 +1220,8 @@ fn run(vs: VideoService) -> ResultType<()> {
             bail!("SWITCH");
         }
         #[cfg(all(windows, feature = "vram"))]
-        if c.is_gdi() && encoder.input_texture() {
-            log::info!("changed to gdi when using vram");
+        if (c.is_gdi() || c.is_wgc() || c.is_mag()) && encoder.input_texture() {
+            log::info!("changed to pixel-buffer capture when using vram");
             VRamEncoder::set_fallback_gdi(sp.name(), true);
             bail!("SWITCH");
         }
@@ -717,10 +1248,27 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
+        #[cfg(windows)]
+        let frame_from_gdi = c.is_gdi();
+        #[cfg(windows)]
+        let frame_from_wgc = c.is_wgc();
+        #[cfg(windows)]
+        let frame_from_mag = c.is_mag();
         let res = match c.frame(spf) {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
+                    #[cfg(windows)]
+                    {
+                        if frame_from_wgc {
+                            wgc_first_valid_frame = true;
+                            wgc_no_frame_since = None;
+                        } else if !frame_from_gdi && !frame_from_mag {
+                            dxgi_first_valid_frame = true;
+                            dxgi_no_frame_since = None;
+                        }
+                    }
+                    host_diag.valid_capture += 1;
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&display_idx);
                     if let Some(mut screenshot) = screenshot {
                         let restore_vram = screenshot.restore_vram;
@@ -773,20 +1321,36 @@ fn run(vs: VideoService) -> ResultType<()> {
                         &mut encoder,
                         recorder.clone(),
                         &mut encode_fail_counter,
+                        &mut hw_no_valid_frame_since,
                         &mut first_frame,
                         capture_width,
                         capture_height,
                     )?;
+                    host_diag.record_send_result(send_conn_ids.len());
                     frame_controller.set_send(now, send_conn_ids);
                     send_counter += 1;
+                    #[cfg(windows)]
+                    if dxgi_startup_gdi_snapshot && frame_from_gdi {
+                        if c.cancel_gdi() {
+                            capture_fallback_reason.clear();
+                            dxgi_startup_gdi_snapshot = false;
+                            try_gdi = 1;
+                            dxgi_no_frame_since = Some(Instant::now());
+                            log::info!("startup gdi snapshot sent; returning to dxgi capture");
+                        }
+                    }
+                } else {
+                    host_diag.invalid_capture += 1;
                 }
                 #[cfg(windows)]
                 {
-                    #[cfg(feature = "vram")]
-                    if try_gdi == 1 && !c.is_gdi() {
-                        VRamEncoder::set_fallback_gdi(sp.name(), false);
+                    if dxgi_first_valid_frame {
+                        #[cfg(feature = "vram")]
+                        if try_gdi == 1 && !c.is_gdi() {
+                            VRamEncoder::set_fallback_gdi(sp.name(), false);
+                        }
+                        try_gdi = 0;
                     }
-                    try_gdi = 0;
                 }
                 Ok(())
             }
@@ -795,12 +1359,154 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         match res {
             Err(ref e) if e.kind() == WouldBlock => {
+                host_diag.would_block += 1;
                 #[cfg(windows)]
-                if try_gdi > 0 && !c.is_gdi() {
-                    if try_gdi > 3 {
-                        c.set_gdi();
-                        try_gdi = 0;
-                        log::info!("No image, fall back to gdi");
+                if c.is_wgc() {
+                    let no_frame_elapsed = wgc_no_frame_since
+                        .get_or_insert_with(Instant::now)
+                        .elapsed();
+                    if !wgc_first_valid_frame
+                        && no_frame_elapsed >= DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
+                    {
+                        if try_set_magnifier_fallback(
+                            &mut c,
+                            &mut capture_fallback_reason,
+                            "wgc_no_frame_mag",
+                        ) {
+                            wgc_no_frame_since = None;
+                            try_gdi = 0;
+                            log::info!(
+                                "wgc returned no valid startup frame for {:?}; fall back to magnifier capture",
+                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
+                            );
+                            continue;
+                        }
+                        if try_set_gdi_fallback(
+                            &mut c,
+                            &mut capture_fallback_reason,
+                            "wgc_no_frame",
+                        ) {
+                            wgc_no_frame_since = None;
+                            try_gdi = 0;
+                            log::info!(
+                                "wgc returned no valid startup frame for {:?}; fall back to gdi",
+                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
+                            );
+                            continue;
+                        }
+                    }
+                    if wgc_first_valid_frame
+                        && repeat_encode_counter >= repeat_encode_max
+                        && no_frame_elapsed >= WGC_STALLED_NO_FRAME_FALLBACK_TIMEOUT
+                    {
+                        if try_set_magnifier_fallback(
+                            &mut c,
+                            &mut capture_fallback_reason,
+                            "wgc_stalled_mag",
+                        ) {
+                            wgc_no_frame_since = None;
+                            try_gdi = 0;
+                            log::info!(
+                                "wgc returned no new frame for {:?}; fall back to magnifier capture",
+                                WGC_STALLED_NO_FRAME_FALLBACK_TIMEOUT
+                            );
+                            continue;
+                        }
+                        if try_set_gdi_fallback(&mut c, &mut capture_fallback_reason, "wgc_stalled")
+                        {
+                            wgc_no_frame_since = None;
+                            try_gdi = 0;
+                            log::info!(
+                                "wgc returned no new frame for {:?}; fall back to gdi",
+                                WGC_STALLED_NO_FRAME_FALLBACK_TIMEOUT
+                            );
+                            continue;
+                        }
+                    }
+                    if try_gdi == 1 {
+                        log::info!("wgc returned no new image; keeping wgc active before fallback");
+                    } else if try_gdi % 30 == 0 {
+                        log::info!(
+                            "wgc still has no new image after {} would-block samples",
+                            try_gdi
+                        );
+                    }
+                    try_gdi += 1;
+                } else if try_gdi > 0 && !c.is_gdi() {
+                    let no_frame_elapsed = dxgi_no_frame_since
+                        .get_or_insert_with(Instant::now)
+                        .elapsed();
+                    if !dxgi_first_valid_frame
+                        && !dxgi_startup_gdi_snapshot_done
+                        && start.elapsed() >= DXGI_STARTUP_GDI_SNAPSHOT_TIMEOUT
+                    {
+                        if c.set_gdi() {
+                            capture_fallback_reason = "dxgi_startup_gdi_snapshot".to_owned();
+                            dxgi_startup_gdi_snapshot = true;
+                            dxgi_startup_gdi_snapshot_done = true;
+                            try_gdi = 0;
+                            log::info!(
+                                "dxgi returned no valid startup frame for {:?}; taking one gdi snapshot before returning to dxgi",
+                                DXGI_STARTUP_GDI_SNAPSHOT_TIMEOUT
+                            );
+                            continue;
+                        }
+                    }
+                    if !dxgi_first_valid_frame
+                        && dxgi_startup_gdi_snapshot_done
+                        && !dxgi_startup_gdi_snapshot
+                        && no_frame_elapsed >= DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
+                    {
+                        if try_set_wgc_fallback(
+                            &mut c,
+                            &mut capture_fallback_reason,
+                            "dxgi_no_frame_after_snapshot_wgc",
+                        ) {
+                            dxgi_no_frame_since = Some(Instant::now());
+                            wgc_first_valid_frame = false;
+                            wgc_no_frame_since = Some(Instant::now());
+                            try_gdi = 1;
+                            log::info!(
+                                "dxgi returned no valid frame for {:?} after startup snapshot; fall back to wgc capture",
+                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
+                            );
+                            continue;
+                        } else if try_set_magnifier_fallback(
+                            &mut c,
+                            &mut capture_fallback_reason,
+                            "dxgi_no_frame_after_snapshot_mag",
+                        ) {
+                            dxgi_no_frame_since = None;
+                            try_gdi = 0;
+                            log::info!(
+                                "dxgi returned no valid frame for {:?} after startup snapshot; fall back to magnifier capture",
+                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
+                            );
+                            continue;
+                        }
+                        if try_set_gdi_fallback(
+                            &mut c,
+                            &mut capture_fallback_reason,
+                            "dxgi_no_frame_after_snapshot",
+                        ) {
+                            dxgi_no_frame_since = None;
+                            try_gdi = 0;
+                            log::info!(
+                                "dxgi returned no valid frame for {:?} after startup snapshot; fall back to gdi",
+                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
+                            );
+                            continue;
+                        }
+                    }
+                    if try_gdi == 1 {
+                        log::info!(
+                            "dxgi returned no new image; keeping dxgi active instead of falling back to gdi"
+                        );
+                    } else if try_gdi % 30 == 0 {
+                        log::info!(
+                            "dxgi still has no new image after {} would-block samples; keeping dxgi active",
+                            try_gdi
+                        );
                     }
                     try_gdi += 1;
                 }
@@ -824,6 +1530,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                     // yun.len() > 0 means the frame is not texture.
                     if repeat_encode_counter < repeat_encode_max {
                         repeat_encode_counter += 1;
+                        host_diag.repeat_encode_calls += 1;
                         let send_conn_ids = handle_one_frame(
                             display_idx,
                             &sp,
@@ -832,10 +1539,12 @@ fn run(vs: VideoService) -> ResultType<()> {
                             &mut encoder,
                             recorder.clone(),
                             &mut encode_fail_counter,
+                            &mut hw_no_valid_frame_since,
                             &mut first_frame,
                             capture_width,
                             capture_height,
                         )?;
+                        host_diag.record_send_result(send_conn_ids.len());
                         frame_controller.set_send(now, send_conn_ids);
                         send_counter += 1;
                     }
@@ -849,9 +1558,51 @@ fn run(vs: VideoService) -> ResultType<()> {
                 }
 
                 #[cfg(windows)]
+                if c.is_wgc() {
+                    if try_set_magnifier_fallback(
+                        &mut c,
+                        &mut capture_fallback_reason,
+                        "wgc_error_mag",
+                    ) {
+                        log::info!("wgc capture error, fall back to magnifier: {:?}", err);
+                        continue;
+                    }
+                    if try_set_gdi_fallback(&mut c, &mut capture_fallback_reason, "wgc_error") {
+                        log::info!("wgc capture error, fall back to gdi: {:?}", err);
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+                #[cfg(windows)]
+                if c.is_mag() {
+                    if try_set_gdi_fallback(&mut c, &mut capture_fallback_reason, "mag_error") {
+                        log::info!("magnifier capture error, fall back to gdi: {:?}", err);
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+                #[cfg(windows)]
                 if !c.is_gdi() {
-                    c.set_gdi();
-                    log::info!("dxgi error, fall back to gdi: {:?}", err);
+                    if try_set_wgc_fallback(&mut c, &mut capture_fallback_reason, "dxgi_error_wgc")
+                    {
+                        dxgi_no_frame_since = Some(Instant::now());
+                        wgc_first_valid_frame = false;
+                        wgc_no_frame_since = Some(Instant::now());
+                        try_gdi = 1;
+                        log::info!("dxgi error, fall back to wgc: {:?}", err);
+                        continue;
+                    }
+                    if try_set_magnifier_fallback(
+                        &mut c,
+                        &mut capture_fallback_reason,
+                        "dxgi_error_mag",
+                    ) {
+                        log::info!("dxgi error, fall back to magnifier: {:?}", err);
+                        continue;
+                    }
+                    if try_set_gdi_fallback(&mut c, &mut capture_fallback_reason, "dxgi_error") {
+                        log::info!("dxgi error, fall back to gdi: {:?}", err);
+                    }
                     continue;
                 }
                 return Err(err.into());
@@ -865,18 +1616,19 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
 
         let mut fetched_conn_ids = HashSet::new();
-        let timeout_millis = 3_000u64;
         let wait_begin = Instant::now();
-        while wait_begin.elapsed().as_millis() < timeout_millis as _ {
-            if vs.source.is_monitor() {
-                check_privacy_mode_changed(&sp, display_idx, &c)?;
-            }
-            frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
-            // break if all connections have received current frame
-            if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
-                break;
-            }
+        if vs.source.is_monitor() {
+            check_privacy_mode_changed(&sp, display_idx, &c)?;
         }
+        frame_controller.try_wait_next(
+            &mut fetched_conn_ids,
+            video_frame_fetch_wait_timeout_ms(spf),
+        );
+        host_diag.record_wait(
+            frame_controller.send_conn_ids.len(),
+            fetched_conn_ids.len(),
+            wait_begin.elapsed(),
+        );
         DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
 
         let elapsed = now.elapsed();
@@ -885,6 +1637,60 @@ fn run(vs: VideoService) -> ResultType<()> {
         if elapsed < spf {
             std::thread::sleep(spf - elapsed);
         }
+        #[cfg(windows)]
+        let current_gdi = c.is_gdi();
+        #[cfg(not(windows))]
+        let current_gdi = false;
+        #[cfg(windows)]
+        let current_mag = c.is_mag();
+        #[cfg(windows)]
+        let current_wgc = c.is_wgc();
+        #[cfg(windows)]
+        let capture_backend = if vs.source.is_camera() {
+            "Camera"
+        } else if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID {
+            "WinMag"
+        } else if current_wgc {
+            "WGC"
+        } else if current_mag {
+            "WinMag"
+        } else if current_gdi {
+            "GDI"
+        } else {
+            "DXGI"
+        };
+        #[cfg(windows)]
+        let current_fallback_reason = if current_gdi || current_wgc || current_mag {
+            if capture_fallback_reason.is_empty() {
+                "unknown"
+            } else {
+                capture_fallback_reason.as_str()
+            }
+        } else {
+            "none"
+        };
+        #[cfg(not(windows))]
+        let capture_backend = if vs.source.is_camera() {
+            "Camera"
+        } else {
+            "Screen"
+        };
+        #[cfg(not(windows))]
+        let current_fallback_reason = "none";
+        let service_name = sp.name();
+        host_diag.maybe_log(
+            &service_name,
+            vs.source,
+            display_idx,
+            codec_format,
+            encoder.is_hardware(),
+            encoder.bitrate(),
+            quality,
+            spf,
+            current_gdi,
+            capture_backend,
+            current_fallback_reason,
+        );
     }
 
     Ok(())
@@ -950,6 +1756,21 @@ fn setup_encoder(
     let codec_format = Encoder::negotiated_codec();
     let recorder = get_recorder(record_incoming, display_idx, source == VideoSource::Camera);
     let use_i444 = Encoder::use_i444(&encoder_cfg);
+    log::info!(
+        "diag host selected encoder config: service={}, source={:?}, display_idx={}, capture={}x{}, negotiated={:?}, cfg={:?}, use_i444={}, quality={:?}, client_record={}, record_incoming={}, portable_service={}",
+        name,
+        source,
+        display_idx,
+        c.width,
+        c.height,
+        codec_format,
+        encoder_cfg,
+        use_i444,
+        quality,
+        client_record,
+        record_incoming,
+        last_portable_service_running
+    );
     let encoder = Encoder::new(encoder_cfg.clone(), use_i444)?;
     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
 }
@@ -1134,6 +1955,7 @@ fn handle_one_frame(
     encoder: &mut Encoder,
     recorder: Arc<Mutex<Option<Recorder>>>,
     encode_fail_counter: &mut usize,
+    hw_no_valid_frame_since: &mut Option<Instant>,
     first_frame: &mut bool,
     width: usize,
     height: usize,
@@ -1153,7 +1975,10 @@ fn handle_one_frame(
     match encoder.encode_to_message(frame, ms) {
         Ok(mut vf) => {
             *encode_fail_counter = 0;
+            *hw_no_valid_frame_since = None;
             vf.display = display as _;
+            let (payload_bytes, frame_count, has_keyframe) =
+                scrap::codec::video_frame_payload_stats(&vf).unwrap_or((0, 0, false));
             let mut msg = Message::new();
             msg.set_video_frame(vf);
             recorder
@@ -1162,9 +1987,62 @@ fn handle_one_frame(
                 .as_mut()
                 .map(|r| r.write_message(&msg, width, height));
             send_conn_ids = sp.send_video_frame(msg);
+            if first {
+                log::info!(
+                    "diag first video frame encoded: service={}, display={}, width={}, height={}, targets={:?}, negotiated={:?}, hardware={}, bitrate={}, payload_bytes={}, frame_count={}, keyframe={}, capture_ms={}",
+                    sp.name(),
+                    display,
+                    width,
+                    height,
+                    send_conn_ids,
+                    Encoder::negotiated_codec(),
+                    encoder.is_hardware(),
+                    encoder.bitrate(),
+                    payload_bytes,
+                    frame_count,
+                    has_keyframe,
+                    ms
+                );
+            }
         }
         Err(e) => {
+            let is_hw_no_valid_frame = encoder.is_hardware()
+                && e.chain()
+                    .any(|cause| cause.to_string() == ENCODE_NO_VALID_FRAME);
             *encode_fail_counter += 1;
+            if is_hw_no_valid_frame {
+                let warmup_start = hw_no_valid_frame_since.get_or_insert_with(Instant::now);
+                let warmup_elapsed = warmup_start.elapsed();
+                if warmup_elapsed < HW_ENCODER_WARMUP_TIMEOUT {
+                    if *encode_fail_counter == 1 {
+                        log::warn!(
+                            "hardware encoder has no packet yet: {e:?}, warmup_timeout_ms={}",
+                            HW_ENCODER_WARMUP_TIMEOUT.as_millis()
+                        );
+                    }
+                    return Ok(send_conn_ids);
+                }
+                *encode_fail_counter = 0;
+                *hw_no_valid_frame_since = None;
+                Encoder::set_fallback_codec(CodecFormat::VP9);
+                log::error!(
+                    "switch due to hardware encoder warmup timeout: elapsed_ms={}, error={e:?}",
+                    warmup_elapsed.as_millis()
+                );
+                bail!("SWITCH");
+            }
+            *hw_no_valid_frame_since = None;
+            if first {
+                log::warn!(
+                    "diag first video frame encode failed: service={}, display={}, negotiated={:?}, hardware={}, capture_ms={}, err={:?}",
+                    sp.name(),
+                    display,
+                    Encoder::negotiated_codec(),
+                    encoder.is_hardware(),
+                    ms,
+                    e
+                );
+            }
             // Encoding errors are not frequent except on Android
             if !cfg!(target_os = "android") {
                 log::error!("encode fail: {e:?}, times: {}", *encode_fail_counter,);
@@ -1179,15 +2057,19 @@ fn handle_one_frame(
             if (first && !repeat) || *encode_fail_counter >= max_fail_times {
                 *encode_fail_counter = 0;
                 if encoder.is_hardware() {
-                    encoder.disable();
-                    log::error!("switch due to encoding fails, first frame: {first}, error: {e:?}");
+                    Encoder::set_fallback_codec(CodecFormat::VP9);
+                    log::error!(
+                        "switch due to hardware encoding fails without disabling hwcodec availability, first frame: {first}, error: {e:?}"
+                    );
                     bail!("SWITCH");
                 }
             }
             match e.to_string().as_str() {
                 scrap::codec::ENCODE_NEED_SWITCH => {
-                    encoder.disable();
-                    log::error!("switch due to encoder need switch");
+                    Encoder::set_fallback_codec(CodecFormat::VP9);
+                    log::error!(
+                        "switch due to encoder need switch without disabling hwcodec availability"
+                    );
                     bail!("SWITCH");
                 }
                 _ => {}

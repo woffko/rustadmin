@@ -206,7 +206,7 @@ class DraggableMobileActions extends StatelessWidget {
                     decoration: BoxDecoration(
                         color: MyTheme.accent.withOpacity(0.4),
                         borderRadius:
-                            BorderRadius.all(Radius.circular(15 * scale))),
+                            BorderRadius.all(Radius.circular(4.0 * scale))),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceAround,
                       children: [
@@ -562,22 +562,58 @@ class QualityMonitor extends StatelessWidget {
   final QualityMonitorModel qualityMonitorModel;
   QualityMonitor(this.qualityMonitorModel);
 
+  static const _labelStyle = TextStyle(
+      color: Color.fromARGB(255, 210, 210, 210), fontSize: 9, height: 1.08);
+  static const _valueStyle =
+      TextStyle(color: Colors.white, fontSize: 9, height: 1.08);
+
   Widget _row(String info, String? value, {Color? rightColor}) {
     return Row(
       children: [
         Expanded(
-            flex: 8,
+            flex: 7,
             child: AutoSizeText(info,
-                style: TextStyle(color: Color.fromARGB(255, 210, 210, 210)),
+                style: _labelStyle,
                 textAlign: TextAlign.right,
+                minFontSize: 6,
                 maxLines: 1)),
-        Spacer(flex: 1),
+        const SizedBox(width: 4),
         Expanded(
-            flex: 8,
+            flex: 9,
             child: AutoSizeText(value ?? '',
-                style: TextStyle(color: rightColor ?? Colors.white),
+                style: rightColor == null
+                    ? _valueStyle
+                    : _valueStyle.copyWith(color: rightColor),
+                minFontSize: 6,
                 maxLines: 1)),
       ],
+    );
+  }
+
+  Widget _optionalRow(String info, String? value, {Color? rightColor}) {
+    if (value == null || value.isEmpty) return const SizedBox.shrink();
+    return _row(info, value, rightColor: rightColor);
+  }
+
+  Widget _debugToggle(QualityMonitorModel model) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 16,
+            height: 16,
+            child: Checkbox(
+              value: model.debugMode,
+              onChanged: (value) => model.setDebugMode(value == true),
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+          const SizedBox(width: 4),
+          Text(translate('Debug mode'), style: _valueStyle),
+        ],
+      ),
     );
   }
 
@@ -588,13 +624,20 @@ class QualityMonitor extends StatelessWidget {
           builder: (context, qualityMonitorModel, child) => qualityMonitorModel
                   .show
               ? Container(
-                  constraints: BoxConstraints(maxWidth: 200),
-                  padding: const EdgeInsets.all(8),
+                  constraints: const BoxConstraints(maxWidth: 300),
+                  padding: const EdgeInsets.all(6),
                   color: MyTheme.canvasColor.withAlpha(150),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      _debugToggle(qualityMonitorModel),
                       _row("Speed", qualityMonitorModel.data.speed ?? '-'),
+                      if (qualityMonitorModel.debugMode)
+                        _optionalRow(
+                            "HostVer", qualityMonitorModel.data.hostVersion),
+                      if (qualityMonitorModel.debugMode)
+                        _optionalRow("ClientVer",
+                            qualityMonitorModel.data.clientVersion),
                       _row("FPS", qualityMonitorModel.data.fps ?? '-'),
                       // let delay be 0 if fps is 0
                       _row(
@@ -606,10 +649,91 @@ class QualityMonitor extends StatelessWidget {
                       _row(
                           "Codec", qualityMonitorModel.data.codecFormat ?? '-'),
                       _row("Chroma", qualityMonitorModel.data.chroma ?? '-'),
+                      if (qualityMonitorModel.debugMode) ...[
+                        _optionalRow(
+                            "Path", qualityMonitorModel.data.codecPath),
+                        _optionalRow(
+                            "Render", qualityMonitorModel.data.renderPath),
+                        _optionalRow(
+                            "Res", qualityMonitorModel.data.frameResolution),
+                        _optionalRow(
+                            "Queue", qualityMonitorModel.data.queueLen),
+                        _optionalRow(
+                            "DecFPS", qualityMonitorModel.data.decodeFps),
+                        _optionalRow(
+                            "AutoFPS", qualityMonitorModel.data.autoFps),
+                        _optionalRow("Mode", qualityMonitorModel.data.fpsMode),
+                        _optionalRow("Direct", qualityMonitorModel.data.direct),
+                        _optionalRow(
+                            "HostFPS", qualityMonitorModel.data.hostVideoFps),
+                        _optionalRow("HostCodec",
+                            qualityMonitorModel.data.hostVideoCodec),
+                        _optionalRow("HostBackend",
+                            qualityMonitorModel.data.hostVideoBackend),
+                        _optionalRow(
+                            "HostQoS", qualityMonitorModel.data.hostVideoQos),
+                        _optionalRow("HostFallback",
+                            qualityMonitorModel.data.hostVideoFallback),
+                        _optionalRow(
+                            "HostWait", qualityMonitorModel.data.hostVideoWait),
+                        _optionalRow("MC in",
+                            qualityMonitorModel.data.mediacodecInputQueueMs),
+                        _optionalRow("MC out",
+                            qualityMonitorModel.data.mediacodecOutputDequeueMs),
+                        _optionalRow("YUV->RGBA",
+                            qualityMonitorModel.data.yuvToRgbaMs),
+                        _optionalRow(
+                            "MC dec", qualityMonitorModel.data.mediacodecDecodeMs),
+                        _optionalRow(
+                            "Frame", qualityMonitorModel.data.handleFrameMs),
+                        _optionalRow("Flutter",
+                            qualityMonitorModel.data.flutterHandoffMs),
+                        _optionalRow(
+                            "Total", qualityMonitorModel.data.endToEndMs),
+                        _optionalRow("RGBA", qualityMonitorModel.data.rgbaBytes),
+                        _optionalRow("Realloc",
+                            qualityMonitorModel.data.rgbaReallocated),
+                        _optionalRow(
+                            "Out buf", qualityMonitorModel.data.outputBufferBytes),
+                        _optionalRow(
+                            "Format", qualityMonitorModel.data.mediaFormat),
+                      ],
                     ],
                   ),
                 )
               : const SizedBox.shrink()));
+}
+
+class PositionedQualityMonitor extends StatelessWidget {
+  final QualityMonitorModel qualityMonitorModel;
+  final Widget Function(Widget child)? childBuilder;
+
+  const PositionedQualityMonitor(
+      {Key? key, required this.qualityMonitorModel, this.childBuilder})
+      : super(key: key);
+
+  @override
+  Widget build(BuildContext context) => ChangeNotifierProvider.value(
+      value: qualityMonitorModel,
+      child: Consumer<QualityMonitorModel>(
+        builder: (context, qualityMonitorModel, child) {
+          final monitor =
+              childBuilder?.call(QualityMonitor(qualityMonitorModel)) ??
+                  QualityMonitor(qualityMonitorModel);
+          const inset = 10.0;
+          switch (qualityMonitorModel.position) {
+            case kQualityMonitorPositionTopLeft:
+              return Positioned(top: inset, left: inset, child: monitor);
+            case kQualityMonitorPositionBottomRight:
+              return Positioned(bottom: inset, right: inset, child: monitor);
+            case kQualityMonitorPositionBottomLeft:
+              return Positioned(bottom: inset, left: inset, child: monitor);
+            case kQualityMonitorPositionTopRight:
+            default:
+              return Positioned(top: inset, right: inset, child: monitor);
+          }
+        },
+      ));
 }
 
 class BlockableOverlayState extends OverlayKeyState {

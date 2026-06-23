@@ -88,6 +88,9 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
                 if let Some(msg) = handler.get_clipboard_msg() {
                     sp.send(msg);
                 }
+                for msg in crate::clipboard::take_clipboard_debug_messages() {
+                    sp.send(msg);
+                }
             }
             Ok(CallbackResult::Stop) => {
                 log::debug!("Clipboard listener stopped");
@@ -147,6 +150,7 @@ impl Handler {
                     // Maybe there's something wrong reading the clipboard data in cm, but no error msg is returned.
                     // The clipboard data should not be empty, the last line will try again to get the clipboard data.
                     if !data.is_empty() {
+                        crate::clipboard::mark_local_clipboard_change(ClipboardSide::Host);
                         let mut msg = Message::new();
                         let multi_clipboards = MultiClipboards {
                             clipboards: data
@@ -211,6 +215,9 @@ impl Handler {
         if let Some(stream) = &mut self.stream {
             loop {
                 match rt.block_on(stream.next_timeout(800))? {
+                    Some(Data::ClipboardDebug(lines)) => {
+                        crate::clipboard::queue_clipboard_debug_lines(lines);
+                    }
                     Some(Data::ClipboardNonFile(Some((err, mut contents)))) => {
                         if !err.is_empty() {
                             bail!("{}", err);

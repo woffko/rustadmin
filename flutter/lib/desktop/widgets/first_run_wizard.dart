@@ -329,6 +329,8 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
         .textTheme
         .bodySmall
         ?.copyWith(color: Theme.of(context).hintColor);
+    final canEditPairing =
+        !widget.localPairingFixed && _settings.directAccessEnabled;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -405,19 +407,21 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
         const SizedBox(height: 10),
         TextField(
           controller: _pairingController,
-          enabled: !widget.localPairingFixed,
+          enabled: canEditPairing,
           obscureText: _obscurePairing,
           decoration: InputDecoration(
             labelText: 'Local pairing passphrase',
             hintText: 'Optional',
             helperText: widget.localPairingFixed
                 ? 'Managed by your deployment.'
-                : 'Optional. Require this for first direct local-only connections.',
+                : _settings.directAccessEnabled
+                    ? 'Optional. Require this for first direct local-only connections.'
+                    : 'Enable direct local/VPN access to require local pairing.',
             suffixIcon: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 IconButton(
-                  onPressed: widget.localPairingFixed
+                  onPressed: !canEditPairing
                       ? null
                       : () {
                           setState(() {
@@ -429,7 +433,7 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
                   ),
                 ),
                 IconButton(
-                  onPressed: widget.localPairingFixed
+                  onPressed: !canEditPairing
                       ? null
                       : () {
                           _pairingController.clear();
@@ -451,8 +455,9 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
         Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.4),
-            borderRadius: BorderRadius.circular(12),
+            color:
+                Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.4),
+            borderRadius: BorderRadius.circular(4.0),
           ),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -514,7 +519,7 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
     final Widget page;
     switch (_page) {
       case 0:
-        pageTitle = 'Welcome to RustDesk';
+        pageTitle = 'Welcome to RustAdmin';
         pageBody =
             'This quick setup helps you start with direct local or VPN connections and shows where the main network controls live.';
         page = _buildWelcomePage();
@@ -522,7 +527,7 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
       case 1:
         pageTitle = 'How connections work';
         pageBody =
-            'RustDesk can use a public or private rendezvous server, or it can accept direct encrypted local/VPN connections when direct access is enabled.';
+            'RustAdmin can use a public or private rendezvous server, or it can accept direct encrypted local/VPN connections when direct access is enabled.';
         page = _buildBasicsPage();
         break;
       case 2:
@@ -534,7 +539,7 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
       default:
         pageTitle = 'Ready to apply';
         pageBody =
-            'RustDesk will save these startup settings now. You can change them later from Settings.';
+            'RustAdmin will save these startup settings now. You can change them later from Settings.';
         page = _buildReviewPage();
         break;
     }
@@ -545,7 +550,7 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
         const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
       ),
       shape: WidgetStatePropertyAll(
-        RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        RoundedRectangleBorder(borderRadius: BorderRadius.circular(4.0)),
       ),
     );
     return Dialog(
@@ -571,8 +576,10 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
               const SizedBox(height: 14),
               Text(
                 pageBody,
-                style:
-                    Theme.of(context).textTheme.bodyMedium?.copyWith(height: 1.45),
+                style: Theme.of(context)
+                    .textTheme
+                    .bodyMedium
+                    ?.copyWith(height: 1.45),
               ),
               const SizedBox(height: 16),
               _buildStepIndicator(),
@@ -589,7 +596,7 @@ class _FirstRunWizardDialogState extends State<FirstRunWizardDialog> {
                 },
                 title: const Text('Show on next start'),
                 subtitle: const Text(
-                  'Keep this welcome window visible automatically when RustDesk starts.',
+                  'Keep this welcome window visible automatically when RustAdmin starts.',
                 ),
               ),
               const SizedBox(height: 22),
@@ -705,8 +712,9 @@ class _WizardCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: Theme.of(context).dividerColor.withOpacity(0.4)),
+        borderRadius: BorderRadius.circular(4.0),
+        border:
+            Border.all(color: Theme.of(context).dividerColor.withOpacity(0.4)),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,

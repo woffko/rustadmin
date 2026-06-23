@@ -36,7 +36,7 @@ use crate::{
     secure_tcp,
     ui_interface::{get_builtin_option, resolve_avatar_url, use_texture_render},
     ui_session_interface::{InvokeUiSession, Session},
-    wrap_direct_public_key_symmetric_value,
+    wrap_direct_public_key_symmetric_value_with_identity,
 };
 #[cfg(feature = "unix-file-copy-paste")]
 use crate::{clipboard::check_clipboard_files, clipboard_file::unix_file_clip};
@@ -55,7 +55,11 @@ use hbb_common::{
     fs::JobType,
     futures::future::{select_ok, FutureExt},
     get_version_number, log,
-    message_proto::{option_message::BoolOption, *},
+    message_proto::{
+        option_message::{BoolOption, CaptureBackend},
+        supported_decoding::PreferCodec,
+        *,
+    },
     protobuf::{Message as _, MessageField},
     rand,
     rendezvous_proto::*,
@@ -81,7 +85,7 @@ pub use helper::*;
 use scrap::{
     codec::Decoder,
     record::{Recorder, RecorderContext},
-    CodecFormat, ImageFormat, ImageRgb, ImageTexture,
+    CodecFormat, ImageFormat, ImageRgb, ImageTexture, VideoDecodePerf,
 };
 
 #[cfg(not(target_os = "ios"))]
@@ -131,6 +135,7 @@ pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str = "wayland-requires-higher-l
 pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str = "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
+pub const CLIPBOARD_DIRECTION_TOGGLE_PREFIX: &str = "clipboard-direction:";
 
 #[cfg(not(target_os = "linux"))]
 pub const AUDIO_BUFFER_MS: usize = 3000;
@@ -150,6 +155,40 @@ pub(crate) struct ClientClipboardContext {
 
 /// Client of the remote desktop.
 pub struct Client;
+
+struct PendingPeerTrust {
+    fingerprint: String,
+    trust_phrase: String,
+    replace_existing_pin: bool,
+}
+
+impl PendingPeerTrust {
+    fn new(pk: &[u8], replace_existing_pin: bool) -> Self {
+        let fingerprint = crate::common::pk_to_fingerprint(pk.to_vec());
+        let trust_phrase = crate::common::fingerprint_to_trust_phrase(&fingerprint);
+        Self {
+            fingerprint,
+            trust_phrase,
+            replace_existing_pin,
+        }
+    }
+}
+
+fn pending_peer_trust_from_status(
+    status: crate::common::TrustedPeerSigningKeyStatus,
+    pk: &[u8],
+) -> Option<PendingPeerTrust> {
+    match status {
+        crate::common::TrustedPeerSigningKeyStatus::Trusted => None,
+        crate::common::TrustedPeerSigningKeyStatus::Missing => {
+            Some(PendingPeerTrust::new(pk, false))
+        }
+        crate::common::TrustedPeerSigningKeyStatus::Changed { .. }
+        | crate::common::TrustedPeerSigningKeyStatus::InvalidPinnedKey { .. } => {
+            Some(PendingPeerTrust::new(pk, true))
+        }
+    }
+}
 
 #[cfg(not(target_os = "ios"))]
 struct ClipboardState {
@@ -210,7 +249,12 @@ impl Client {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
         interface.update_received(false);
-        match Self::_start(peer, key, token, conn_type, interface.clone()).await {
+        let peer_config_id = interface.get_id();
+        match Self::retry_after_cleared_rendezvous_pairing(&peer_config_id, || {
+            Self::_start(peer, key, token, conn_type, interface.clone())
+        })
+        .await
+        {
             Err(err) => {
                 let err_str = err.to_string();
                 if err_str.starts_with("Failed") {
@@ -233,6 +277,59 @@ impl Client {
                 Ok((x.0, x.1))
             }
         }
+    }
+
+    async fn retry_after_cleared_rendezvous_pairing<T, Op, Fut>(
+        peer_config_id: &str,
+        mut op: Op,
+    ) -> ResultType<T>
+    where
+        Op: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ResultType<T>>,
+    {
+        let had_confirmed_pairing =
+            crate::common::has_confirmed_rendezvous_paired_viewer(peer_config_id);
+        match op().await {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                let pairing_was_cleared = had_confirmed_pairing
+                    && !crate::common::has_confirmed_rendezvous_paired_viewer(peer_config_id);
+                if !pairing_was_cleared {
+                    return Err(err);
+                }
+                log::info!(
+                    "Remembered rendezvous pairing for {peer_config_id} was refused; restarting connection with pairing passphrase"
+                );
+                op().await
+            }
+        }
+    }
+
+    fn resolve_explicit_rendezvous_server(
+        other_server: &str,
+    ) -> ResultType<(String, Vec<String>, bool)> {
+        if !Config::allow_id_relay_server() {
+            bail!("ID/Relay server routes are disabled");
+        }
+        if other_server.trim().is_empty() {
+            bail!("No ID/Relay server route specified");
+        }
+        if other_server == PUBLIC_SERVER {
+            let mut servers = Config::get_bootstrap_rendezvous_servers()
+                .into_iter()
+                .filter(|server| !server.trim().is_empty());
+            let rendezvous_server = servers
+                .next()
+                .and_then(|server| {
+                    hbb_common::socket_client::check_port_non_empty(&server, RENDEZVOUS_PORT)
+                })
+                .ok_or_else(|| anyhow!("No bootstrap rendezvous server configured"))?;
+            return Ok((rendezvous_server, servers.collect(), true));
+        }
+        let rendezvous_server =
+            hbb_common::socket_client::check_port_non_empty(other_server, RENDEZVOUS_PORT)
+                .ok_or_else(|| anyhow!("No ID/Relay server route specified"))?;
+        Ok((rendezvous_server, Vec::new(), true))
     }
 
     /// Start a new connection.
@@ -258,12 +355,12 @@ impl Client {
         }
         // to-do: remember the port for each peer, so that we can retry easier
         if hbb_common::is_ip_str(peer) {
-            let mut conn =
-                connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT).await?;
-            let pk = Self::secure_direct_connection(
+            let peer_config_id = interface.get_id();
+            let connect_addr = check_port(peer, RELAY_PORT + 1);
+            let (conn, pk) = Self::connect_secure_direct_with_pairing_retry(
                 peer,
-                &interface.get_id(),
-                &mut conn,
+                &peer_config_id,
+                &connect_addr,
                 interface.clone(),
             )
             .await?;
@@ -275,11 +372,11 @@ impl Client {
         }
         // Allow connect to {domain}:{port}
         if hbb_common::is_domain_port_str(peer) {
-            let mut conn = connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?;
-            let pk = Self::secure_direct_connection(
+            let peer_config_id = interface.get_id();
+            let (conn, pk) = Self::connect_secure_direct_with_pairing_retry(
                 peer,
-                &interface.get_id(),
-                &mut conn,
+                &peer_config_id,
+                peer,
                 interface.clone(),
             )
             .await?;
@@ -291,25 +388,17 @@ impl Client {
         }
 
         let other_server = interface.get_lch().read().unwrap().other_server.clone();
-        let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
-            (a.as_ref(), b.as_ref(), c.as_ref(), "")
+        let (peer, key, token) = if let Some((a, _, c)) = other_server.as_ref() {
+            (a.as_ref(), c.as_ref(), "")
         } else {
-            (peer, "", key, token)
+            (peer, key, token)
         };
-        let (rendezvous_server, servers, contained) = if other_server.is_empty() {
-            crate::get_rendezvous_server(1_000).await
-        } else {
-            if other_server == PUBLIC_SERVER {
-                let mut servers = Config::get_bootstrap_rendezvous_servers().into_iter();
-                let rendezvous_server = servers
-                    .next()
-                    .map(|server| check_port(&server, RENDEZVOUS_PORT))
-                    .ok_or_else(|| anyhow!("No bootstrap rendezvous server configured"))?;
-                (rendezvous_server, servers.collect(), true)
+        let (rendezvous_server, servers, contained) =
+            if let Some((_, server, _)) = other_server.as_ref() {
+                Self::resolve_explicit_rendezvous_server(server)?
             } else {
-                (check_port(other_server, RENDEZVOUS_PORT), Vec::new(), true)
-            }
-        };
+                crate::get_rendezvous_server(1_000).await
+            };
         if rendezvous_server.is_empty() {
             bail!("No rendezvous server configured");
         }
@@ -747,11 +836,19 @@ impl Client {
                 peer
             );
         }
-        if let Some(udp_socket_nat) = udp_socket_nat {
-            connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
-        }
-        if let Some(udp_socket_v6) = udp_socket_v6 {
-            connect_futures.push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
+        if is_local {
+            log::info!(
+                "Using TCP-only local connection path for LAN MTU compatibility; UDP/KCP candidates are skipped"
+            );
+        } else {
+            if let Some(udp_socket_nat) = udp_socket_nat {
+                connect_futures
+                    .push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
+            }
+            if let Some(udp_socket_v6) = udp_socket_v6 {
+                connect_futures
+                    .push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
+            }
         }
         // Run all connection attempts concurrently, return the first successful one
         let (mut conn, kcp, mut typ) = if connect_futures.is_empty() {
@@ -858,57 +955,90 @@ impl Client {
                 if secure_id.id != peer_id {
                     bail!("Handshake failed: peer id mismatch");
                 }
-                let mut pending_trust = if crate::common::needs_trusted_peer_signing_key(
-                    peer_id,
-                    peer_config_id,
+                let mut pending_trust = pending_peer_trust_from_status(
+                    crate::common::trusted_peer_signing_key_status(
+                        peer_id,
+                        peer_config_id,
+                        option_pk.as_deref().unwrap_or_default(),
+                    )?,
                     option_pk.as_deref().unwrap_or_default(),
-                )? {
-                    let fingerprint = crate::common::pk_to_fingerprint(pk.to_vec());
-                    let trust_phrase = crate::common::fingerprint_to_trust_phrase(&fingerprint);
-                    Some((fingerprint, trust_phrase))
-                } else {
-                    None
-                };
-                if let Some((fingerprint, trust_phrase)) = pending_trust.as_ref() {
+                );
+                if let Some(pending) = pending_trust.as_ref() {
                     if !secure_id.pairing_required {
-                        if !crate::common::allow_unverified_peer_trust() {
+                        if pending.replace_existing_pin {
                             bail!(
-                                "Handshake failed: first secure contact requires a trusted peer key or peer pairing passphrase. Enable 'Allow unverified peer trust' to allow legacy first-contact trust"
+                                "Handshake failed: trusted peer key changed or is invalid; rendezvous pairing passphrase is required to repair trust"
                             );
                         }
                         interface
-                            .confirm_peer_trust(peer, peer_id, fingerprint, trust_phrase, false)
+                            .confirm_peer_trust(
+                                peer,
+                                peer_id,
+                                &pending.fingerprint,
+                                &pending.trust_phrase,
+                                false,
+                            )
                             .await?;
+                        if !crate::common::allow_unverified_peer_trust() {
+                            bail!(
+                                "Handshake failed: first secure contact requires a trusted peer key or rendezvous pairing passphrase. Enable 'Allow unverified peer trust' to allow legacy first-contact trust"
+                            );
+                        }
                         crate::common::pin_trusted_peer_signing_key(peer_id, peer_config_id, &pk)?;
                         pending_trust = None;
                     }
                 }
                 let (asymmetric_value, symmetric_value, key) =
                     create_symmetric_key_msg(secure_id.box_pk);
+                let remember_paired_viewers =
+                    Config::get_bool_option(keys::OPTION_REMEMBER_PAIRED_VIEWERS);
+                let use_paired_viewer = secure_id.pairing_required
+                    && secure_id.supports_paired_viewer_identity
+                    && remember_paired_viewers
+                    && pending_trust.is_none()
+                    && crate::common::has_confirmed_rendezvous_paired_viewer(peer_config_id);
+                let initiator_signed_id = if secure_id.pairing_required
+                    && secure_id.supports_paired_viewer_identity
+                    && remember_paired_viewers
+                {
+                    Some(crate::common::create_direct_public_key_initiator_id(
+                        &Config::get_id(),
+                        &asymmetric_value,
+                    )?)
+                } else {
+                    None
+                };
+                let mut pairing_was_proven = false;
                 let pairing_proof = if let Some(pairing_salt) = secure_id.pairing_salt {
                     let mut our_pk_b = [0u8; box_::PUBLICKEYBYTES];
                     our_pk_b.copy_from_slice(&asymmetric_value);
-                    let passphrase = interface
-                        .request_pairing_passphrase(peer, peer_id, false)
-                        .await?;
-                    Some(crate::common::compute_direct_pairing_proof(
-                        &passphrase,
-                        &pairing_salt,
-                        peer_id,
-                        &pk,
-                        &secure_id.box_pk,
-                        &our_pk_b,
-                    )?)
+                    if use_paired_viewer {
+                        None
+                    } else {
+                        let passphrase = interface
+                            .request_pairing_passphrase(peer, peer_id, false)
+                            .await?;
+                        pairing_was_proven = true;
+                        Some(crate::common::compute_direct_pairing_proof(
+                            &passphrase,
+                            &pairing_salt,
+                            peer_id,
+                            &pk,
+                            &secure_id.box_pk,
+                            &our_pk_b,
+                        )?)
+                    }
                 } else {
                     None
                 };
                 let mut msg_out = Message::new();
                 msg_out.set_public_key(PublicKey {
                     asymmetric_value,
-                    symmetric_value: wrap_direct_public_key_symmetric_value(
+                    symmetric_value: wrap_direct_public_key_symmetric_value_with_identity(
                         &symmetric_value,
                         pairing_proof,
-                    ),
+                        initiator_signed_id.as_ref().map(|value| value.as_ref()),
+                    )?,
                     ..Default::default()
                 });
                 timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
@@ -926,17 +1056,39 @@ impl Client {
                                 Some(message::Union::MessageBox(msgbox))
                                     if msgbox.msgtype == "error" =>
                                 {
+                                    Self::clear_refused_rendezvous_paired_viewer(
+                                        peer_config_id,
+                                        use_paired_viewer,
+                                    );
                                     bail!("{}", msgbox.text);
                                 }
-                                _ => bail!("Handshake failed: invalid pairing acknowledgement"),
+                                _ => {
+                                    Self::clear_refused_rendezvous_paired_viewer(
+                                        peer_config_id,
+                                        use_paired_viewer,
+                                    );
+                                    bail!("Handshake failed: invalid pairing acknowledgement");
+                                }
                             }
                         }
-                        None => bail!("Handshake failed: pairing acknowledgement missing"),
+                        None => {
+                            Self::clear_refused_rendezvous_paired_viewer(
+                                peer_config_id,
+                                use_paired_viewer,
+                            );
+                            bail!("Handshake failed: pairing acknowledgement missing");
+                        }
                     }
                 }
-                if let Some((fingerprint, trust_phrase)) = pending_trust.take() {
-                    let _ = (fingerprint, trust_phrase);
-                    crate::common::pin_trusted_peer_signing_key(peer_id, peer_config_id, &pk)?;
+                if pending_trust.take().is_some() {
+                    crate::common::trust_peer_signing_key_after_pairing(
+                        peer_id,
+                        peer_config_id,
+                        &pk,
+                    )?;
+                }
+                if pairing_was_proven && initiator_signed_id.is_some() {
+                    crate::common::set_confirmed_rendezvous_paired_viewer(peer_config_id, true);
                 }
             }
             None => {
@@ -968,27 +1120,35 @@ impl Client {
                 if peer_id.is_empty() {
                     bail!("Handshake failed: empty peer id");
                 }
-                let mut pending_trust = if crate::common::needs_trusted_peer_signing_key(
-                    &peer_id,
-                    peer_config_id,
+                let mut pending_trust = pending_peer_trust_from_status(
+                    crate::common::trusted_peer_signing_key_status(
+                        &peer_id,
+                        peer_config_id,
+                        &sign_pk,
+                    )?,
                     &sign_pk,
-                )? {
-                    let fingerprint = crate::common::pk_to_fingerprint(sign_pk.to_vec());
-                    let trust_phrase = crate::common::fingerprint_to_trust_phrase(&fingerprint);
-                    Some((fingerprint, trust_phrase))
-                } else {
-                    None
-                };
-                if let Some((fingerprint, trust_phrase)) = pending_trust.as_ref() {
+                );
+                if let Some(pending) = pending_trust.as_ref() {
                     if !direct_id.pairing_required {
-                        if !crate::common::allow_unverified_peer_trust() {
+                        if pending.replace_existing_pin {
                             bail!(
-                                "Handshake failed: first direct secure contact requires a trusted peer key or local pairing passphrase. Enable 'Allow unverified peer trust' to allow legacy first-contact trust"
+                                "Handshake failed: trusted peer key changed or is invalid; local or rendezvous pairing passphrase is required to repair trust"
                             );
                         }
                         interface
-                            .confirm_peer_trust(peer, &peer_id, fingerprint, trust_phrase, true)
+                            .confirm_peer_trust(
+                                peer,
+                                &peer_id,
+                                &pending.fingerprint,
+                                &pending.trust_phrase,
+                                true,
+                            )
                             .await?;
+                        if !crate::common::allow_unverified_peer_trust() {
+                            bail!(
+                                "Handshake failed: first direct secure contact requires a trusted peer key or local/rendezvous pairing passphrase. Enable 'Allow unverified peer trust' to allow legacy first-contact trust"
+                            );
+                        }
                         crate::common::pin_trusted_peer_signing_key(
                             &peer_id,
                             peer_config_id,
@@ -998,30 +1158,55 @@ impl Client {
                     }
                 }
                 let (asymmetric_value, symmetric_value, key) = create_symmetric_key_msg(their_pk_b);
+                let remember_paired_viewers =
+                    Config::get_bool_option(keys::OPTION_REMEMBER_PAIRED_VIEWERS);
+                let use_paired_viewer = direct_id.pairing_required
+                    && direct_id.supports_paired_viewer_identity
+                    && remember_paired_viewers
+                    && pending_trust.is_none()
+                    && crate::common::has_confirmed_direct_paired_viewer(peer_config_id);
+                let initiator_signed_id = if direct_id.pairing_required
+                    && direct_id.supports_paired_viewer_identity
+                    && remember_paired_viewers
+                {
+                    Some(crate::common::create_direct_public_key_initiator_id(
+                        &Config::get_id(),
+                        &asymmetric_value,
+                    )?)
+                } else {
+                    None
+                };
+                let mut pairing_was_proven = false;
                 let pairing_proof = if let Some(pairing_salt) = direct_id.pairing_salt {
                     let mut our_pk_b = [0u8; box_::PUBLICKEYBYTES];
                     our_pk_b.copy_from_slice(&asymmetric_value);
-                    let passphrase = interface
-                        .request_pairing_passphrase(peer, &peer_id, true)
-                        .await?;
-                    Some(crate::common::compute_direct_pairing_proof(
-                        &passphrase,
-                        &pairing_salt,
-                        &peer_id,
-                        &sign_pk,
-                        &their_pk_b,
-                        &our_pk_b,
-                    )?)
+                    if use_paired_viewer {
+                        None
+                    } else {
+                        let passphrase = interface
+                            .request_pairing_passphrase(peer, &peer_id, true)
+                            .await?;
+                        pairing_was_proven = true;
+                        Some(crate::common::compute_direct_pairing_proof(
+                            &passphrase,
+                            &pairing_salt,
+                            &peer_id,
+                            &sign_pk,
+                            &their_pk_b,
+                            &our_pk_b,
+                        )?)
+                    }
                 } else {
                     None
                 };
                 let mut msg_out = Message::new();
                 msg_out.set_public_key(PublicKey {
                     asymmetric_value,
-                    symmetric_value: wrap_direct_public_key_symmetric_value(
+                    symmetric_value: wrap_direct_public_key_symmetric_value_with_identity(
                         &symmetric_value,
                         pairing_proof,
-                    ),
+                        initiator_signed_id.as_ref().map(|value| value.as_ref()),
+                    )?,
                     ..Default::default()
                 });
                 timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
@@ -1041,31 +1226,93 @@ impl Client {
                                 Some(message::Union::MessageBox(msgbox))
                                     if msgbox.msgtype == "error" =>
                                 {
+                                    Self::clear_refused_direct_paired_viewer(
+                                        peer_config_id,
+                                        use_paired_viewer,
+                                    );
                                     bail!("{}", msgbox.text);
                                 }
                                 _ => {
+                                    Self::clear_refused_direct_paired_viewer(
+                                        peer_config_id,
+                                        use_paired_viewer,
+                                    );
                                     bail!("Handshake failed: invalid direct handshake acknowledgement");
                                 }
                             }
                         }
                         None => {
+                            Self::clear_refused_direct_paired_viewer(
+                                peer_config_id,
+                                use_paired_viewer,
+                            );
                             bail!("Handshake failed: missing direct handshake acknowledgement");
                         }
                     }
                 }
-                if let Some((fingerprint, trust_phrase)) = pending_trust.take() {
-                    let _ = (fingerprint, trust_phrase);
-                    crate::common::pin_trusted_peer_signing_key(
+                if pending_trust.take().is_some() {
+                    crate::common::trust_peer_signing_key_after_pairing(
                         &peer_id,
                         peer_config_id,
                         &sign_pk,
                     )?;
+                }
+                if pairing_was_proven && initiator_signed_id.is_some() {
+                    crate::common::set_confirmed_direct_paired_viewer(peer_config_id, true);
                 }
                 log::info!("Established direct secure connection to {peer} as {peer_id}");
                 Ok(sign_pk.to_vec())
             }
             None => {
                 bail!("Reset by the peer");
+            }
+        }
+    }
+
+    fn clear_refused_direct_paired_viewer(peer_config_id: &str, used_paired_viewer: bool) {
+        if used_paired_viewer {
+            log::info!(
+                "Clearing remembered direct pairing for {peer_config_id}; host requested pairing again"
+            );
+            crate::common::set_confirmed_direct_paired_viewer(peer_config_id, false);
+        }
+    }
+
+    fn clear_refused_rendezvous_paired_viewer(peer_config_id: &str, used_paired_viewer: bool) {
+        if used_paired_viewer {
+            log::info!(
+                "Clearing remembered rendezvous pairing for {peer_config_id}; host requested pairing again"
+            );
+            crate::common::set_confirmed_rendezvous_paired_viewer(peer_config_id, false);
+        }
+    }
+
+    async fn connect_secure_direct_with_pairing_retry(
+        peer: &str,
+        peer_config_id: &str,
+        connect_addr: &str,
+        interface: impl Interface,
+    ) -> ResultType<(Stream, Vec<u8>)> {
+        let had_confirmed_pairing =
+            crate::common::has_confirmed_direct_paired_viewer(peer_config_id);
+        let mut conn = connect_tcp_local(connect_addr, None, CONNECT_TIMEOUT).await?;
+        match Self::secure_direct_connection(peer, peer_config_id, &mut conn, interface.clone())
+            .await
+        {
+            Ok(pk) => Ok((conn, pk)),
+            Err(err) => {
+                let pairing_was_cleared = had_confirmed_pairing
+                    && !crate::common::has_confirmed_direct_paired_viewer(peer_config_id);
+                if !pairing_was_cleared {
+                    return Err(err);
+                }
+                log::info!(
+                    "Remembered direct pairing for {peer_config_id} was refused; retrying with local pairing passphrase"
+                );
+                let mut conn = connect_tcp_local(connect_addr, None, CONNECT_TIMEOUT).await?;
+                let pk = Self::secure_direct_connection(peer, peer_config_id, &mut conn, interface)
+                    .await?;
+                Ok((conn, pk))
             }
         }
     }
@@ -1345,13 +1592,15 @@ impl ClientClipboardHandler {
     fn check_clipboard(&mut self) {
         if CLIPBOARD_STATE.lock().unwrap().running {
             #[cfg(feature = "unix-file-copy-paste")]
-            if let Some(urls) = check_clipboard_files(&mut self.ctx, ClipboardSide::Client, false) {
-                if !urls.is_empty() {
-                    #[cfg(target_os = "macos")]
-                    if crate::clipboard::is_file_url_set_by_rustdesk(&urls) {
-                        return;
-                    }
-                    if self.is_file_required() {
+            if self.is_file_required() {
+                if let Some(urls) =
+                    check_clipboard_files(&mut self.ctx, ClipboardSide::Client, false)
+                {
+                    if !urls.is_empty() {
+                        #[cfg(target_os = "macos")]
+                        if crate::clipboard::is_file_url_set_by_rustdesk(&urls) {
+                            return;
+                        }
                         match clipboard::platform::unix::serv_files::sync_files(&urls) {
                             Ok(()) => {
                                 let msg = crate::clipboard_file::clip_2_msg(
@@ -1368,11 +1617,12 @@ impl ClientClipboardHandler {
                 }
             }
 
-            if let Some(msg) = check_clipboard(&mut self.ctx, ClipboardSide::Client, false) {
-                if self.is_text_required() {
+            if self.is_text_required() {
+                if let Some(msg) = check_clipboard(&mut self.ctx, ClipboardSide::Client, false) {
                     self.send_msg(msg, false);
                 }
             }
+            self.send_debug_messages();
         }
     }
 
@@ -1380,6 +1630,12 @@ impl ClientClipboardHandler {
     #[cfg(feature = "flutter")]
     fn send_msg(&self, msg: Message, _is_file: bool) {
         crate::flutter::send_clipboard_msg(msg, _is_file);
+    }
+
+    #[inline]
+    #[cfg(feature = "flutter")]
+    fn send_debug_msg(&self, msg: Message) {
+        crate::flutter::send_debug_msg(msg);
     }
 
     #[cfg(not(feature = "flutter"))]
@@ -1407,6 +1663,19 @@ impl ClientClipboardHandler {
                 }
             }
             let _ = ctx.tx.send(Data::Message(msg));
+        }
+    }
+
+    #[cfg(not(feature = "flutter"))]
+    fn send_debug_msg(&self, msg: Message) {
+        if let Some(ctx) = &self.client_clip_ctx {
+            let _ = ctx.tx.send(Data::Message(msg));
+        }
+    }
+
+    fn send_debug_messages(&self) {
+        for msg in crate::clipboard::take_clipboard_debug_messages() {
+            self.send_debug_msg(msg);
         }
     }
 }
@@ -1783,6 +2052,7 @@ pub struct VideoHandler {
     _display: usize, // useful for debug
     fail_counter: usize,
     first_frame: bool,
+    pub decode_perf: VideoDecodePerf,
 }
 
 impl VideoHandler {
@@ -1815,6 +2085,7 @@ impl VideoHandler {
             _display,
             fail_counter: 0,
             first_frame: true,
+            decode_perf: Default::default(),
         }
     }
 
@@ -1832,19 +2103,60 @@ impl VideoHandler {
         }
         match &vf.union {
             Some(frame) => {
+                let handle_frame_start = std::time::Instant::now();
+                self.decode_perf = VideoDecodePerf::default();
+                self.decode_perf.codec_format = format;
                 let res = self.decoder.handle_video_frame(
                     frame,
                     &mut self.rgb,
                     &mut self.texture,
                     pixelbuffer,
                     chroma,
+                    &mut self.decode_perf,
                 );
-                if res.as_ref().is_ok_and(|x| *x) {
+                self.decode_perf.handle_frame_total = Some(handle_frame_start.elapsed());
+                if res.as_ref().map(|x| *x).unwrap_or(false) {
+                    if *pixelbuffer {
+                        self.decode_perf.width = self.rgb.w;
+                        self.decode_perf.height = self.rgb.h;
+                        self.decode_perf.rgba_bytes = self.rgb.raw.len();
+                        if self.decode_perf.render_path == "unknown" {
+                            self.decode_perf.render_path = "rgba_soft_render";
+                        }
+                    } else {
+                        self.decode_perf.width = self.texture.w;
+                        self.decode_perf.height = self.texture.h;
+                        self.decode_perf.render_path = "texture_render";
+                    }
+                    if self.first_frame {
+                        log::info!(
+                            "diag first video frame decoded: display={}, format={:?}, codec_path={}, render_path={}, pixelbuffer={}, chroma={:?}, rgb={}x{}, texture={}x{}, decoder_valid={}",
+                            self._display,
+                            self.decoder.format(),
+                            self.decode_perf.codec_path,
+                            self.decode_perf.render_path,
+                            *pixelbuffer,
+                            chroma,
+                            self.rgb.w,
+                            self.rgb.h,
+                            self.texture.w,
+                            self.texture.h,
+                            self.decoder.valid()
+                        );
+                    }
                     self.fail_counter = 0;
                 } else {
                     if self.fail_counter < usize::MAX {
                         if self.first_frame && self.fail_counter < MAX_DECODE_FAIL_COUNTER {
-                            log::error!("decode first frame failed");
+                            log::error!(
+                                "diag first video frame decode failed: display={}, format={:?}, pixelbuffer={}, chroma={:?}, decoder_valid={}, err={:?}",
+                                self._display,
+                                self.decoder.format(),
+                                *pixelbuffer,
+                                chroma,
+                                self.decoder.valid(),
+                                res.as_ref().err()
+                            );
                             self.fail_counter = MAX_DECODE_FAIL_COUNTER;
                         } else {
                             self.fail_counter += 1;
@@ -1885,6 +2197,7 @@ impl VideoHandler {
         self.decoder = Decoder::new(format, luid);
         self.fail_counter = 0;
         self.first_frame = true;
+        self.decode_perf = Default::default();
     }
 
     /// Start or stop screen record.
@@ -1982,6 +2295,9 @@ pub struct LoginConfigHandler {
     pub direct: Option<bool>,
     pub received: bool,
     switch_uuid: Option<String>,
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    switch_back_allowed: bool,
     pub save_ab_password_to_recent: bool, // true: connected with ab password
     pub other_server: Option<(String, String, String)>,
     pub custom_fps: Arc<Mutex<Option<usize>>>,
@@ -2006,6 +2322,17 @@ impl Deref for LoginConfigHandler {
 }
 
 impl LoginConfigHandler {
+    pub fn capture_backend_from_value(value: &str) -> CaptureBackend {
+        match value.to_ascii_lowercase().as_str() {
+            "dxgi" => CaptureBackend::CaptureBackendDxgi,
+            "wgc" => CaptureBackend::CaptureBackendWgc,
+            "winmag" => CaptureBackend::CaptureBackendWinMag,
+            "gdi" => CaptureBackend::CaptureBackendGdi,
+            "auto" | "" => CaptureBackend::CaptureBackendAuto,
+            _ => CaptureBackend::CaptureBackendAuto,
+        }
+    }
+
     /// Initialize the login config handler.
     ///
     /// # Arguments
@@ -2023,6 +2350,7 @@ impl LoginConfigHandler {
         conn_token: Option<String>,
     ) {
         let mut id = id;
+        self.other_server = None;
         if id.contains("@") {
             let mut v = id.split("@");
             let raw_id: &str = v.next().unwrap_or_default();
@@ -2098,6 +2426,11 @@ impl LoginConfigHandler {
 
         self.direct = None;
         self.received = false;
+        #[cfg(feature = "flutter")]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            self.switch_back_allowed = false;
+        }
         self.switch_uuid = switch_uuid;
         self.adapter_luid = adapter_luid;
         self.selected_windows_session_id = None;
@@ -2109,6 +2442,23 @@ impl LoginConfigHandler {
         let is_terminal_admin = conn_type == ConnType::TERMINAL
             && std::env::var("IS_TERMINAL_ADMIN").map_or(false, |v| v == "Y");
         self.is_terminal_admin = is_terminal_admin;
+    }
+
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn allow_switch_back_once(&mut self) {
+        self.switch_back_allowed = true;
+    }
+
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn consume_switch_back_permission(&mut self) -> bool {
+        if self.switch_back_allowed {
+            self.switch_back_allowed = false;
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if the client should auto login.
@@ -2282,7 +2632,29 @@ impl LoginConfigHandler {
     pub fn toggle_option(&mut self, name: String) -> Option<Message> {
         let mut option = OptionMessage::default();
         let mut config = self.load_config();
-        if name == "show-remote-cursor" {
+        if let Some(direction) = name.strip_prefix(CLIPBOARD_DIRECTION_TOGGLE_PREFIX) {
+            let direction =
+                crate::clipboard::clipboard_direction_policy_from_option_value(direction);
+            config.options.insert(
+                keys::OPTION_ONE_WAY_CLIPBOARD_REDIRECTION.to_owned(),
+                direction.as_option_value().to_owned(),
+            );
+            let disable_clipboard =
+                !direction.allows_local_to_remote() && !direction.allows_remote_to_local();
+            let disable_changed = config.disable_clipboard.v != disable_clipboard;
+            config.disable_clipboard.v = disable_clipboard;
+            if disable_changed {
+                option.disable_clipboard = (if disable_clipboard {
+                    BoolOption::Yes
+                } else {
+                    BoolOption::No
+                })
+                .into();
+            } else {
+                self.save_config(config);
+                return None;
+            }
+        } else if name == "show-remote-cursor" {
             config.show_remote_cursor.v = !config.show_remote_cursor.v;
             option.show_remote_cursor = (if config.show_remote_cursor.v {
                 BoolOption::Yes
@@ -2477,9 +2849,25 @@ impl LoginConfigHandler {
                 if !allow_more && custom_fps > 30 {
                     custom_fps = 30;
                 }
-                msg.custom_fps = custom_fps;
+                let fixed_fps = self.get_option(keys::OPTION_CUSTOM_FPS_MODE) == "fixed";
+                msg.custom_fps = if fixed_fps { -custom_fps } else { custom_fps };
+                log::info!(
+                    "custom_fps initial option send: mode={}, fps={}, wire={}",
+                    if fixed_fps { "fixed" } else { "adaptive" },
+                    custom_fps,
+                    msg.custom_fps
+                );
                 *self.custom_fps.lock().unwrap() = Some(custom_fps as _);
             }
+        }
+        let capture_backend = self.get_option(keys::OPTION_CAPTURE_BACKEND);
+        msg.capture_backend = Self::capture_backend_from_value(&capture_backend).into();
+        if !capture_backend.is_empty() {
+            log::info!(
+                "capture_backend initial option send: id={}, value={}",
+                self.id,
+                capture_backend
+            );
         }
         let view_only = self.get_toggle_option("view-only");
         if view_only {
@@ -2509,11 +2897,25 @@ impl LoginConfigHandler {
         if view_only || self.get_toggle_option("disable-clipboard") {
             msg.disable_clipboard = BoolOption::Yes.into();
         }
-        msg.supported_decoding = MessageField::some(self.get_supported_decoding());
+        let supported_decoding = self.get_supported_decoding();
+        log::info!(
+            "diag viewer supported_decoding on login: id={}, texture_render={}, adapter_luid={:?}, mark_unsupported={:?}, h264={}, h265={}, vp9={}, av1={}, prefer={:?}",
+            self.id,
+            use_texture_render(),
+            self.adapter_luid,
+            self.mark_unsupported,
+            supported_decoding.ability_h264,
+            supported_decoding.ability_h265,
+            supported_decoding.ability_vp9,
+            supported_decoding.ability_av1,
+            supported_decoding.prefer.enum_value_or(PreferCodec::Auto)
+        );
+        msg.supported_decoding = MessageField::some(supported_decoding);
         Some(msg)
     }
 
     pub fn get_supported_decoding(&self) -> SupportedDecoding {
+        get_hwcodec_config();
         Decoder::supported_decodings(
             Some(&self.id),
             use_texture_render(),
@@ -2669,21 +3071,66 @@ impl LoginConfigHandler {
     /// * `fps` - The given fps.
     /// * `save_config` - Save the config.
     pub fn set_custom_fps(&mut self, fps: i32, save_config: bool) -> Message {
+        let custom_fps = fps.checked_abs().unwrap_or(30).clamp(5, 120);
+        let wire_custom_fps = if fps < 0 { -custom_fps } else { custom_fps };
         let mut misc = Misc::new();
         misc.set_option(OptionMessage {
-            custom_fps: fps,
+            custom_fps: wire_custom_fps,
             ..Default::default()
         });
+        log::info!(
+            "custom_fps option send: mode={}, fps={}, wire={}",
+            if fps < 0 { "fixed" } else { "adaptive" },
+            custom_fps,
+            wire_custom_fps
+        );
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
         if save_config {
             let mut config = self.load_config();
             config
                 .options
-                .insert("custom-fps".to_owned(), fps.to_string());
+                .insert("custom-fps".to_owned(), custom_fps.to_string());
             self.save_config(config);
         }
-        *self.custom_fps.lock().unwrap() = Some(fps as _);
+        *self.custom_fps.lock().unwrap() = Some(custom_fps as _);
+        msg_out
+    }
+
+    pub fn set_capture_backend(&mut self, value: String, save_config: bool) -> Message {
+        let normalized = match value.to_ascii_lowercase().as_str() {
+            "dxgi" => "dxgi",
+            "wgc" => "wgc",
+            "winmag" => "winmag",
+            "gdi" => "gdi",
+            _ => "auto",
+        };
+        let capture_backend = Self::capture_backend_from_value(normalized);
+        let mut misc = Misc::new();
+        misc.set_option(OptionMessage {
+            capture_backend: capture_backend.into(),
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_misc(misc);
+        if save_config {
+            let mut config = self.load_config();
+            if normalized == "auto" {
+                config.options.remove(keys::OPTION_CAPTURE_BACKEND);
+            } else {
+                config.options.insert(
+                    keys::OPTION_CAPTURE_BACKEND.to_owned(),
+                    normalized.to_owned(),
+                );
+            }
+            self.save_config(config);
+        }
+        log::info!(
+            "capture_backend option send: id={}, value={}, wire={:?}",
+            self.id,
+            normalized,
+            capture_backend
+        );
         msg_out
     }
 
@@ -2693,6 +3140,29 @@ impl LoginConfigHandler {
         } else {
             "".to_owned()
         }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(crate) fn clipboard_direction_policy(&self) -> crate::clipboard::ClipboardDirectionPolicy {
+        let value = self.get_option(keys::OPTION_ONE_WAY_CLIPBOARD_REDIRECTION);
+        if value.is_empty() {
+            return crate::clipboard::clipboard_direction_policy_for_side(
+                crate::clipboard::ClipboardSide::Client,
+            );
+        }
+        crate::clipboard::clipboard_direction_policy_from_option_value(&value)
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(crate) fn is_local_to_remote_clipboard_allowed(&self) -> bool {
+        self.clipboard_direction_policy().allows_local_to_remote()
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn is_local_to_remote_clipboard_allowed(&self) -> bool {
+        crate::clipboard::is_local_to_remote_clipboard_allowed(
+            crate::clipboard::ClipboardSide::Client,
+        )
     }
 
     #[inline]
@@ -2859,9 +3329,19 @@ impl LoginConfigHandler {
         let my_id = Config::get_id_or(crate::DEVICE_ID.lock().unwrap().clone());
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let my_id = Config::get_id();
-        let (my_id, pure_id) = if let Some((id, _, _)) = self.other_server.as_ref() {
-            let server = Config::get_rendezvous_server();
-            (format!("{my_id}@{server}"), id.clone())
+        let (my_id, pure_id) = if let Some((id, server, _)) = self.other_server.as_ref() {
+            let server = if server == PUBLIC_SERVER {
+                Config::get_rendezvous_server()
+            } else {
+                server.clone()
+            };
+            let my_id = if server.is_empty() {
+                log::warn!("Omitting empty ID/Relay server from login identity");
+                my_id
+            } else {
+                format!("{my_id}@{server}")
+            };
+            (my_id, id.clone())
         } else {
             (my_id, self.id.clone())
         };
@@ -2972,6 +3452,18 @@ impl LoginConfigHandler {
             self.adapter_luid,
             &self.mark_unsupported,
         );
+        log::info!(
+            "diag viewer supported_decoding update: id={}, texture_render={}, adapter_luid={:?}, mark_unsupported={:?}, h264={}, h265={}, vp9={}, av1={}, prefer={:?}",
+            self.id,
+            use_texture_render(),
+            self.adapter_luid,
+            self.mark_unsupported,
+            decoding.ability_h264,
+            decoding.ability_h265,
+            decoding.ability_vp9,
+            decoding.ability_av1,
+            decoding.prefer.enum_value_or(PreferCodec::Auto)
+        );
         let mut misc = Misc::new();
         misc.set_option(OptionMessage {
             supported_decoding: hbb_common::protobuf::MessageField::some(decoding),
@@ -3057,21 +3549,24 @@ pub fn start_video_thread<F, T>(
         let mut count = 0;
         let mut duration = std::time::Duration::ZERO;
         let mut skip_beginning = 0;
+        let mut diag_frame_count = 0usize;
         loop {
             if let Ok(data) = video_receiver.recv() {
                 match data {
                     MediaData::VideoFrame(_) | MediaData::VideoQueue => {
-                        let vf = match data {
+                        let (vf, queue_len, queue_source) = match data {
                             MediaData::VideoFrame(vf) => {
                                 *discard_queue.write().unwrap() = false;
-                                *vf
+                                let queue_len = video_queue.read().unwrap().len();
+                                (*vf, queue_len, "direct_keyframe")
                             }
                             MediaData::VideoQueue => {
                                 if let Some(vf) = video_queue.read().unwrap().pop() {
                                     if discard_queue.read().unwrap().clone() {
                                         continue;
                                     }
-                                    vf
+                                    let queue_len = video_queue.read().unwrap().len();
+                                    (vf, queue_len, "queued_delta")
                                 } else {
                                     continue;
                                 }
@@ -3084,6 +3579,8 @@ pub fn start_video_thread<F, T>(
                         let display = vf.display as usize;
                         let start = std::time::Instant::now();
                         let format = CodecFormat::from(&vf);
+                        let (payload_bytes, encoded_frame_count, has_keyframe) =
+                            scrap::codec::video_frame_payload_stats(&vf).unwrap_or((0, 0, false));
                         if video_handler.is_none() {
                             let mut handler = VideoHandler::new(format, display);
                             let record_state = session.lc.read().unwrap().record_state;
@@ -3100,12 +3597,15 @@ pub fn start_video_thread<F, T>(
                             let format_changed = handler.decoder.format() != format;
                             match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
                                 Ok(true) => {
+                                    let callback_start = std::time::Instant::now();
                                     video_callback(
                                         display,
                                         &mut handler.rgb,
                                         handler.texture.texture,
                                         pixelbuffer,
                                     );
+                                    let callback_elapsed = callback_start.elapsed();
+                                    let total_elapsed = start.elapsed();
 
                                     // chroma
                                     if tmp_chroma.is_some() && last_chroma != tmp_chroma {
@@ -3118,10 +3618,125 @@ pub fn start_video_thread<F, T>(
                                         &mut skip_beginning,
                                         &fps,
                                         format_changed,
-                                        start.elapsed(),
+                                        total_elapsed,
                                         &mut count,
                                         &mut duration,
                                     );
+                                    diag_frame_count += 1;
+                                    let should_log_diag = diag_frame_count <= 5
+                                        || diag_frame_count % 30 == 0
+                                        || format_changed;
+                                    #[cfg(not(target_os = "android"))]
+                                    let _ = (
+                                        queue_len,
+                                        queue_source,
+                                        payload_bytes,
+                                        encoded_frame_count,
+                                        has_keyframe,
+                                        callback_elapsed,
+                                        should_log_diag,
+                                    );
+                                    #[cfg(target_os = "android")]
+                                    if should_log_diag {
+                                        let decode_fps = *fps.read().unwrap();
+                                        let perf = &handler.decode_perf;
+                                        let render_path = if pixelbuffer {
+                                            perf.render_path
+                                        } else {
+                                            "texture_render"
+                                        };
+                                        let media_format = format!(
+                                            "w:{:?} h:{:?} s:{:?} sh:{:?} cf:{:?} crop:{:?},{:?},{:?},{:?}",
+                                            perf.media_format_width,
+                                            perf.media_format_height,
+                                            perf.media_format_stride,
+                                            perf.media_format_slice_height,
+                                            perf.media_format_color_format,
+                                            perf.crop_left,
+                                            perf.crop_top,
+                                            perf.crop_right,
+                                            perf.crop_bottom,
+                                        );
+                                        let chroma = match tmp_chroma {
+                                            Some(Chroma::I444) => Some("4:4:4".to_owned()),
+                                            Some(Chroma::I420) => Some("4:2:0".to_owned()),
+                                            None => None,
+                                        };
+                                        session.update_quality_status(QualityStatus {
+                                            codec_format: Some(format.clone()),
+                                            chroma,
+                                            codec_path: Some(perf.codec_path.to_owned()),
+                                            render_path: Some(render_path.to_owned()),
+                                            frame_resolution: Some(format!(
+                                                "{}x{}",
+                                                perf.width, perf.height
+                                            )),
+                                            queue_len: Some(queue_len),
+                                            decode_fps,
+                                            mediacodec_input_queue_ms: Some(format_duration_ms(
+                                                perf.mediacodec_input_queue,
+                                            )),
+                                            mediacodec_output_dequeue_ms: Some(format_duration_ms(
+                                                perf.mediacodec_output_dequeue,
+                                            )),
+                                            yuv_to_rgba_ms: Some(format_duration_ms(
+                                                perf.yuv_to_rgba,
+                                            )),
+                                            mediacodec_decode_ms: Some(format_duration_ms(
+                                                perf.decoder_total,
+                                            )),
+                                            handle_frame_ms: Some(format_duration_ms(
+                                                perf.handle_frame_total,
+                                            )),
+                                            flutter_handoff_ms: Some(format_duration_ms(Some(
+                                                callback_elapsed,
+                                            ))),
+                                            end_to_end_ms: Some(format_duration_ms(Some(
+                                                total_elapsed,
+                                            ))),
+                                            rgba_bytes: Some(perf.rgba_bytes),
+                                            rgba_reallocated: Some(perf.rgba_reallocated),
+                                            output_buffer_bytes: Some(perf.output_buffer_bytes),
+                                            media_format: Some(media_format),
+                                            ..Default::default()
+                                        });
+                                        log::info!(
+                                            "diag android video pipeline: display={}, source={}, queue_len={}, codec={:?}, codec_path={}, render_path={}, frame_resolution={}x{}, payload_bytes={}, encoded_frames={}, keyframe={}, pixelbuffer={}, chroma={:?}, mediacodec_input_queue_ms={}, mediacodec_output_dequeue_ms={}, yuv_to_rgba_ms={}, mediacodec_decode_ms={}, handle_frame_ms={}, flutter_handoff_ms={}, end_to_end_ms={}, decode_fps={:?}, rgba_bytes={}, rgba_reallocated={}, output_buffer_bytes={}, media_format={{width:{:?}, height:{:?}, stride:{:?}, slice_height:{:?}, color_format:{:?}, crop:[{:?},{:?},{:?},{:?}]}}",
+                                            display,
+                                            queue_source,
+                                            queue_len,
+                                            format,
+                                            perf.codec_path,
+                                            render_path,
+                                            perf.width,
+                                            perf.height,
+                                            payload_bytes,
+                                            encoded_frame_count,
+                                            has_keyframe,
+                                            pixelbuffer,
+                                            tmp_chroma,
+                                            format_duration_ms(perf.mediacodec_input_queue),
+                                            format_duration_ms(perf.mediacodec_output_dequeue),
+                                            format_duration_ms(perf.yuv_to_rgba),
+                                            format_duration_ms(perf.decoder_total),
+                                            format_duration_ms(perf.handle_frame_total),
+                                            format_duration_ms(Some(callback_elapsed)),
+                                            format_duration_ms(Some(total_elapsed)),
+                                            decode_fps,
+                                            perf.rgba_bytes,
+                                            perf.rgba_reallocated,
+                                            perf.output_buffer_bytes,
+                                            perf.media_format_width,
+                                            perf.media_format_height,
+                                            perf.media_format_stride,
+                                            perf.media_format_slice_height,
+                                            perf.media_format_color_format,
+                                            perf.crop_left,
+                                            perf.crop_top,
+                                            perf.crop_right,
+                                            perf.crop_bottom,
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     // This is a simple workaround.
@@ -3211,6 +3826,13 @@ pub fn start_audio_thread() -> MediaSender {
     audio_sender
 }
 
+#[cfg(target_os = "android")]
+fn format_duration_ms(duration: Option<std::time::Duration>) -> String {
+    duration
+        .map(|duration| format!("{:.3}", duration.as_secs_f64() * 1000.0))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
 #[inline]
 fn fps_calculate(
     skip_beginning: &mut usize,
@@ -3246,21 +3868,20 @@ fn fps_calculate(
 fn get_hwcodec_config() {
     // for sciter and unilink
     #[cfg(feature = "hwcodec")]
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     {
-        use std::sync::Once;
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            let start = std::time::Instant::now();
-            if let Err(e) = crate::ipc::get_hwcodec_config_from_server() {
-                log::error!(
-                    "Failed to get hwcodec config: {e:?}, elapsed: {:?}",
-                    start.elapsed()
-                );
-            } else {
-                log::info!("{:?} used to get hwcodec config", start.elapsed());
-            }
-        });
+        if !scrap::codec::enable_hwcodec_option() || scrap::hwcodec::HwCodecConfig::already_set() {
+            return;
+        }
+        let start = std::time::Instant::now();
+        if let Err(e) = crate::ipc::get_hwcodec_config_from_server() {
+            log::error!(
+                "Failed to get hwcodec config: {e:?}, elapsed: {:?}",
+                start.elapsed()
+            );
+        } else {
+            log::info!("{:?} used to get hwcodec config", start.elapsed());
+        }
     }
 }
 
@@ -3613,6 +4234,32 @@ pub fn handle_login_error(
     }
 }
 
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
+    let Ok(mut conn) = crate::ipc::connect(1000, "").await else {
+        return false;
+    };
+    let uuid = uuid.to_string();
+    if conn
+        .send(&crate::ipc::Data::SwitchSidesUuid(
+            uuid.clone(),
+            id.to_owned(),
+            None,
+        ))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    match conn.next_timeout(1000).await {
+        Ok(Some(crate::ipc::Data::SwitchSidesUuid(returned_uuid, returned_id, Some(true)))) => {
+            returned_uuid == uuid && returned_id == id
+        }
+        _ => false,
+    }
+}
+
 /// Handle hash message sent by peer.
 /// Hash will be used for login.
 ///
@@ -3632,13 +4279,22 @@ pub async fn handle_hash(
     lc.write().unwrap().hash = hash.clone();
     // Take care of password application order
 
-    // switch_uuid
-    let uuid = lc.write().unwrap().switch_uuid.take();
-    if let Some(uuid) = uuid {
-        if let Ok(uuid) = uuid::Uuid::from_str(&uuid) {
-            send_switch_login_request(lc.clone(), peer, uuid).await;
-            lc.write().unwrap().password_source = Default::default();
-            return;
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let uuid = lc.write().unwrap().switch_uuid.take();
+        if let Some(uuid) = uuid {
+            if let Ok(uuid) = uuid::Uuid::from_str(&uuid) {
+                let id = lc.read().unwrap().id.clone();
+                if !consume_local_switch_sides_uuid(&id, &uuid).await {
+                    log::warn!("Ignored untrusted switch_uuid");
+                } else {
+                    lc.write().unwrap().allow_switch_back_once();
+                    send_switch_login_request(lc.clone(), peer, uuid).await;
+                    lc.write().unwrap().password_source = Default::default();
+                    return;
+                }
+            }
         }
     }
     // last password
@@ -4341,10 +4997,58 @@ pub mod peer_online {
 #[cfg(test)]
 mod security_tests {
     use super::*;
-    use hbb_common::{config::keys, tcp, tokio::net::TcpListener};
+    use hbb_common::{
+        config::{keys, PairedViewer},
+        get_time, tcp,
+        tokio::net::{TcpListener, TcpStream},
+    };
     use std::sync::Mutex;
 
+    const SECURITY_TEST_CONNECT_TIMEOUT_MS: u64 = 15_000;
+    const SECURITY_TEST_CONNECT_ATTEMPT_TIMEOUT_MS: u64 = 250;
+
     static TEST_CLIENT_SECURITY_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_security_tests() -> std::sync::MutexGuard<'static, ()> {
+        TEST_CLIENT_SECURITY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn connect_security_test_tcp(addr: &str) -> ResultType<Stream> {
+        let addr: SocketAddr = addr.parse().context("Invalid security test TCP address")?;
+        let deadline = Instant::now() + Duration::from_millis(SECURITY_TEST_CONNECT_TIMEOUT_MS);
+        loop {
+            // These tests connect to in-process localhost listeners. Do not use
+            // connect_tcp_local()/FramedStream::new() here: they can honor
+            // persisted proxy or local-bind behavior that is irrelevant to
+            // these loopback-only mock peers.
+            let connect_result = tokio::time::timeout(
+                Duration::from_millis(SECURITY_TEST_CONNECT_ATTEMPT_TIMEOUT_MS),
+                TcpStream::connect(addr),
+            )
+            .await;
+            match connect_result {
+                Ok(Ok(conn)) => {
+                    conn.set_nodelay(true).ok();
+                    let local_addr = conn.local_addr()?;
+                    return Ok(Stream::Tcp(tcp::FramedStream::from(conn, local_addr)));
+                }
+                Ok(Err(err)) if Instant::now() >= deadline => {
+                    bail!(
+                        "Failed to connect to security test peer {addr} within {SECURITY_TEST_CONNECT_TIMEOUT_MS} ms: {err}"
+                    );
+                }
+                Err(err) if Instant::now() >= deadline => {
+                    bail!(
+                        "Timed out connecting to security test peer {addr} within {SECURITY_TEST_CONNECT_TIMEOUT_MS} ms: {err}"
+                    );
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Ok(Err(_)) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    }
 
     #[derive(Clone, Default)]
     struct TestInterface {
@@ -4506,40 +5210,83 @@ mod security_tests {
             let Some(message::Union::PublicKey(public_key)) = msg_in.union else {
                 bail!("Handshake failed: invalid client response type");
             };
-            let (pairing_proof, symmetric_value) =
-                crate::common::unwrap_direct_public_key_symmetric_value(
-                    &public_key.symmetric_value,
-                    pairing_salt.is_some(),
-                )?;
-            let key =
-                tcp::Encrypt::decode(&symmetric_value, &public_key.asymmetric_value, &box_sk)?;
+            let public_key_payload = crate::common::unwrap_direct_public_key_payload(
+                &public_key.symmetric_value,
+                pairing_salt.is_some(),
+            )?;
+            let key = tcp::Encrypt::decode(
+                &public_key_payload.symmetric_value,
+                &public_key.asymmetric_value,
+                &box_sk,
+            )?;
             if let (Some(pairing_passphrase), Some(pairing_salt)) =
                 (pairing_passphrase.as_ref(), pairing_salt)
             {
-                let Some(pairing_proof) = pairing_proof else {
-                    bail!("Handshake failed: missing pairing proof");
-                };
                 let mut initiator_box_pk = [0u8; box_::PUBLICKEYBYTES];
                 initiator_box_pk.copy_from_slice(&public_key.asymmetric_value);
-                let expected_proof = crate::common::compute_direct_pairing_proof(
-                    pairing_passphrase,
-                    &pairing_salt,
-                    &peer_id,
-                    &sign_pk,
-                    &box_pk.0,
-                    &initiator_box_pk,
-                )?;
                 stream.set_key(key);
                 let mut ack = Message::new();
-                if pairing_proof != expected_proof {
+                let mut paired_initiator = None;
+                let mut error_text = None;
+                if let Some(pairing_proof) = public_key_payload.pairing_proof {
+                    let expected_proof = crate::common::compute_direct_pairing_proof(
+                        pairing_passphrase,
+                        &pairing_salt,
+                        &peer_id,
+                        &sign_pk,
+                        &box_pk.0,
+                        &initiator_box_pk,
+                    )?;
+                    if pairing_proof == expected_proof {
+                        if let Some(initiator) = public_key_payload.initiator.as_ref() {
+                            crate::common::validate_direct_public_key_initiator(
+                                initiator,
+                                &public_key.asymmetric_value,
+                            )?;
+                            paired_initiator = Some(initiator.clone());
+                        }
+                    } else {
+                        error_text =
+                            Some("Handshake failed: pairing passphrase rejected".to_owned());
+                    }
+                } else {
+                    let trusted = if let Some(initiator) = public_key_payload.initiator.as_ref() {
+                        crate::common::validate_direct_public_key_initiator(
+                            initiator,
+                            &public_key.asymmetric_value,
+                        )?;
+                        Config::has_paired_viewer(
+                            crate::common::DIRECT_PAIRING_SCOPE,
+                            &initiator.id,
+                            &initiator.sign_pk,
+                        )
+                    } else {
+                        false
+                    };
+                    if !trusted {
+                        error_text =
+                            Some("Handshake failed: pairing passphrase required".to_owned());
+                    }
+                }
+                if let Some(error_text) = error_text {
                     ack.set_message_box(MessageBox {
                         msgtype: "error".to_owned(),
                         title: "Connection Error".to_owned(),
-                        text: "Handshake failed: pairing passphrase rejected".to_owned(),
+                        text: error_text.clone(),
                         ..Default::default()
                     });
                     stream.send(&ack).await?;
-                    bail!("Handshake failed: pairing passphrase rejected");
+                    bail!("{}", error_text);
+                }
+                if let Some(initiator) = paired_initiator {
+                    Config::add_paired_viewer(PairedViewer {
+                        sign_pk: Bytes::from(initiator.sign_pk.to_vec()),
+                        time: get_time(),
+                        id: initiator.id,
+                        name: String::new(),
+                        platform: String::new(),
+                        scope: crate::common::DIRECT_PAIRING_SCOPE.to_owned(),
+                    });
                 }
                 ack.set_signed_id(SignedId {
                     id: crate::common::direct_handshake_ack_ok(),
@@ -4548,6 +5295,87 @@ mod security_tests {
                 stream.send(&ack).await?;
             }
             Ok(())
+        });
+        Ok((addr.to_string(), handle))
+    }
+
+    async fn spawn_direct_handshake_peer_refuse_paired_then_accept_pairing(
+        peer_id: String,
+        sign_pk: [u8; sign::PUBLICKEYBYTES],
+        sign_sk: sign::SecretKey,
+        pairing_passphrase: String,
+    ) -> ResultType<(String, tokio::task::JoinHandle<ResultType<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await?;
+                socket.set_nodelay(true).ok();
+                let local_addr = socket.local_addr()?;
+                let mut stream = Stream::from(socket, local_addr);
+                let (box_pk, box_sk) = box_::gen_keypair();
+                let pairing_salt = crate::common::create_direct_pairing_salt();
+                let signed_id = crate::common::create_direct_signed_id_with_pairing(
+                    &peer_id,
+                    box_pk.0,
+                    &sign_pk,
+                    &sign_sk,
+                    pairing_salt,
+                );
+                let mut msg_out = Message::new();
+                msg_out.set_signed_id(SignedId {
+                    id: signed_id,
+                    ..Default::default()
+                });
+                stream.send(&msg_out).await?;
+
+                let bytes = stream
+                    .next()
+                    .await
+                    .ok_or_else(|| anyhow!("Handshake failed: missing client response"))??;
+                let msg_in = Message::parse_from_bytes(&bytes)?;
+                let Some(message::Union::PublicKey(public_key)) = msg_in.union else {
+                    bail!("Handshake failed: invalid client response type");
+                };
+                let public_key_payload = crate::common::unwrap_direct_public_key_payload(
+                    &public_key.symmetric_value,
+                    true,
+                )?;
+                let key = tcp::Encrypt::decode(
+                    &public_key_payload.symmetric_value,
+                    &public_key.asymmetric_value,
+                    &box_sk,
+                )?;
+                stream.set_key(key);
+                let Some(pairing_proof) = public_key_payload.pairing_proof else {
+                    // Simulate host-side paired-viewer removal/refusal where the
+                    // remembered-pairing attempt closes before the client reads an ack.
+                    continue;
+                };
+
+                let mut initiator_box_pk = [0u8; box_::PUBLICKEYBYTES];
+                initiator_box_pk.copy_from_slice(&public_key.asymmetric_value);
+                let expected_proof = crate::common::compute_direct_pairing_proof(
+                    &pairing_passphrase,
+                    &pairing_salt,
+                    &peer_id,
+                    &sign_pk,
+                    &box_pk.0,
+                    &initiator_box_pk,
+                )?;
+                if pairing_proof != expected_proof {
+                    bail!("Handshake failed: pairing passphrase rejected");
+                }
+
+                let mut ack = Message::new();
+                ack.set_signed_id(SignedId {
+                    id: crate::common::direct_handshake_ack_ok(),
+                    ..Default::default()
+                });
+                stream.send(&ack).await?;
+                return Ok(());
+            }
+            bail!("Handshake failed: retry with pairing proof was not received")
         });
         Ok((addr.to_string(), handle))
     }
@@ -4603,40 +5431,81 @@ mod security_tests {
             let Some(message::Union::PublicKey(public_key)) = msg_in.union else {
                 bail!("Handshake failed: invalid client response type");
             };
-            let (pairing_proof, symmetric_value) =
-                crate::common::unwrap_direct_public_key_symmetric_value(
-                    &public_key.symmetric_value,
-                    pairing_salt.is_some(),
-                )?;
-            let key =
-                tcp::Encrypt::decode(&symmetric_value, &public_key.asymmetric_value, &box_sk)?;
+            let public_key_payload = crate::common::unwrap_direct_public_key_payload(
+                &public_key.symmetric_value,
+                pairing_salt.is_some(),
+            )?;
+            let key = tcp::Encrypt::decode(
+                &public_key_payload.symmetric_value,
+                &public_key.asymmetric_value,
+                &box_sk,
+            )?;
             if let (Some(pairing_passphrase), Some(pairing_salt)) =
                 (pairing_passphrase.as_ref(), pairing_salt)
             {
-                let Some(pairing_proof) = pairing_proof else {
-                    bail!("Handshake failed: missing pairing proof");
-                };
                 let mut initiator_box_pk = [0u8; box_::PUBLICKEYBYTES];
                 initiator_box_pk.copy_from_slice(&public_key.asymmetric_value);
-                let expected_proof = crate::common::compute_direct_pairing_proof(
-                    pairing_passphrase,
-                    &pairing_salt,
-                    &peer_id,
-                    &sign_pk,
-                    &box_pk.0,
-                    &initiator_box_pk,
-                )?;
                 stream.set_key(key);
                 let mut ack = Message::new();
-                if pairing_proof != expected_proof {
+                let mut paired_initiator = None;
+                let mut error_text = None;
+                if let Some(pairing_proof) = public_key_payload.pairing_proof {
+                    let expected_proof = crate::common::compute_direct_pairing_proof(
+                        pairing_passphrase,
+                        &pairing_salt,
+                        &peer_id,
+                        &sign_pk,
+                        &box_pk.0,
+                        &initiator_box_pk,
+                    )?;
+                    if pairing_proof == expected_proof {
+                        if let Some(initiator) = public_key_payload.initiator.as_ref() {
+                            crate::common::validate_direct_public_key_initiator(
+                                initiator,
+                                &public_key.asymmetric_value,
+                            )?;
+                            paired_initiator = Some(initiator.clone());
+                        }
+                    } else {
+                        error_text = Some("Handshake failed: pairing passphrase rejected");
+                    }
+                } else {
+                    let trusted = if let Some(initiator) = public_key_payload.initiator.as_ref() {
+                        crate::common::validate_direct_public_key_initiator(
+                            initiator,
+                            &public_key.asymmetric_value,
+                        )?;
+                        Config::has_paired_viewer(
+                            crate::common::RENDEZVOUS_PAIRING_SCOPE,
+                            &initiator.id,
+                            &initiator.sign_pk,
+                        )
+                    } else {
+                        false
+                    };
+                    if !trusted {
+                        error_text = Some("Handshake failed: pairing passphrase required");
+                    }
+                }
+                if let Some(error_text) = error_text {
                     ack.set_message_box(MessageBox {
                         msgtype: "error".to_owned(),
                         title: "Connection Error".to_owned(),
-                        text: "Handshake failed: pairing passphrase rejected".to_owned(),
+                        text: error_text.to_owned(),
                         ..Default::default()
                     });
                     stream.send(&ack).await?;
-                    bail!("Handshake failed: pairing passphrase rejected");
+                    bail!("{}", error_text);
+                }
+                if let Some(initiator) = paired_initiator {
+                    Config::add_paired_viewer(PairedViewer {
+                        sign_pk: Bytes::from(initiator.sign_pk.to_vec()),
+                        time: get_time(),
+                        id: initiator.id,
+                        name: String::new(),
+                        platform: String::new(),
+                        scope: crate::common::RENDEZVOUS_PAIRING_SCOPE.to_owned(),
+                    });
                 }
                 ack.set_signed_id(SignedId {
                     id: crate::common::direct_handshake_ack_ok(),
@@ -4649,9 +5518,55 @@ mod security_tests {
         Ok((addr.to_string(), signed_id_pk, handle))
     }
 
+    #[test]
+    fn test_explicit_rendezvous_route_requires_id_relay_switch() {
+        let _guard = lock_security_tests();
+
+        struct RestoreRouteOptions {
+            allow_id_relay_server: String,
+        }
+
+        impl Drop for RestoreRouteOptions {
+            fn drop(&mut self) {
+                Config::set_option(
+                    keys::OPTION_ALLOW_ID_RELAY_SERVER.to_owned(),
+                    self.allow_id_relay_server.clone(),
+                );
+            }
+        }
+
+        let _restore = RestoreRouteOptions {
+            allow_id_relay_server: Config::get_option(keys::OPTION_ALLOW_ID_RELAY_SERVER),
+        };
+
+        Config::set_option(
+            keys::OPTION_ALLOW_ID_RELAY_SERVER.to_owned(),
+            "N".to_owned(),
+        );
+        let err = Client::resolve_explicit_rendezvous_server("hbbs.example.test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ID/Relay server routes are disabled"));
+
+        Config::set_option(
+            keys::OPTION_ALLOW_ID_RELAY_SERVER.to_owned(),
+            "Y".to_owned(),
+        );
+        let err = Client::resolve_explicit_rendezvous_server("  ")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No ID/Relay server route specified"));
+
+        let (server, alternates, contained) =
+            Client::resolve_explicit_rendezvous_server("hbbs.example.test").unwrap();
+        assert_eq!(server, format!("hbbs.example.test:{RENDEZVOUS_PORT}"));
+        assert!(alternates.is_empty());
+        assert!(contained);
+    }
+
     #[tokio::test]
     async fn test_secure_direct_connection_requires_pairing_or_pretrust() {
-        let _guard = TEST_CLIENT_SECURITY_LOCK.lock().unwrap();
+        let _guard = lock_security_tests();
         let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
         let peer_id = format!("direct-peer-{}", Uuid::new_v4());
         let peer_config_id = format!("direct-config-{}", Uuid::new_v4());
@@ -4665,15 +5580,13 @@ mod security_tests {
         let (addr, handle) = spawn_direct_handshake_peer(peer_id.clone(), sign_pk.0, sign_sk, None)
             .await
             .unwrap();
-        let mut conn = connect_tcp_local(addr.clone(), None, CONNECT_TIMEOUT)
-            .await
-            .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
         let err = Client::secure_direct_connection(&addr, &peer_config_id, &mut conn, interface)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains(
-            "first direct secure contact requires a trusted peer key or local pairing passphrase"
+            "first direct secure contact requires a trusted peer key or local/rendezvous pairing passphrase"
         ));
         handle.abort();
         PeerConfig::remove(&peer_config_id);
@@ -4684,8 +5597,8 @@ mod security_tests {
     }
 
     #[tokio::test]
-    async fn test_secure_direct_connection_with_pairing_pins_and_rejects_changed_key() {
-        let _guard = TEST_CLIENT_SECURITY_LOCK.lock().unwrap();
+    async fn test_secure_direct_connection_with_pairing_repairs_changed_key() {
+        let _guard = lock_security_tests();
         let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
         let peer_id = format!("direct-peer-{}", Uuid::new_v4());
         let peer_config_id = format!("direct-config-{}", Uuid::new_v4());
@@ -4704,9 +5617,7 @@ mod security_tests {
         )
         .await
         .unwrap();
-        let mut conn = connect_tcp_local(addr.clone(), None, CONNECT_TIMEOUT)
-            .await
-            .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
         let pk =
             Client::secure_direct_connection(&addr, &peer_config_id, &mut conn, interface.clone())
                 .await
@@ -4727,20 +5638,21 @@ mod security_tests {
         )
         .await
         .unwrap();
-        let mut changed_conn = connect_tcp_local(changed_addr.clone(), None, CONNECT_TIMEOUT)
-            .await
-            .unwrap();
-        let err = Client::secure_direct_connection(
+        let mut changed_conn = connect_security_test_tcp(&changed_addr).await.unwrap();
+        let pk = Client::secure_direct_connection(
             &changed_addr,
             &peer_config_id,
             &mut changed_conn,
             interface,
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("peer identity changed"));
-        changed_handle.abort();
+        .unwrap();
+        assert_eq!(pk, changed_sign_pk.0.to_vec());
+        assert!(
+            crate::common::has_trusted_peer_signing_key(&peer_config_id, &changed_sign_pk.0)
+                .unwrap()
+        );
+        changed_handle.await.unwrap().unwrap();
 
         PeerConfig::remove(&peer_config_id);
         Config::set_option(
@@ -4750,8 +5662,262 @@ mod security_tests {
     }
 
     #[tokio::test]
+    async fn test_secure_direct_connection_rejects_changed_key_without_pairing() {
+        let _guard = lock_security_tests();
+        let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
+        let peer_id = format!("direct-peer-{}", Uuid::new_v4());
+        let peer_config_id = format!("direct-config-{}", Uuid::new_v4());
+        let (trusted_sign_pk, _) = sign::gen_keypair();
+        let (changed_sign_pk, changed_sign_sk) = sign::gen_keypair();
+
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            "N".to_owned(),
+        );
+        crate::common::pin_trusted_peer_signing_key(&peer_id, &peer_config_id, &trusted_sign_pk.0)
+            .unwrap();
+
+        let interface = TestInterface::new(&peer_config_id, None);
+        let (addr, handle) =
+            spawn_direct_handshake_peer(peer_id, changed_sign_pk.0, changed_sign_sk, None)
+                .await
+                .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        let err = Client::secure_direct_connection(&addr, &peer_config_id, &mut conn, interface)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pairing passphrase is required to repair trust"));
+        handle.abort();
+
+        PeerConfig::remove(&peer_config_id);
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            saved_allow,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secure_direct_connection_reuses_paired_viewer() {
+        let _guard = lock_security_tests();
+        let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
+        let saved_remember = Config::get_option(keys::OPTION_REMEMBER_PAIRED_VIEWERS);
+        let peer_id = format!("direct-peer-{}", Uuid::new_v4());
+        let peer_config_id = format!("direct-config-{}", Uuid::new_v4());
+        let (trusted_sign_pk, trusted_sign_sk) = sign::gen_keypair();
+
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            "N".to_owned(),
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            "Y".to_owned(),
+        );
+
+        let first_interface = TestInterface::new(&peer_config_id, Some("local-secret"));
+        let (addr, handle) = spawn_direct_handshake_peer(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk.clone(),
+            Some("local-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        Client::secure_direct_connection(
+            &addr,
+            &peer_config_id,
+            &mut conn,
+            first_interface.clone(),
+        )
+        .await
+        .unwrap();
+        handle.await.unwrap().unwrap();
+        assert_eq!(first_interface.pairing_requests.lock().unwrap().len(), 1);
+        assert!(crate::common::has_confirmed_direct_paired_viewer(
+            &peer_config_id
+        ));
+
+        let second_interface = TestInterface::new(&peer_config_id, None);
+        let (addr, handle) = spawn_direct_handshake_peer(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk,
+            Some("local-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        let pk = Client::secure_direct_connection(
+            &addr,
+            &peer_config_id,
+            &mut conn,
+            second_interface.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pk, trusted_sign_pk.0.to_vec());
+        assert!(second_interface.pairing_requests.lock().unwrap().is_empty());
+        handle.await.unwrap().unwrap();
+
+        PeerConfig::remove(&peer_config_id);
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            saved_allow,
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            saved_remember,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secure_direct_connection_requires_pairing_when_paired_viewer_memory_disabled() {
+        let _guard = lock_security_tests();
+        let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
+        let saved_remember = Config::get_option(keys::OPTION_REMEMBER_PAIRED_VIEWERS);
+        let peer_id = format!("direct-peer-{}", Uuid::new_v4());
+        let peer_config_id = format!("direct-config-{}", Uuid::new_v4());
+        let (trusted_sign_pk, trusted_sign_sk) = sign::gen_keypair();
+
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            "N".to_owned(),
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            "Y".to_owned(),
+        );
+
+        let first_interface = TestInterface::new(&peer_config_id, Some("local-secret"));
+        let (addr, handle) = spawn_direct_handshake_peer(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk.clone(),
+            Some("local-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        Client::secure_direct_connection(
+            &addr,
+            &peer_config_id,
+            &mut conn,
+            first_interface.clone(),
+        )
+        .await
+        .unwrap();
+        handle.await.unwrap().unwrap();
+        assert!(crate::common::has_confirmed_direct_paired_viewer(
+            &peer_config_id
+        ));
+
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            "N".to_owned(),
+        );
+
+        let second_interface = TestInterface::new(&peer_config_id, None);
+        let (addr, handle) = spawn_direct_handshake_peer(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk,
+            Some("local-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        let err = Client::secure_direct_connection(
+            &addr,
+            &peer_config_id,
+            &mut conn,
+            second_interface.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("pairing passphrase was not provided"));
+        assert_eq!(second_interface.pairing_requests.lock().unwrap().len(), 1);
+        handle.abort();
+
+        PeerConfig::remove(&peer_config_id);
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            saved_allow,
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            saved_remember,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secure_direct_connection_retries_after_removed_paired_viewer() {
+        let _guard = lock_security_tests();
+        let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
+        let saved_remember = Config::get_option(keys::OPTION_REMEMBER_PAIRED_VIEWERS);
+        let peer_id = format!("direct-peer-{}", Uuid::new_v4());
+        let peer_config_id = format!("direct-config-{}", Uuid::new_v4());
+        let (trusted_sign_pk, trusted_sign_sk) = sign::gen_keypair();
+
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            "N".to_owned(),
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            "Y".to_owned(),
+        );
+        crate::common::pin_trusted_peer_signing_key(&peer_id, &peer_config_id, &trusted_sign_pk.0)
+            .unwrap();
+        crate::common::set_confirmed_direct_paired_viewer(&peer_config_id, true);
+
+        let interface = TestInterface::new(&peer_config_id, Some("local-secret"));
+        let (addr, handle) = spawn_direct_handshake_peer_refuse_paired_then_accept_pairing(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk,
+            "local-secret".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let (_conn, pk) = Client::connect_secure_direct_with_pairing_retry(
+            &addr,
+            &peer_config_id,
+            &addr,
+            interface.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pk, trusted_sign_pk.0.to_vec());
+        assert_eq!(interface.pairing_requests.lock().unwrap().len(), 1);
+        assert!(crate::common::has_confirmed_direct_paired_viewer(
+            &peer_config_id
+        ));
+        handle.await.unwrap().unwrap();
+
+        PeerConfig::remove(&peer_config_id);
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            saved_allow,
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            saved_remember,
+        );
+    }
+
+    #[tokio::test]
     async fn test_secure_connection_requires_pairing_or_pretrust() {
-        let _guard = TEST_CLIENT_SECURITY_LOCK.lock().unwrap();
+        let _guard = lock_security_tests();
         let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
         let peer_id = format!("secure-peer-{}", Uuid::new_v4());
         let peer_config_id = format!("secure-config-{}", Uuid::new_v4());
@@ -4767,9 +5933,7 @@ mod security_tests {
             spawn_secure_handshake_peer(peer_id.clone(), sign_pk.0, sign_sk, rs_sk, None)
                 .await
                 .unwrap();
-        let mut conn = connect_tcp_local(addr.clone(), None, CONNECT_TIMEOUT)
-            .await
-            .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
         let err = Client::secure_connection(
             &peer_id,
             &peer_id,
@@ -4783,7 +5947,7 @@ mod security_tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains(
-            "first secure contact requires a trusted peer key or peer pairing passphrase"
+            "first secure contact requires a trusted peer key or rendezvous pairing passphrase"
         ));
         handle.abort();
 
@@ -4795,18 +5959,24 @@ mod security_tests {
     }
 
     #[tokio::test]
-    async fn test_secure_connection_with_pairing_pins_and_rejects_changed_key() {
-        let _guard = TEST_CLIENT_SECURITY_LOCK.lock().unwrap();
+    async fn test_secure_connection_with_pairing_repairs_changed_key() {
+        let _guard = lock_security_tests();
         let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
+        let saved_remember = Config::get_option(keys::OPTION_REMEMBER_PAIRED_VIEWERS);
         let peer_id = format!("secure-peer-{}", Uuid::new_v4());
         let peer_config_id = format!("secure-config-{}", Uuid::new_v4());
         let interface = TestInterface::new(&peer_config_id, Some("server-secret"));
         let (trusted_sign_pk, trusted_sign_sk) = sign::gen_keypair();
         let (rs_pk, rs_sk) = sign::gen_keypair();
 
+        Config::clear_paired_viewers();
         Config::set_option(
             keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
             "N".to_owned(),
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            "Y".to_owned(),
         );
         let (addr, signed_id_pk, handle) = spawn_secure_handshake_peer(
             peer_id.clone(),
@@ -4817,9 +5987,7 @@ mod security_tests {
         )
         .await
         .unwrap();
-        let mut conn = connect_tcp_local(addr.clone(), None, CONNECT_TIMEOUT)
-            .await
-            .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
         let pk = Client::secure_connection(
             &peer_id,
             &peer_id,
@@ -4849,10 +6017,8 @@ mod security_tests {
         )
         .await
         .unwrap();
-        let mut changed_conn = connect_tcp_local(changed_addr.clone(), None, CONNECT_TIMEOUT)
-            .await
-            .unwrap();
-        let err = Client::secure_connection(
+        let mut changed_conn = connect_security_test_tcp(&changed_addr).await.unwrap();
+        let pk = Client::secure_connection(
             &peer_id,
             &peer_id,
             &peer_config_id,
@@ -4862,16 +6028,239 @@ mod security_tests {
             &mut changed_conn,
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("peer identity changed"));
-        changed_handle.abort();
+        .unwrap()
+        .unwrap();
+        assert_eq!(pk, changed_sign_pk.0.to_vec());
+        assert!(
+            crate::common::has_trusted_peer_signing_key(&peer_config_id, &changed_sign_pk.0)
+                .unwrap()
+        );
+        changed_handle.await.unwrap().unwrap();
 
         PeerConfig::remove(&peer_config_id);
+        Config::clear_paired_viewers();
         Config::set_option(
             keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
             saved_allow,
         );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            saved_remember,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secure_connection_reuses_paired_viewer() {
+        let _guard = lock_security_tests();
+        let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
+        let saved_remember = Config::get_option(keys::OPTION_REMEMBER_PAIRED_VIEWERS);
+        let peer_id = format!("secure-peer-{}", Uuid::new_v4());
+        let peer_config_id = format!("secure-config-{}", Uuid::new_v4());
+        let (trusted_sign_pk, trusted_sign_sk) = sign::gen_keypair();
+        let (rs_pk, rs_sk) = sign::gen_keypair();
+
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            "N".to_owned(),
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            "Y".to_owned(),
+        );
+
+        let first_interface = TestInterface::new(&peer_config_id, Some("server-secret"));
+        let (addr, signed_id_pk, handle) = spawn_secure_handshake_peer(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk.clone(),
+            rs_sk.clone(),
+            Some("server-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        Client::secure_connection(
+            &peer_id,
+            &peer_id,
+            &peer_config_id,
+            signed_id_pk,
+            &crate::common::encode64(rs_pk.0),
+            &first_interface,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        handle.await.unwrap().unwrap();
+        assert_eq!(first_interface.pairing_requests.lock().unwrap().len(), 1);
+        assert!(crate::common::has_confirmed_rendezvous_paired_viewer(
+            &peer_config_id
+        ));
+
+        let second_interface = TestInterface::new(&peer_config_id, None);
+        let (addr, signed_id_pk, handle) = spawn_secure_handshake_peer(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk,
+            rs_sk,
+            Some("server-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        let pk = Client::secure_connection(
+            &peer_id,
+            &peer_id,
+            &peer_config_id,
+            signed_id_pk,
+            &crate::common::encode64(rs_pk.0),
+            &second_interface,
+            &mut conn,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pk, trusted_sign_pk.0.to_vec());
+        assert!(second_interface.pairing_requests.lock().unwrap().is_empty());
+        handle.await.unwrap().unwrap();
+
+        PeerConfig::remove(&peer_config_id);
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            saved_allow,
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            saved_remember,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secure_connection_clears_deleted_paired_viewer_and_requires_passphrase() {
+        let _guard = lock_security_tests();
+        let saved_allow = Config::get_option(keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
+        let saved_remember = Config::get_option(keys::OPTION_REMEMBER_PAIRED_VIEWERS);
+        let peer_id = format!("secure-peer-{}", Uuid::new_v4());
+        let peer_config_id = format!("secure-config-{}", Uuid::new_v4());
+        let (trusted_sign_pk, trusted_sign_sk) = sign::gen_keypair();
+        let (rs_pk, rs_sk) = sign::gen_keypair();
+
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            "N".to_owned(),
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            "Y".to_owned(),
+        );
+        crate::common::pin_trusted_peer_signing_key(&peer_id, &peer_config_id, &trusted_sign_pk.0)
+            .unwrap();
+        crate::common::set_confirmed_rendezvous_paired_viewer(&peer_config_id, true);
+
+        let refused_interface = TestInterface::new(&peer_config_id, None);
+        let (addr, signed_id_pk, handle) = spawn_secure_handshake_peer(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk.clone(),
+            rs_sk.clone(),
+            Some("server-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        let err = Client::secure_connection(
+            &peer_id,
+            &peer_id,
+            &peer_config_id,
+            signed_id_pk,
+            &crate::common::encode64(rs_pk.0),
+            &refused_interface,
+            &mut conn,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("pairing passphrase required"));
+        assert!(refused_interface
+            .pairing_requests
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(!crate::common::has_confirmed_rendezvous_paired_viewer(
+            &peer_config_id
+        ));
+        let _ = handle.await;
+
+        let retry_interface = TestInterface::new(&peer_config_id, Some("server-secret"));
+        let (addr, signed_id_pk, handle) = spawn_secure_handshake_peer(
+            peer_id.clone(),
+            trusted_sign_pk.0,
+            trusted_sign_sk,
+            rs_sk,
+            Some("server-secret".to_owned()),
+        )
+        .await
+        .unwrap();
+        let mut conn = connect_security_test_tcp(&addr).await.unwrap();
+        let pk = Client::secure_connection(
+            &peer_id,
+            &peer_id,
+            &peer_config_id,
+            signed_id_pk,
+            &crate::common::encode64(rs_pk.0),
+            &retry_interface,
+            &mut conn,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pk, trusted_sign_pk.0.to_vec());
+        assert_eq!(retry_interface.pairing_requests.lock().unwrap().len(), 1);
+        assert!(crate::common::has_confirmed_rendezvous_paired_viewer(
+            &peer_config_id
+        ));
+        handle.await.unwrap().unwrap();
+
+        PeerConfig::remove(&peer_config_id);
+        Config::clear_paired_viewers();
+        Config::set_option(
+            keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST.to_owned(),
+            saved_allow,
+        );
+        Config::set_option(
+            keys::OPTION_REMEMBER_PAIRED_VIEWERS.to_owned(),
+            saved_remember,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_retries_once_after_rendezvous_pairing_was_cleared() {
+        let _guard = lock_security_tests();
+        let peer_config_id = format!("secure-config-{}", Uuid::new_v4());
+        let attempts = Arc::new(Mutex::new(0usize));
+
+        crate::common::set_confirmed_rendezvous_paired_viewer(&peer_config_id, true);
+        let result = Client::retry_after_cleared_rendezvous_pairing(&peer_config_id, || {
+            let attempts = attempts.clone();
+            let peer_config_id = peer_config_id.clone();
+            async move {
+                let mut attempts = attempts.lock().unwrap();
+                *attempts += 1;
+                if *attempts == 1 {
+                    crate::common::set_confirmed_rendezvous_paired_viewer(&peer_config_id, false);
+                    bail!("Handshake failed: pairing passphrase required");
+                }
+                Ok("retried")
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, "retried");
+        assert_eq!(*attempts.lock().unwrap(), 2);
+        PeerConfig::remove(&peer_config_id);
     }
 }
 

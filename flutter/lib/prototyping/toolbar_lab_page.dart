@@ -101,16 +101,16 @@ class _ToolbarLabPageState extends State<ToolbarLabPage> {
                     child: IgnorePointer(
                       child: DecoratedBox(
                         decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(26),
+                          borderRadius: BorderRadius.circular(4.0),
                           border: Border.all(
-                            color: scheme.primary.withValues(alpha: 0.28),
+                            color: scheme.primary.withOpacity(0.28),
                           ),
                           gradient: LinearGradient(
                             begin: Alignment.topCenter,
                             end: Alignment.bottomCenter,
                             colors: [
-                              scheme.primary.withValues(alpha: 0.18),
-                              scheme.primary.withValues(alpha: 0.04),
+                              scheme.primary.withOpacity(0.18),
+                              scheme.primary.withOpacity(0.04),
                               Colors.transparent,
                             ],
                           ),
@@ -301,8 +301,8 @@ class _ToolbarLabPageState extends State<ToolbarLabPage> {
     final toolbarRect = _toolbarRect(_shape);
     final expanded = _shape == ToolbarLabShape.expanded;
     final borderRadius = expanded
-        ? const BorderRadius.all(Radius.circular(4))
-        : const BorderRadius.vertical(bottom: Radius.circular(5));
+        ? const BorderRadius.all(Radius.circular(4.0))
+        : const BorderRadius.vertical(bottom: Radius.circular(4.0));
 
     return Positioned(
       left: toolbarRect.left,
@@ -754,7 +754,7 @@ class _CompactIconButton extends StatelessWidget {
       style: buttonStyle.copyWith(
         backgroundColor: WidgetStateProperty.resolveWith((states) {
           if (states.contains(WidgetState.hovered)) {
-            return _LabToolbarTheme.blueColor.withValues(alpha: 0.15);
+            return _LabToolbarTheme.blueColor.withOpacity(0.15);
           }
           return Colors.transparent;
         }),
@@ -878,8 +878,8 @@ class _ToolbarLabBackdrop extends StatelessWidget {
             child: IgnorePointer(
               child: CustomPaint(
                 painter: _BackdropGridPainter(
-                  lineColor: scheme.outlineVariant.withValues(
-                    alpha: isDark ? 0.16 : 0.3,
+                  lineColor: scheme.outlineVariant.withOpacity(
+                    isDark ? 0.16 : 0.3,
                   ),
                 ),
               ),
@@ -919,7 +919,7 @@ class _ToolbarLabBackdrop extends StatelessWidget {
                   height: 20,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: scheme.primary.withValues(alpha: 0.16),
+                    color: scheme.primary.withOpacity(0.16),
                     border: Border.all(color: scheme.primary, width: 2),
                   ),
                 ),
@@ -948,25 +948,25 @@ class _MockMonitorCard extends StatelessWidget {
       aspectRatio: 16 / 10,
       child: Container(
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(28),
+          borderRadius: BorderRadius.circular(4.0),
           border: Border.all(
             color: isDark
-                ? Colors.white.withValues(alpha: 0.08)
-                : Colors.white.withValues(alpha: 0.7),
+                ? Colors.white.withOpacity(0.08)
+                : Colors.white.withOpacity(0.7),
             width: 1.4,
           ),
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
             colors: [
-              accent.withValues(alpha: isDark ? 0.24 : 0.14),
-              accent.withValues(alpha: isDark ? 0.1 : 0.05),
+              accent.withOpacity(isDark ? 0.24 : 0.14),
+              accent.withOpacity(isDark ? 0.1 : 0.05),
               isDark ? const Color(0xFF1A2230) : Colors.white,
             ],
           ),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withValues(alpha: isDark ? 0.24 : 0.08),
+              color: Colors.black.withOpacity(isDark ? 0.24 : 0.08),
               blurRadius: 24,
               offset: const Offset(0, 12),
             ),
@@ -1026,10 +1026,10 @@ class _MockChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
-        color: scheme.surface.withValues(alpha: 0.66),
+        color: scheme.surface.withOpacity(0.66),
         borderRadius: BorderRadius.circular(999),
         border: Border.all(
-          color: scheme.outlineVariant.withValues(alpha: 0.55),
+          color: scheme.outlineVariant.withOpacity(0.55),
         ),
       ),
       child: Text(label),

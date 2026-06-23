@@ -43,6 +43,27 @@ Optional overrides:
 
 Use `-NoHwCodec` to build without the `hwcodec` feature.
 Use `-Clean` to force-refresh Flutter metadata and Windows build intermediates.
+The Windows build and validation scripts set `RUSTDESK_WINDOWS_CODEC_ROOT` and
+`CMAKE_PREFIX_PATH` from `-DepsRoot`, so clean machines do not fall back to an
+incomplete Visual Studio vcpkg prefix.
+
+The scripts also generate `flutter_rust_bridge` files when they are missing or
+older than `src/flutter_ffi.rs`. Install the generator once:
+
+```powershell
+cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked --force
+```
+
+If `ffigen` cannot find `libclang.dll`, pass an LLVM root that contains
+`bin\libclang.dll`:
+
+```powershell
+.\scripts\build_windows.ps1 `
+  -BridgeLlvmPath "D:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64"
+```
+
+Use `-SkipBridgeGen` when generated files are already current and the generator
+is not installed. Use `-ForceBridgeGen` to regenerate them anyway.
 
 Toolbar lab:
 
@@ -58,13 +79,16 @@ flutter\build\windows\x64\runner\Release
 
 ## Linux
 
-Default layout:
+The Linux wrapper discovers Flutter from `PATH`, or from
+`RUSTADMIN_FLUTTER_ROOT` when set. Native codec dependencies can come from
+system `pkg-config` packages, from `RUSTADMIN_LINUX_CODEC_ROOT`, or from the
+repo-local `.local/linux-codecs` prefix.
 
-```text
-/mnt/f/GH/flutter
-/mnt/f/GH/flutter-pub-cache-linux
-/mnt/f/GH/rustdesk-target-linux
-.local/linux-codecs, or /mnt/f/UBc/Release
+Common system packages on Debian/Ubuntu:
+
+```bash
+sudo apt install pkg-config libgtk-3-dev libpam0g-dev libclang-dev \
+  libyuv-dev libvpx-dev libaom-dev libopus-dev
 ```
 
 Run:
@@ -73,12 +97,31 @@ Run:
 scripts/build_linux.sh
 ```
 
+By default this builds the Flutter bundle and a release zip under `dist/linux`.
+To build a Debian package instead:
+
+```bash
+scripts/build_linux.sh --deb
+```
+
+To build both:
+
+```bash
+scripts/build_linux.sh --package all
+```
+
 Optional:
 
 ```bash
-RUSTDESK_LINUX_CODEC_ROOT=/mnt/f/DVS/linux scripts/build_linux.sh --clean
+RUSTADMIN_FLUTTER_ROOT=/path/to/flutter \
+RUSTADMIN_LINUX_CODEC_ROOT=/path/to/codec-prefix \
+scripts/build_linux.sh --clean
+
 scripts/build_linux.sh --hwcodec
 ```
+
+Legacy `RUSTDESK_*` Linux variable names are still accepted for compatibility
+with inherited build code.
 
 Toolbar lab:
 
@@ -86,10 +129,23 @@ Toolbar lab:
 scripts/run_toolbar_lab_linux.sh
 ```
 
+Validation tests:
+
+```bash
+scripts/run_linux_tests.sh
+```
+
 Final bundle:
 
 ```text
 flutter/build/linux/x64/release/bundle
+```
+
+Linux package outputs:
+
+```text
+dist/linux/*.zip
+dist/linux/*.deb
 ```
 
 ## macOS
@@ -100,12 +156,31 @@ Run on macOS:
 scripts/build_macos.sh
 ```
 
-Optional:
+Hardware codecs are enabled by default. If FFmpeg/hwcodec dependencies are not
+available, the script writes `build/macos-build-report.md`, reports the fallback
+as an error, and exits nonzero so the issue is not missed. Use `--no-hwcodec`
+when a non-hardware-codec build is intentional, or set
+`RUSTADMIN_MACOS_ALLOW_HWCODEC_FALLBACK=1` to allow an automatic fallback.
+
+Override the report path when needed:
 
 ```bash
-RUSTDESK_FLUTTER_ROOT=/path/to/flutter \
-RUSTDESK_MACOS_CODEC_ROOT=/path/to/prefix \
+RUSTADMIN_MACOS_BUILD_REPORT=/tmp/rustadmin-macos-report.md \
+scripts/build_macos.sh
+```
+
+Optional codec prefix:
+
+```bash
+RUSTADMIN_FLUTTER_ROOT=/path/to/flutter \
+RUSTADMIN_MACOS_CODEC_ROOT=/path/to/prefix \
 scripts/build_macos.sh --screencapturekit
+```
+
+Explicitly disable hardware codecs:
+
+```bash
+scripts/build_macos.sh --no-hwcodec
 ```
 
 Toolbar lab:
@@ -114,11 +189,51 @@ Toolbar lab:
 scripts/run_toolbar_lab_macos.sh
 ```
 
+Validation tests:
+
+```bash
+scripts/run_macos_tests.sh
+```
+
 Final bundle:
 
 ```text
 flutter/build/macos/Build/Products/Release
 ```
+
+Package, sign, and optionally notarize a distribution DMG:
+
+```bash
+SKIP_NOTARY=1 \
+SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
+scripts/package_macos.sh
+```
+
+Fast signing and dependency verification without creating a DMG:
+
+```bash
+SKIP_NOTARY=1 SKIP_DMG=1 SIGN_IDENTITY=- scripts/package_macos.sh
+```
+
+For notarization with an existing `notarytool` keychain profile:
+
+```bash
+SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
+NOTARY_PROFILE="rustadmin-notary" \
+scripts/package_macos.sh
+```
+
+Portable notarization without storing credentials:
+
+```bash
+SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
+NOTARY_APPLE_ID=developer@example.com \
+NOTARY_TEAM_ID=TEAMID \
+scripts/package_macos.sh
+```
+
+If `NOTARY_PASSWORD` is omitted, `xcrun notarytool` prompts for the
+app-specific password. The script does not store credentials.
 
 ## Do Not Distribute
 
@@ -145,3 +260,20 @@ Common options:
 
 - Linux/macOS: `--clean`, `--skip-cargo`, `--device DEVICE`, `-- ...extra flutter run args`
 - Windows: `-Clean`, `-SkipCargo`, `-Device windows`, `-HwCodec`, plus extra trailing `flutter run` args
+
+## Validation Runners
+
+The Linux/macOS test runners mirror `scripts/run_windows_tests.ps1`: each step
+writes a dedicated log under `target/<platform>-test-logs/`, then prints a final
+summary table.
+
+Common options:
+
+- `--flutter-root PATH`
+- `--pub-cache PATH`
+- `--cargo-target-dir PATH`
+- `--features flutter,use_dasp`
+- `--skip-full-client`
+- `--skip-hbb-common`
+- `--skip-flutter`
+- `--stop-on-failure`

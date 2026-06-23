@@ -27,6 +27,11 @@ use std::{
         Arc, RwLock,
     },
 };
+#[cfg(target_os = "android")]
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 /// tag "main" for [Desktop Main Page] and [Mobile (Client and Server)] (the mobile don't need multiple windows, only one global event stream is needed)
 /// tag "cm" only for [Desktop CM Page]
@@ -245,6 +250,19 @@ struct RgbaData {
     // We must check the `rgba_valid` before reading [rgba].
     data: Vec<u8>,
     valid: bool,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Default)]
+struct RgbaSoftRenderDiag {
+    delivered: usize,
+    skipped: usize,
+    last_log: Option<Instant>,
+}
+
+#[cfg(target_os = "android")]
+lazy_static::lazy_static! {
+    static ref RGBA_SOFT_RENDER_DIAG: Mutex<HashMap<usize, RgbaSoftRenderDiag>> = Default::default();
 }
 
 pub type FlutterRgbaRendererPluginOnRgba = unsafe extern "C" fn(
@@ -728,6 +746,109 @@ impl InvokeUiSession for FlutterHandler {
                     &status.codec_format.map_or(NULL, |it| it.to_string()),
                 ),
                 ("chroma", &status.chroma.map_or(NULL, |it| it.to_string())),
+                (
+                    "codec_path",
+                    &status.codec_path.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "render_path",
+                    &status.render_path.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "frame_resolution",
+                    &status.frame_resolution.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "queue_len",
+                    &status.queue_len.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "decode_fps",
+                    &status.decode_fps.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "auto_fps",
+                    &status.auto_fps.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "fps_mode",
+                    &status.fps_mode.map_or(NULL, |it| it.to_string()),
+                ),
+                ("direct", &status.direct.map_or(NULL, |it| it.to_string())),
+                (
+                    "mediacodec_input_queue_ms",
+                    &status
+                        .mediacodec_input_queue_ms
+                        .map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "mediacodec_output_dequeue_ms",
+                    &status
+                        .mediacodec_output_dequeue_ms
+                        .map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "yuv_to_rgba_ms",
+                    &status.yuv_to_rgba_ms.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "mediacodec_decode_ms",
+                    &status
+                        .mediacodec_decode_ms
+                        .map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "handle_frame_ms",
+                    &status.handle_frame_ms.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "flutter_handoff_ms",
+                    &status.flutter_handoff_ms.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "end_to_end_ms",
+                    &status.end_to_end_ms.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "rgba_bytes",
+                    &status.rgba_bytes.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "rgba_reallocated",
+                    &status.rgba_reallocated.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "output_buffer_bytes",
+                    &status.output_buffer_bytes.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "media_format",
+                    &status.media_format.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "host_video_fps",
+                    &status.host_video_fps.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "host_video_codec",
+                    &status.host_video_codec.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "host_video_qos",
+                    &status.host_video_qos.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "host_video_wait",
+                    &status.host_video_wait.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "host_video_backend",
+                    &status.host_video_backend.map_or(NULL, |it| it.to_string()),
+                ),
+                (
+                    "host_video_fallback",
+                    &status.host_video_fallback.map_or(NULL, |it| it.to_string()),
+                ),
             ],
             &[],
         );
@@ -1183,6 +1304,45 @@ impl InvokeUiSession for FlutterHandler {
 }
 
 impl FlutterHandler {
+    #[cfg(target_os = "android")]
+    fn diag_rgba_soft_render(
+        display: usize,
+        skipped: bool,
+        width: usize,
+        height: usize,
+        rgba_bytes: usize,
+        reason: &'static str,
+    ) {
+        let now = Instant::now();
+        let mut lock = RGBA_SOFT_RENDER_DIAG.lock().unwrap();
+        let entry = lock.entry(display).or_default();
+        let event_count = if skipped {
+            entry.skipped += 1;
+            entry.skipped
+        } else {
+            entry.delivered += 1;
+            entry.delivered
+        };
+        let periodic = entry
+            .last_log
+            .map(|last| now.saturating_duration_since(last) >= Duration::from_secs(5))
+            .unwrap_or(true);
+        if event_count <= 5 || periodic {
+            entry.last_log = Some(now);
+            log::info!(
+                "diag android rgba soft render: display={}, render_path=rgba_soft_render, skipped={}, reason={}, frame_resolution={}x{}, rgba_bytes={}, delivered_total={}, skipped_total={}",
+                display,
+                skipped,
+                reason,
+                width,
+                height,
+                rgba_bytes,
+                entry.delivered,
+                entry.skipped
+            );
+        }
+    }
+
     #[inline]
     fn on_rgba_soft_render(&self, display: usize, rgba: &mut scrap::ImageRgb) {
         // Give a chance for plugins or etc to hook a rgba data.
@@ -1194,11 +1354,23 @@ impl FlutterHandler {
                 }
             }
         }
+        let frame_width = rgba.w;
+        let frame_height = rgba.h;
+        let frame_bytes = rgba.raw.len();
         // If the current rgba is not fetched by flutter, i.e., is valid.
         // We give up sending a new event to flutter.
         let mut rgba_write_lock = self.display_rgbas.write().unwrap();
         if let Some(rgba_data) = rgba_write_lock.get_mut(&display) {
             if rgba_data.valid {
+                #[cfg(target_os = "android")]
+                Self::diag_rgba_soft_render(
+                    display,
+                    true,
+                    frame_width,
+                    frame_height,
+                    frame_bytes,
+                    "previous_rgba_valid",
+                );
                 return;
             } else {
                 rgba_data.valid = true;
@@ -1243,6 +1415,19 @@ impl FlutterHandler {
                 rgba_data.valid = false;
             }
         }
+        #[cfg(target_os = "android")]
+        Self::diag_rgba_soft_render(
+            display,
+            false,
+            frame_width,
+            frame_height,
+            frame_bytes,
+            if is_sent {
+                "event_sent"
+            } else {
+                "no_matching_flutter_session"
+            },
+        );
     }
 
     #[inline]
@@ -1479,6 +1664,13 @@ pub fn send_clipboard_msg(msg: Message, _is_file: bool) {
     }
 }
 
+#[cfg(not(target_os = "ios"))]
+pub fn send_debug_msg(msg: Message) {
+    for s in sessions::get_sessions() {
+        s.send(Data::Message(msg.clone()));
+    }
+}
+
 // Server Side
 #[cfg(not(any(target_os = "ios")))]
 pub mod connection_manager {
@@ -1523,6 +1715,29 @@ pub mod connection_manager {
             self.push_event(
                 "chat_server_mode",
                 &[("id", &id.to_string()), ("text", &text)],
+            );
+        }
+
+        fn permission_update(&self, id: i32, name: String, enabled: bool) {
+            self.push_event(
+                "permission_update",
+                &[
+                    ("id", &id.to_string()),
+                    ("permission_name", &name),
+                    ("enabled", &enabled.to_string()),
+                ],
+            );
+        }
+
+        fn permission_request(&self, id: i32, request_id: u64, name: String, enabled: bool) {
+            self.push_event(
+                "permission_request",
+                &[
+                    ("id", &id.to_string()),
+                    ("request_id", &request_id.to_string()),
+                    ("permission_name", &name),
+                    ("enabled", &enabled.to_string()),
+                ],
             );
         }
 

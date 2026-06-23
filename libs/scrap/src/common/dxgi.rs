@@ -57,6 +57,15 @@ impl TraitCapturer for Capturer {
         self.inner.set_gdi()
     }
 
+    fn cancel_gdi(&mut self) -> bool {
+        self.inner.cancel_gdi();
+        !self.inner.is_gdi()
+    }
+
+    fn gdi_fallback_reason(&self) -> String {
+        self.inner.gdi_fallback_reason().to_owned()
+    }
+
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice {
         self.inner.device()
@@ -248,6 +257,71 @@ impl TraitCapturer for CapturerMag {
 
     fn is_gdi(&self) -> bool {
         false
+    }
+
+    fn is_mag(&self) -> bool {
+        true
+    }
+
+    fn set_gdi(&mut self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "vram")]
+    fn device(&self) -> AdapterDevice {
+        AdapterDevice::default()
+    }
+
+    #[cfg(feature = "vram")]
+    fn set_output_texture(&mut self, _texture: bool) {}
+}
+
+pub struct CapturerWgc {
+    inner: dxgi::wgc::CapturerWgc,
+    data: Vec<u8>,
+}
+
+impl CapturerWgc {
+    pub fn is_supported() -> bool {
+        dxgi::wgc::CapturerWgc::is_supported()
+    }
+
+    pub fn new(display: Display) -> io::Result<Self> {
+        Ok(CapturerWgc {
+            inner: dxgi::wgc::CapturerWgc::new(
+                display.0.hmonitor(),
+                display.width(),
+                display.height(),
+            )?,
+            data: Vec::new(),
+        })
+    }
+
+    pub fn width(&self) -> usize {
+        self.inner.width()
+    }
+
+    pub fn height(&self) -> usize {
+        self.inner.height()
+    }
+}
+
+impl TraitCapturer for CapturerWgc {
+    fn frame<'a>(&'a mut self, timeout: Duration) -> io::Result<Frame<'a>> {
+        self.inner.frame(&mut self.data, timeout)?;
+        Ok(Frame::PixelBuffer(PixelBuffer::with_BGRA(
+            &self.data,
+            self.inner.width(),
+            self.inner.height(),
+        )))
+    }
+
+    fn is_gdi(&self) -> bool {
+        false
+    }
+
+    fn is_wgc(&self) -> bool {
+        true
     }
 
     fn set_gdi(&mut self) -> bool {

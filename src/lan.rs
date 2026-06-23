@@ -89,14 +89,31 @@ fn build_lan_discovery_response(p: PeerDiscovery, addr: SocketAddr) -> Option<Me
         ..Default::default()
     };
     if trusted_requester {
+        #[cfg(not(target_os = "ios"))]
         let mut hostname = crate::whoami_hostname();
+        #[cfg(target_os = "ios")]
+        let mut hostname = crate::common::hostname();
         if hostname == "localhost" {
             hostname = "unknown".to_owned();
         }
         peer.mac = get_mac(&self_addr);
         peer.hostname = hostname;
-        peer.username = crate::platform::get_active_username();
-        peer.platform = whoami::platform().to_string();
+        #[cfg(not(target_os = "ios"))]
+        {
+            peer.username = crate::platform::get_active_username();
+        }
+        #[cfg(target_os = "ios")]
+        {
+            peer.username = crate::common::username();
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            peer.platform = whoami::platform().to_string();
+        }
+        #[cfg(target_os = "ios")]
+        {
+            peer.platform = "iOS".to_owned();
+        }
     }
     let Ok(misc) = crate::common::create_lan_discovery_response_misc(&peer, &request.nonce) else {
         log::error!("Failed to sign LAN discovery response for {addr}");
@@ -233,6 +250,9 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
+    // These tests mutate process-wide Config state and inspect local LAN/system
+    // behavior. Run the full client library suite with `-- --test-threads=1`;
+    // this module lock only protects tests inside this module.
     static TEST_LAN_LOCK: Mutex<()> = Mutex::new(());
 
     fn make_ping(

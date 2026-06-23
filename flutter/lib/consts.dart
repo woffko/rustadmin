@@ -7,6 +7,32 @@ import 'package:get/get.dart';
 const int kMaxVirtualDisplayCount = 4;
 const int kAllVirtualDisplay = -1;
 
+const String kRustAdminSourceUrl =
+    'https://github.com/RustAdministrator/rustadmin';
+const String kRustDeskUpstreamUrl = 'https://github.com/rustdesk/rustdesk';
+const String kRustAdminForkSummary =
+    'RustAdmin is an independent administrator- and security-oriented fork of RustDesk.';
+const String kRustAdminUpstreamAttribution =
+    'Portions are based on RustDesk by Purslane Ltd. and RustDesk contributors.';
+const String kRustAdminLicenseNotice =
+    'Licensed under the GNU Affero General Public License v3.0.';
+const String kRustAdminNoEndorsementNotice =
+    'This project is not affiliated with or endorsed by RustDesk.';
+
+String rustAdminLegalNotice({String runtimeLicense = ''}) {
+  final lines = [
+    'Copyright (C) ${DateTime.now().year} RustAdministrator.',
+    kRustAdminUpstreamAttribution,
+    kRustAdminLicenseNotice,
+    kRustAdminNoEndorsementNotice,
+  ];
+  final normalizedLicense = runtimeLicense.trim();
+  if (normalizedLicense.isNotEmpty) {
+    lines.add(normalizedLicense);
+  }
+  return lines.join('\n');
+}
+
 const double kDesktopRemoteTabBarHeight = 28.0;
 const int kInvalidWindowId = -1;
 const int kMainWindowId = 0;
@@ -28,6 +54,9 @@ const String kPlatformAdditionsAmyuniVirtualDisplays =
 const String kPlatformAdditionsHasFileClipboard = "has_file_clipboard";
 const String kPlatformAdditionsSupportedPrivacyModeImpl =
     "supported_privacy_mode_impl";
+const String kPlatformAdditionsFullVersion = "full_version";
+const String kPlatformAdditionsSupportCaptureBackend =
+    "support_capture_backend";
 
 const String kPeerPlatformWindows = "Windows";
 const String kPeerPlatformLinux = "Linux";
@@ -82,6 +111,10 @@ const String kOptionViewStyle = "view_style";
 const String kOptionScrollStyle = "scroll_style";
 const String kOptionEdgeScrollEdgeThickness = "edge-scroll-edge-thickness";
 const String kOptionImageQuality = "image_quality";
+const String kOptionCustomImageQuality = "custom_image_quality";
+const String kOptionCustomFps = "custom-fps";
+const String kOptionCustomFpsMode = "custom-fps-mode";
+const String kOptionCaptureBackend = "capture-backend";
 const String kOptionOpenNewConnInTabs = "enable-open-new-connections-in-tabs";
 const String kOptionTextureRender = "use-texture-render";
 const String kOptionD3DRender = "allow-d3d-render";
@@ -99,6 +132,7 @@ const String kOptionDirectAccessPort = "direct-access-port";
 const String kOptionDirectAccessPairingPassphrase =
     "direct-access-pairing-passphrase";
 const String kOptionPeerPairingPassphrase = "peer-pairing-passphrase";
+const String kOptionRememberPairedViewers = "remember-paired-viewers";
 const String kOptionAllowUnverifiedPeerTrust = "allow-unverified-peer-trust";
 const String kLanDiscoveryModeOff = "off";
 const String kLanDiscoveryModeTrustedPeersOnly = "trusted-only";
@@ -109,11 +143,18 @@ const String kOptionEnableHwcodec = "enable-hwcodec";
 const String kOptionAllowAutoRecordIncoming = "allow-auto-record-incoming";
 const String kOptionAllowAutoRecordOutgoing = "allow-auto-record-outgoing";
 const String kOptionVideoSaveDirectory = "video-save-directory";
+const String kOptionAllowClipboardDebug = "allow-clipboard-debug";
 const String kOptionAccessMode = "access-mode";
 const String kOptionEnableKeyboard = "enable-keyboard";
 // "Settings -> Security -> Permissions"
 const String kOptionEnableRemotePrinter = "enable-remote-printer";
 const String kOptionEnableClipboard = "enable-clipboard";
+const String kOptionClipboardDirection = "one-way-clipboard-redirection";
+const String kSessionToggleClipboardDirectionPrefix = "clipboard-direction:";
+const String kClipboardDirectionBoth = "both";
+const String kClipboardDirectionLocalToRemote = "local-to-remote";
+const String kClipboardDirectionRemoteToLocal = "remote-to-local";
+const String kClipboardDirectionOff = "off";
 const String kOptionEnableFileTransfer = "enable-file-transfer";
 const String kOptionEnableAudio = "enable-audio";
 const String kOptionEnableCamera = "enable-camera";
@@ -145,16 +186,64 @@ const String kOptionTouchMode = "touch-mode";
 const String kOptionI444 = "i444";
 const String kOptionSwapLeftRightMouse = "swap-left-right-mouse";
 const String kOptionCodecPreference = "codec-preference";
+const String kOptionQualityMonitorPosition = "quality-monitor-position";
+const String kOptionQualityMonitorDebugMode = "quality-monitor-debug-mode";
+const String kQualityMonitorPositionTopRight = "top-right";
+const String kQualityMonitorPositionTopLeft = "top-left";
+const String kQualityMonitorPositionBottomRight = "bottom-right";
+const String kQualityMonitorPositionBottomLeft = "bottom-left";
 const String kOptionRemoteMenubarDragLeft = "remote-menubar-drag-left";
 const String kOptionRemoteMenubarDragRight = "remote-menubar-drag-right";
 const String kOptionRemoteToolbarRevealZonePx = "remote-toolbar-reveal-zone-px";
 const String kOptionRemoteToolbarHideDelayMs = "remote-toolbar-hide-delay-ms";
+const String kOptionRemoteToolbarPinnedOpacityPercent =
+    "remote-toolbar-pinned-opacity-percent";
+const String kOptionRemoteToolbarPinnedDimDelayMs =
+    "remote-toolbar-pinned-dim-delay-ms";
+const String kOptionRemoteToolbarPinnedDimDurationMs =
+    "remote-toolbar-pinned-dim-duration-ms";
 const int kDefaultRemoteToolbarRevealZonePx = 36;
 const int kMinRemoteToolbarRevealZonePx = 8;
 const int kMaxRemoteToolbarRevealZonePx = 160;
 const int kDefaultRemoteToolbarHideDelayMs = 300;
 const int kMinRemoteToolbarHideDelayMs = 0;
 const int kMaxRemoteToolbarHideDelayMs = 2000;
+const int kDefaultRemoteToolbarPinnedOpacityPercent = 20;
+const int kMinRemoteToolbarPinnedOpacityPercent = 1;
+const int kMaxRemoteToolbarPinnedOpacityPercent = 100;
+const int kDefaultRemoteToolbarPinnedDimDelayMs = 1000;
+const int kMinRemoteToolbarPinnedDimDelayMs = 0;
+const int kMaxRemoteToolbarPinnedDimDelayMs = 5000;
+const int kDefaultRemoteToolbarPinnedDimDurationMs = 3000;
+const int kMinRemoteToolbarPinnedDimDurationMs = 0;
+const int kMaxRemoteToolbarPinnedDimDurationMs = 10000;
+
+String normalizeQualityMonitorPosition(String value) {
+  switch (value) {
+    case kQualityMonitorPositionTopLeft:
+    case kQualityMonitorPositionBottomRight:
+    case kQualityMonitorPositionBottomLeft:
+      return value;
+    case kQualityMonitorPositionTopRight:
+    default:
+      return kQualityMonitorPositionTopRight;
+  }
+}
+
+String qualityMonitorPositionLabel(String value) {
+  switch (normalizeQualityMonitorPosition(value)) {
+    case kQualityMonitorPositionTopLeft:
+      return 'Top left';
+    case kQualityMonitorPositionBottomRight:
+      return 'Bottom right';
+    case kQualityMonitorPositionBottomLeft:
+      return 'Bottom left';
+    case kQualityMonitorPositionTopRight:
+    default:
+      return 'Top right';
+  }
+}
+
 const String kOptionHideAbTagsPanel = "hideAbTagsPanel";
 const String kOptionRemoteMenubarState = "remoteMenubarState";
 const String kOptionPeerSorting = "peer-sorting";
@@ -207,6 +296,7 @@ const String kOptionHideHelpCards = "hide-help-cards";
 const String kOptionAllowDeepLinkPassword = "allow-deep-link-password";
 const String kOptionAllowDeepLinkServerSettings =
     "allow-deep-link-server-settings";
+const String kOptionAllowIdRelayServer = "allow-id-relay-server";
 
 const String kOptionToggleViewOnly = "view-only";
 const String kOptionToggleShowMyCursor = "show-my-cursor";
@@ -254,7 +344,7 @@ const String kKeyReverseMouseWheel = "reverse_mouse_wheel";
 const String kMsgboxTextWaitingForImage = 'Connected, waiting for image...';
 
 // the executable name of the portable version
-const String kEnvPortableExecutable = "RUSTDESK_APPNAME";
+const String kEnvPortableExecutable = "RUSTADMIN_APPNAME";
 
 const Color kColorWarn = Color.fromARGB(255, 245, 133, 59);
 const Color kColorCanvas = Colors.black;
@@ -416,6 +506,9 @@ const kRemoteImageQualityLow = 'low';
 
 /// [kRemoteImageQualityCustom] Custom image quality.
 const kRemoteImageQualityCustom = 'custom';
+
+const kCustomFpsModeAdaptive = 'adaptive';
+const kCustomFpsModeFixed = 'fixed';
 
 const kIgnoreDpi = true;
 

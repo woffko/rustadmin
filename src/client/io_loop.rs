@@ -1,5 +1,5 @@
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::clipboard::{update_clipboard, ClipboardSide};
+use crate::clipboard::{update_clipboard_with_direction, ClipboardSide};
 #[cfg(not(any(target_os = "ios")))]
 use crate::{audio_service, clipboard::CLIPBOARD_INTERVAL, ConnInner, CLIENT_SERVER};
 use crate::{
@@ -53,6 +53,86 @@ use std::{
     },
 };
 
+const NO_VIDEO_START_TIMEOUT: Duration = Duration::from_secs(15);
+const NO_VIDEO_START_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const NO_VIDEO_START_MAX_REFRESHES: usize = 6;
+const NO_VIDEO_START_STALLED_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const FPS_CONTROL_SUMMARY_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, PartialEq, Eq)]
+enum NoVideoStartupAction {
+    None,
+    Refresh { attempt: usize, elapsed_ms: u128 },
+    Stalled { elapsed_ms: u128 },
+}
+
+#[derive(Default)]
+struct NoVideoStartupWatchdog {
+    since: Option<Instant>,
+    last_refresh: Option<Instant>,
+    refresh_count: usize,
+    last_stalled_log: Option<Instant>,
+}
+
+impl NoVideoStartupWatchdog {
+    fn reset(&mut self) {
+        self.since = None;
+        self.last_refresh = None;
+        self.refresh_count = 0;
+        self.last_stalled_log = None;
+    }
+
+    fn tick(
+        &mut self,
+        expects_video: bool,
+        is_connected: bool,
+        first_frame: bool,
+        now: Instant,
+    ) -> NoVideoStartupAction {
+        if !expects_video || !is_connected || first_frame {
+            self.reset();
+            return NoVideoStartupAction::None;
+        }
+
+        let Some(since) = self.since else {
+            self.since = Some(now);
+            return NoVideoStartupAction::None;
+        };
+
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < NO_VIDEO_START_TIMEOUT {
+            return NoVideoStartupAction::None;
+        }
+
+        let can_refresh = self.refresh_count < NO_VIDEO_START_MAX_REFRESHES
+            && self
+                .last_refresh
+                .map(|last| now.saturating_duration_since(last) >= NO_VIDEO_START_REFRESH_INTERVAL)
+                .unwrap_or(true);
+        if can_refresh {
+            self.refresh_count += 1;
+            self.last_refresh = Some(now);
+            return NoVideoStartupAction::Refresh {
+                attempt: self.refresh_count,
+                elapsed_ms: elapsed.as_millis(),
+            };
+        }
+
+        let should_log_stalled = self
+            .last_stalled_log
+            .map(|last| now.saturating_duration_since(last) >= NO_VIDEO_START_STALLED_LOG_INTERVAL)
+            .unwrap_or(true);
+        if should_log_stalled {
+            self.last_stalled_log = Some(now);
+            return NoVideoStartupAction::Stalled {
+                elapsed_ms: elapsed.as_millis(),
+            };
+        }
+
+        NoVideoStartupAction::None
+    }
+}
+
 pub struct Remote<T: InvokeUiSession> {
     handler: Session<T>,
     audio_sender: MediaSender,
@@ -78,6 +158,8 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
+    last_fps_control_summary_log: Option<Instant>,
+    video_recv_count: usize,
 }
 
 #[derive(Default)]
@@ -87,6 +169,14 @@ struct ParsedPeerInfo {
     idd_impl: String,
     support_view_camera: bool,
     support_terminal: bool,
+}
+
+fn session_permission_response_msgbox_type(approved: bool) -> &'static str {
+    if approved {
+        "custom-nocancel-success"
+    } else {
+        "custom-nocancel-error"
+    }
 }
 
 impl ParsedPeerInfo {
@@ -127,6 +217,8 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            last_fps_control_summary_log: None,
+            video_recv_count: 0,
         }
     }
 
@@ -164,6 +256,8 @@ impl<T: InvokeUiSession> Remote<T> {
         } else {
             ConnType::default()
         };
+        let expects_video =
+            conn_type == ConnType::DEFAULT_CONN || conn_type == ConnType::VIEW_CAMERA;
 
         match Client::start(
             &self.handler.get_id(),
@@ -217,6 +311,7 @@ impl<T: InvokeUiSession> Remote<T> {
                 let mut status_timer =
                     crate::rustdesk_interval(time::interval(Duration::new(1, 0)));
                 let mut fps_instant = Instant::now();
+                let mut no_video_watchdog = NoVideoStartupWatchdog::default();
 
                 let _keep_it = client::hc_connection(feedback, rendezvous_server, token).await;
 
@@ -226,6 +321,14 @@ impl<T: InvokeUiSession> Remote<T> {
                             if let Some(res) = res {
                                 match res {
                                     Err(err) => {
+                                        log::warn!(
+                                            "diag client stream read error: id={}, is_connected={}, video_packet_seen={}, video_format={:?}, err={}",
+                                            self.handler.get_id(),
+                                            self.is_connected,
+                                            self.first_frame,
+                                            self.video_format,
+                                            err
+                                        );
                                         self.handler.on_establish_connection_error(err.to_string());
                                         break;
                                     }
@@ -236,12 +339,26 @@ impl<T: InvokeUiSession> Remote<T> {
                                             self.handler.update_received(true);
                                         }
                                         self.data_count.fetch_add(bytes.len(), Ordering::Relaxed);
-                                        if !self.handle_msg_from_peer(bytes, &mut peer).await {
+                                        if !self.handle_msg_from_peer(bytes, &mut peer, direct).await {
+                                            log::info!(
+                                                "diag client peer handler requested exit: id={}, is_connected={}, video_packet_seen={}, video_format={:?}",
+                                                self.handler.get_id(),
+                                                self.is_connected,
+                                                self.first_frame,
+                                                self.video_format
+                                            );
                                             break
                                         }
                                     }
                                 }
                             } else {
+                                log::warn!(
+                                    "diag client stream ended by peer: id={}, is_connected={}, video_packet_seen={}, video_format={:?}",
+                                    self.handler.get_id(),
+                                    self.is_connected,
+                                    self.first_frame,
+                                    self.video_format
+                                );
                                 if self.handler.is_restarting_remote_device() {
                                     log::info!("Restart remote device");
                                     self.handler.msgbox("restarting", "Restarting remote device", "remote_restarting_tip", "");
@@ -265,6 +382,14 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                         _ = self.timer.tick() => {
                             if last_recv_time.elapsed() >= SEC30 {
+                                log::warn!(
+                                    "diag client receive timeout: id={}, is_connected={}, video_packet_seen={}, video_format={:?}, elapsed_ms={}",
+                                    self.handler.get_id(),
+                                    self.is_connected,
+                                    self.first_frame,
+                                    self.video_format,
+                                    last_recv_time.elapsed().as_millis()
+                                );
                                 self.handler.msgbox("error", "Connection Error", "Timeout", "");
                                 break;
                             }
@@ -279,6 +404,48 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _ = status_timer.tick() => {
+                            match no_video_watchdog.tick(
+                                expects_video,
+                                self.is_connected,
+                                self.first_frame,
+                                Instant::now(),
+                            ) {
+                                NoVideoStartupAction::Refresh { attempt, elapsed_ms } => {
+                                    log::warn!(
+                                        "diag client no video startup retry: id={}, is_connected={}, video_packet_seen={}, video_format={:?}, elapsed_ms={}, refresh_attempt={}/{}",
+                                        self.handler.get_id(),
+                                        self.is_connected,
+                                        self.first_frame,
+                                        self.video_format,
+                                        elapsed_ms,
+                                        attempt,
+                                        NO_VIDEO_START_MAX_REFRESHES
+                                    );
+                                    let msg = client::LoginConfigHandler::refresh();
+                                    if let Err(err) = peer.send(&msg).await {
+                                        log::warn!(
+                                            "diag client no video refresh send failed: id={}, attempt={}, err={}",
+                                            self.handler.get_id(),
+                                            attempt,
+                                            err
+                                        );
+                                    }
+                                }
+                                NoVideoStartupAction::Stalled { elapsed_ms } => {
+                                    log::warn!(
+                                        "diag client no video startup still waiting: id={}, is_connected={}, video_packet_seen={}, video_format={:?}, elapsed_ms={}, refresh_attempts={}/{}",
+                                        self.handler.get_id(),
+                                        self.is_connected,
+                                        self.first_frame,
+                                        self.video_format,
+                                        elapsed_ms,
+                                        NO_VIDEO_START_MAX_REFRESHES.min(no_video_watchdog.refresh_count),
+                                        NO_VIDEO_START_MAX_REFRESHES
+                                    );
+                                }
+                                NoVideoStartupAction::None => {}
+                            }
+
                             let elapsed = fps_instant.elapsed().as_millis();
                             if elapsed < 1000 {
                                 continue;
@@ -536,6 +703,15 @@ impl<T: InvokeUiSession> Remote<T> {
     async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut Stream) -> bool {
         match data {
             Data::Close => {
+                log::info!(
+                    "diag client io_loop received Data::Close: id={}, is_connected={}, video_packet_seen={}, video_format={:?}, video_threads={}, sent_close_reason={}",
+                    self.handler.get_id(),
+                    self.is_connected,
+                    self.first_frame,
+                    self.video_format,
+                    self.video_threads.len(),
+                    self.sent_close_reason
+                );
                 self.send_close_reason(peer, "").await;
                 return false;
             }
@@ -1136,6 +1312,15 @@ impl<T: InvokeUiSession> Remote<T> {
     // The controlled end can consider auto fps as the maximum decoding fps.
     #[inline]
     fn fps_control(&mut self, direct: bool, real_fps_map: HashMap<usize, i32>) {
+        let now = Instant::now();
+        let log_summary = self
+            .last_fps_control_summary_log
+            .map(|last| now.saturating_duration_since(last) >= FPS_CONTROL_SUMMARY_LOG_INTERVAL)
+            .unwrap_or(true);
+        if log_summary {
+            self.last_fps_control_summary_log = Some(now);
+        }
+
         self.video_threads.iter_mut().for_each(|(k, v)| {
             let real_fps = real_fps_map.get(k).cloned().unwrap_or_default();
             if real_fps == 0 {
@@ -1144,6 +1329,13 @@ impl<T: InvokeUiSession> Remote<T> {
                 v.fps_control.inactive_counter = 0;
             }
         });
+        let fixed_fps = self
+            .handler
+            .lc
+            .read()
+            .unwrap()
+            .get_option(config::keys::OPTION_CUSTOM_FPS_MODE)
+            == "fixed";
         let custom_fps = self.handler.lc.read().unwrap().custom_fps.clone();
         let custom_fps = custom_fps.lock().unwrap().clone();
         let mut custom_fps = custom_fps.unwrap_or(30);
@@ -1157,6 +1349,7 @@ impl<T: InvokeUiSession> Remote<T> {
             .map(|v| v.1.video_queue.read().unwrap().len())
             .max()
             .unwrap_or_default();
+        let last_auto_fps = self.handler.lc.read().unwrap().last_auto_fps;
         let min_decode_fps = self
             .video_threads
             .iter()
@@ -1165,65 +1358,183 @@ impl<T: InvokeUiSession> Remote<T> {
             .min()
             .flatten();
         let Some(min_decode_fps) = min_decode_fps else {
+            self.handler.update_quality_status(QualityStatus {
+                fps_mode: Some(if fixed_fps { "fixed" } else { "adaptive" }.to_owned()),
+                direct: Some(direct),
+                queue_len: Some(max_queue_len),
+                auto_fps: last_auto_fps,
+                ..Default::default()
+            });
+            if log_summary {
+                let (decode_fps_by_display, queue_len_by_display, inactive_by_display) =
+                    self.fps_control_snapshot();
+                log::info!(
+                    "diag fps control: id={}, mode={}, direct={}, codec={:?}, custom_fps={}, last_auto_fps={:?}, real_fps={:?}, decode_fps={:?}, queue_len={:?}, inactive={:?}, reason=no_active_decode_fps",
+                    self.handler.get_id(),
+                    if fixed_fps { "fixed" } else { "adaptive" },
+                    direct,
+                    self.video_format,
+                    custom_fps,
+                    last_auto_fps,
+                    real_fps_map,
+                    decode_fps_by_display,
+                    queue_len_by_display,
+                    inactive_by_display
+                );
+            }
             return;
         };
-        let mut limited_fps = if direct {
-            min_decode_fps * 9 / 10 // 30 got 27
+        if fixed_fps {
+            self.handler.update_quality_status(QualityStatus {
+                fps_mode: Some("fixed".to_owned()),
+                direct: Some(direct),
+                queue_len: Some(max_queue_len),
+                decode_fps: Some(min_decode_fps),
+                auto_fps: Some(custom_fps as _),
+                ..Default::default()
+            });
+            if log_summary {
+                let (decode_fps_by_display, queue_len_by_display, inactive_by_display) =
+                    self.fps_control_snapshot();
+                log::info!(
+                    "diag fps control: id={}, mode=fixed, direct={}, codec={:?}, custom_fps={}, last_auto_fps={:?}, real_fps={:?}, decode_fps={:?}, min_decode_fps={}, max_queue_len={}, queue_len={:?}, inactive={:?}",
+                    self.handler.get_id(),
+                    direct,
+                    self.video_format,
+                    custom_fps,
+                    last_auto_fps,
+                    real_fps_map,
+                    decode_fps_by_display,
+                    min_decode_fps,
+                    max_queue_len,
+                    queue_len_by_display,
+                    inactive_by_display
+                );
+            }
         } else {
-            min_decode_fps * 4 / 5 // 30 got 24
-        };
-        if limited_fps > custom_fps {
-            limited_fps = custom_fps;
-        }
-        let last_auto_fps = self.handler.lc.read().unwrap().last_auto_fps.clone();
-        let displays = self.video_threads.keys().cloned().collect::<Vec<_>>();
-        let mut fps_trending = |display: usize| {
-            let thread = self.video_threads.get_mut(&display)?;
-            let ctl = &mut thread.fps_control;
-            let len = thread.video_queue.read().unwrap().len();
-            let decode_fps = thread.decode_fps.read().unwrap().clone()?;
-            let last_auto_fps = last_auto_fps.clone().unwrap_or(custom_fps as _);
-            if ctl.inactive_counter > inactive_threshold {
-                return None;
+            let mut decode_safe_fps = if direct {
+                min_decode_fps * 9 / 10 // 30 got 27
+            } else {
+                min_decode_fps * 4 / 5 // 30 got 24
+            };
+            if decode_safe_fps < 1 {
+                decode_safe_fps = 1;
             }
-            if len > 1 && last_auto_fps > limited_fps || len > std::cmp::max(1, decode_fps / 2) {
-                ctl.idle_counter = 0;
-                return Some(false);
+            if decode_safe_fps > custom_fps {
+                decode_safe_fps = custom_fps;
             }
-            if len <= 1 {
-                ctl.idle_counter += 1;
-                if ctl.idle_counter > 3 && last_auto_fps + 3 <= limited_fps {
-                    return Some(true);
+            let displays = self.video_threads.keys().cloned().collect::<Vec<_>>();
+            let mut fps_trending = |display: usize| {
+                let thread = self.video_threads.get_mut(&display)?;
+                let ctl = &mut thread.fps_control;
+                let len = thread.video_queue.read().unwrap().len();
+                let decode_fps = thread.decode_fps.read().unwrap().clone()?;
+                let last_target_fps = last_auto_fps.unwrap_or(custom_fps as _);
+                if ctl.inactive_counter > inactive_threshold {
+                    return None;
                 }
+                if len > 1 && last_target_fps > decode_safe_fps
+                    || len > std::cmp::max(1, decode_fps / 2)
+                {
+                    ctl.idle_counter = 0;
+                    return Some(false);
+                }
+                if len <= 1 {
+                    ctl.idle_counter += 1;
+                    if ctl.idle_counter > 3 && last_target_fps < custom_fps as _ {
+                        return Some(true);
+                    }
+                }
+                if len > 1 {
+                    ctl.idle_counter = 0;
+                }
+                None
+            };
+            let trendings: Vec<_> = displays.iter().map(|k| fps_trending(*k)).collect();
+            let should_decrease = trendings.iter().any(|v| *v == Some(false));
+            let should_increase = !should_decrease && trendings.iter().any(|v| *v == Some(true));
+            let last_target_fps = last_auto_fps.unwrap_or(custom_fps as _);
+            let mut auto_fps = if should_decrease {
+                decode_safe_fps.min(last_target_fps)
+            } else if should_increase {
+                (last_target_fps + 3).min(custom_fps as _)
+            } else {
+                last_target_fps
+            };
+            if last_auto_fps.is_none() && !should_decrease {
+                auto_fps = custom_fps as _;
             }
-            if len > 1 {
-                ctl.idle_counter = 0;
-            }
-            None
-        };
-        let trendings: Vec<_> = displays.iter().map(|k| fps_trending(*k)).collect();
-        let should_decrease = trendings.iter().any(|v| *v == Some(false));
-        let should_increase = !should_decrease && trendings.iter().any(|v| *v == Some(true));
-        if last_auto_fps.is_none() || should_decrease || should_increase {
-            // limited_fps to ensure decoding is faster than encoding
-            let mut auto_fps = limited_fps;
-            if should_decrease && limited_fps < max_queue_len {
-                auto_fps = limited_fps / 2;
+            if should_decrease && max_queue_len > 1 && auto_fps > 1 {
+                auto_fps = (auto_fps * 4 / 5).max(1);
             }
             if auto_fps < 1 {
                 auto_fps = 1;
             }
-            if Some(auto_fps) != last_auto_fps {
-                let mut misc = Misc::new();
-                misc.set_option(OptionMessage {
-                    custom_fps: auto_fps as _,
-                    ..Default::default()
-                });
-                let mut msg = Message::new();
-                msg.set_misc(misc);
-                self.sender.send(Data::Message(msg)).ok();
-                log::info!("Set fps to {}", auto_fps);
-                self.handler.lc.write().unwrap().last_auto_fps = Some(auto_fps);
+            self.handler.update_quality_status(QualityStatus {
+                fps_mode: Some("adaptive".to_owned()),
+                direct: Some(direct),
+                queue_len: Some(max_queue_len),
+                decode_fps: Some(min_decode_fps),
+                auto_fps: Some(auto_fps),
+                ..Default::default()
+            });
+            let should_send_auto_fps =
+                (last_auto_fps.is_none() || should_decrease || should_increase)
+                    && Some(auto_fps) != last_auto_fps;
+            if log_summary || should_send_auto_fps {
+                let (decode_fps_by_display, queue_len_by_display, inactive_by_display) =
+                    self.fps_control_snapshot();
+                if log_summary {
+                    log::info!(
+                        "diag fps control: id={}, mode=adaptive, direct={}, codec={:?}, custom_fps={}, last_auto_fps={:?}, real_fps={:?}, decode_fps={:?}, min_decode_fps={}, limited_fps={}, auto_fps={}, max_queue_len={}, queue_len={:?}, inactive={:?}, trendings={:?}, decrease={}, increase={}",
+                        self.handler.get_id(),
+                        direct,
+                        self.video_format,
+                        custom_fps,
+                        last_auto_fps,
+                        real_fps_map,
+                        decode_fps_by_display,
+                        min_decode_fps,
+                        decode_safe_fps,
+                        auto_fps,
+                        max_queue_len,
+                        queue_len_by_display,
+                        inactive_by_display,
+                        trendings,
+                        should_decrease,
+                        should_increase
+                    );
+                }
+                if should_send_auto_fps {
+                    let mut misc = Misc::new();
+                    misc.set_option(OptionMessage {
+                        custom_fps: auto_fps as _,
+                        ..Default::default()
+                    });
+                    let mut msg = Message::new();
+                    msg.set_misc(misc);
+                    self.sender.send(Data::Message(msg)).ok();
+                    log::info!(
+                        "diag fps control set_auto_fps: id={}, auto_fps={}, previous_auto_fps={:?}, direct={}, codec={:?}, custom_fps={}, min_decode_fps={}, limited_fps={}, max_queue_len={}, real_fps={:?}, decode_fps={:?}, queue_len={:?}, inactive={:?}, trendings={:?}, decrease={}, increase={}",
+                        self.handler.get_id(),
+                        auto_fps,
+                        last_auto_fps,
+                        direct,
+                        self.video_format,
+                        custom_fps,
+                        min_decode_fps,
+                        decode_safe_fps,
+                        max_queue_len,
+                        real_fps_map,
+                        decode_fps_by_display,
+                        queue_len_by_display,
+                        inactive_by_display,
+                        trendings,
+                        should_decrease,
+                        should_increase
+                    );
+                    self.handler.lc.write().unwrap().last_auto_fps = Some(auto_fps);
+                }
             }
         }
         // send refresh
@@ -1243,6 +1554,41 @@ impl<T: InvokeUiSession> Remote<T> {
                 ctl.last_refresh_instant = Some(Instant::now());
             }
         }
+    }
+
+    fn fps_control_snapshot(
+        &self,
+    ) -> (
+        Vec<(usize, usize)>,
+        Vec<(usize, usize)>,
+        Vec<(usize, usize)>,
+    ) {
+        let decode_fps_by_display = self
+            .video_threads
+            .iter()
+            .filter_map(|(display, thread)| {
+                thread
+                    .decode_fps
+                    .read()
+                    .unwrap()
+                    .map(|decode_fps| (*display, decode_fps))
+            })
+            .collect::<Vec<_>>();
+        let queue_len_by_display = self
+            .video_threads
+            .iter()
+            .map(|(display, thread)| (*display, thread.video_queue.read().unwrap().len()))
+            .collect::<Vec<_>>();
+        let inactive_by_display = self
+            .video_threads
+            .iter()
+            .map(|(display, thread)| (*display, thread.fps_control.inactive_counter))
+            .collect::<Vec<_>>();
+        (
+            decode_fps_by_display,
+            queue_len_by_display,
+            inactive_by_display,
+        )
     }
 
     fn check_view_camera_support(&self, peer_version: &str, peer_platform: &str) -> bool {
@@ -1282,20 +1628,54 @@ impl<T: InvokeUiSession> Remote<T> {
         return false;
     }
 
-    async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream) -> bool {
+    async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream, direct: bool) -> bool {
         if let Ok(msg_in) = Message::parse_from_bytes(&data) {
             match msg_in.union {
                 Some(message::Union::VideoFrame(vf)) => {
+                    self.video_recv_count += 1;
+                    let display = vf.display as usize;
+                    let queue_len_before_enqueue = self
+                        .video_threads
+                        .get(&display)
+                        .map(|thread| thread.video_queue.read().unwrap().len())
+                        .unwrap_or_default();
+                    let format = CodecFormat::from(&vf);
+                    let (payload_bytes, frame_count, has_keyframe) =
+                        scrap::codec::video_frame_payload_stats(&vf).unwrap_or((0, 0, false));
+                    let should_log_frame = self.video_recv_count <= 5
+                        || self.video_recv_count % 30 == 0
+                        || has_keyframe;
+                    if should_log_frame {
+                        log::info!(
+                            "diag video frame received: id={}, display={}, direct={}, codec={:?}, payload_bytes={}, encoded_frames={}, keyframe={}, queue_len_before_enqueue={}, packet_count={}",
+                            self.handler.get_id(),
+                            display,
+                            direct,
+                            format,
+                            payload_bytes,
+                            frame_count,
+                            has_keyframe,
+                            queue_len_before_enqueue,
+                            self.video_recv_count
+                        );
+                    }
                     if !self.first_frame {
+                        log::info!(
+                            "diag first video frame received from stream: display={}, format={:?}, payload_bytes={}, frame_count={}, keyframe={}",
+                            vf.display,
+                            format,
+                            payload_bytes,
+                            frame_count,
+                            has_keyframe
+                        );
                         self.first_frame = true;
                         self.handler.close_success();
                         self.handler.adapt_size();
                         self.send_toggle_virtual_display_msg(peer).await;
                         self.send_toggle_privacy_mode_msg(peer).await;
                     }
-                    self.video_format = CodecFormat::from(&vf);
+                    self.video_format = format;
 
-                    let display = vf.display as usize;
                     if !self.video_threads.contains_key(&display) {
                         self.new_video_thread(display);
                     }
@@ -1374,18 +1754,20 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
 
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            if self.handler.lc.read().unwrap().sync_init_clipboard.v {
+                            if self.handler.lc.read().unwrap().sync_init_clipboard.v
+                                && self
+                                    .handler
+                                    .get_permission_config()
+                                    .is_text_clipboard_required()
+                            {
                                 if let Some(msg_out) = crate::clipboard::get_current_clipboard_msg(
                                     &peer_version,
                                     &peer_platform,
                                     crate::clipboard::ClipboardSide::Client,
                                 ) {
                                     let sender = self.sender.clone();
-                                    let permission_config = self.handler.get_permission_config();
                                     tokio::spawn(async move {
-                                        if permission_config.is_text_clipboard_required() {
-                                            sender.send(Data::Message(msg_out)).ok();
-                                        }
+                                        sender.send(Data::Message(msg_out)).ok();
                                     });
                                 }
                             }
@@ -1426,10 +1808,22 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler.set_cursor_position(cp);
                 }
                 Some(message::Union::Clipboard(cb)) => {
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        let clipboard_policy =
+                            self.handler.lc.read().unwrap().clipboard_direction_policy();
+                        if clipboard_policy.allows_remote_to_local()
+                            && !self.handler.lc.read().unwrap().disable_clipboard.v
+                        {
+                            update_clipboard_with_direction(
+                                vec![cb],
+                                ClipboardSide::Client,
+                                clipboard_policy,
+                            );
+                        }
+                    }
+                    #[cfg(target_os = "ios")]
                     if !self.handler.lc.read().unwrap().disable_clipboard.v {
-                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        update_clipboard(vec![cb], ClipboardSide::Client);
-                        #[cfg(target_os = "ios")]
                         {
                             let content = if cb.compress {
                                 hbb_common::compress::decompress(&cb.content)
@@ -1440,15 +1834,29 @@ impl<T: InvokeUiSession> Remote<T> {
                                 self.handler.clipboard(content);
                             }
                         }
-                        #[cfg(target_os = "android")]
+                    }
+                    #[cfg(target_os = "android")]
+                    if !self.handler.lc.read().unwrap().disable_clipboard.v {
                         crate::clipboard::handle_msg_clipboard(cb);
                     }
                 }
                 Some(message::Union::MultiClipboards(_mcb)) => {
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        let clipboard_policy =
+                            self.handler.lc.read().unwrap().clipboard_direction_policy();
+                        if clipboard_policy.allows_remote_to_local()
+                            && !self.handler.lc.read().unwrap().disable_clipboard.v
+                        {
+                            update_clipboard_with_direction(
+                                _mcb.clipboards,
+                                ClipboardSide::Client,
+                                clipboard_policy,
+                            );
+                        }
+                    }
+                    #[cfg(target_os = "android")]
                     if !self.handler.lc.read().unwrap().disable_clipboard.v {
-                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        update_clipboard(_mcb.clipboards, ClipboardSide::Client);
-                        #[cfg(target_os = "android")]
                         crate::clipboard::handle_msg_multi_clipboards(_mcb);
                     }
                 }
@@ -1729,8 +2137,15 @@ impl<T: InvokeUiSession> Remote<T> {
                     Some(misc::Union::ChatMessage(c)) => {
                         self.handler.new_message(c.text);
                     }
+                    Some(misc::Union::DebugEvent(event)) => {
+                        crate::clipboard::log_remote_debug_event(event);
+                    }
                     Some(misc::Union::PermissionInfo(p)) => {
-                        log::info!("Change permission {:?} -> {}", p.permission, p.enabled);
+                        log::info!(
+                            "Host permission update received: {:?} -> {}",
+                            p.permission,
+                            p.enabled
+                        );
                         // https://github.com/rustdesk/rustdesk/issues/3703#issuecomment-1474734754
                         match p.permission.enum_value() {
                             Ok(Permission::Keyboard) => {
@@ -1783,6 +2198,41 @@ impl<T: InvokeUiSession> Remote<T> {
                             _ => {}
                         }
                     }
+                    Some(misc::Union::SessionPermissionResponse(r)) => {
+                        log::info!(
+                            "Host permission request response: request_id={}, name={}, enabled={}, approved={}, reason={}",
+                            r.request_id,
+                            r.name,
+                            r.enabled,
+                            r.approved,
+                            r.reason
+                        );
+                        if r.approved
+                            && matches!(
+                                r.name.as_str(),
+                                "file_transfer" | "port_forward" | "view_camera" | "terminal"
+                            )
+                        {
+                            self.handler.set_permission(&r.name, true);
+                        }
+                        let text = if r.approved {
+                            if matches!(
+                                r.name.as_str(),
+                                "file_transfer" | "port_forward" | "view_camera" | "terminal"
+                            ) {
+                                "Permission approved. Open the requested tool again.".to_owned()
+                            } else {
+                                "Permission approved.".to_owned()
+                            }
+                        } else if r.reason.is_empty() {
+                            "Permission request declined.".to_owned()
+                        } else {
+                            r.reason
+                        };
+                        let msgtype = session_permission_response_msgbox_type(r.approved);
+                        self.handler
+                            .msgbox(msgtype, "Permission request", &text, "");
+                    }
                     Some(misc::Union::SwitchDisplay(s)) => {
                         self.handler.handle_peer_switch_display(&s);
                         if let Some(thread) = self.video_threads.get_mut(&(s.display as usize)) {
@@ -1808,6 +2258,14 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(misc::Union::CloseReason(c)) => {
+                        log::warn!(
+                            "diag client received remote close reason: id={}, is_connected={}, video_packet_seen={}, video_format={:?}, reason={}",
+                            self.handler.get_id(),
+                            self.is_connected,
+                            self.first_frame,
+                            self.video_format,
+                            c
+                        );
                         self.sent_close_reason = true; // The controlled end will close, no need to send close reason
                         self.handler.msgbox("error", "Connection Error", &c, "");
                         return false;
@@ -1903,9 +2361,23 @@ impl<T: InvokeUiSession> Remote<T> {
                             );
                         }
                     }
+                    #[cfg(feature = "flutter")]
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::SwitchBack(_)) => {
-                        #[cfg(feature = "flutter")]
-                        self.handler.switch_back(&self.handler.get_id());
+                        let allow_switch_back = self
+                            .handler
+                            .lc
+                            .write()
+                            .unwrap()
+                            .consume_switch_back_permission();
+                        if allow_switch_back {
+                            self.handler.switch_back(&self.handler.get_id());
+                        } else {
+                            log::warn!(
+                                "Ignored unsolicited SwitchBack from {}",
+                                self.handler.get_id()
+                            );
+                        }
                     }
                     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -2468,5 +2940,125 @@ impl Drop for VideoThread {
     fn drop(&mut self) {
         // since channels are buffered, messages sent before the disconnect will still be properly received.
         *self.discard_queue.write().unwrap() = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        session_permission_response_msgbox_type, NoVideoStartupAction, NoVideoStartupWatchdog,
+        NO_VIDEO_START_MAX_REFRESHES, NO_VIDEO_START_REFRESH_INTERVAL, NO_VIDEO_START_TIMEOUT,
+    };
+    use hbb_common::tokio::time::{Duration, Instant};
+
+    #[test]
+    fn permission_response_dialogs_do_not_close_session_on_ok() {
+        assert!(session_permission_response_msgbox_type(true).contains("custom"));
+        assert!(session_permission_response_msgbox_type(false).contains("custom"));
+    }
+
+    #[test]
+    fn no_video_watchdog_waits_until_start_timeout() {
+        let mut watchdog = NoVideoStartupWatchdog::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            watchdog.tick(true, true, false, start),
+            NoVideoStartupAction::None
+        );
+        assert_eq!(
+            watchdog.tick(
+                true,
+                true,
+                false,
+                start + NO_VIDEO_START_TIMEOUT - Duration::from_millis(1)
+            ),
+            NoVideoStartupAction::None
+        );
+    }
+
+    #[test]
+    fn no_video_watchdog_retries_refresh_without_close_action() {
+        let mut watchdog = NoVideoStartupWatchdog::default();
+        let start = Instant::now();
+        assert_eq!(
+            watchdog.tick(true, true, false, start),
+            NoVideoStartupAction::None
+        );
+
+        assert_eq!(
+            watchdog.tick(true, true, false, start + NO_VIDEO_START_TIMEOUT),
+            NoVideoStartupAction::Refresh {
+                attempt: 1,
+                elapsed_ms: NO_VIDEO_START_TIMEOUT.as_millis()
+            }
+        );
+
+        assert_eq!(
+            watchdog.tick(
+                true,
+                true,
+                false,
+                start + NO_VIDEO_START_TIMEOUT + NO_VIDEO_START_REFRESH_INTERVAL
+            ),
+            NoVideoStartupAction::Refresh {
+                attempt: 2,
+                elapsed_ms: (NO_VIDEO_START_TIMEOUT + NO_VIDEO_START_REFRESH_INTERVAL).as_millis()
+            }
+        );
+    }
+
+    #[test]
+    fn no_video_watchdog_caps_refreshes_and_stays_alive() {
+        let mut watchdog = NoVideoStartupWatchdog::default();
+        let start = Instant::now();
+        assert_eq!(
+            watchdog.tick(true, true, false, start),
+            NoVideoStartupAction::None
+        );
+
+        for attempt in 1..=NO_VIDEO_START_MAX_REFRESHES {
+            let now = start
+                + NO_VIDEO_START_TIMEOUT
+                + NO_VIDEO_START_REFRESH_INTERVAL * (attempt as u32 - 1);
+            assert_eq!(
+                watchdog.tick(true, true, false, now),
+                NoVideoStartupAction::Refresh {
+                    attempt,
+                    elapsed_ms: now.saturating_duration_since(start).as_millis()
+                }
+            );
+        }
+
+        let after_cap = start
+            + NO_VIDEO_START_TIMEOUT
+            + NO_VIDEO_START_REFRESH_INTERVAL * NO_VIDEO_START_MAX_REFRESHES as u32;
+        assert!(matches!(
+            watchdog.tick(true, true, false, after_cap),
+            NoVideoStartupAction::Stalled { .. }
+        ));
+    }
+
+    #[test]
+    fn no_video_watchdog_resets_after_first_frame() {
+        let mut watchdog = NoVideoStartupWatchdog::default();
+        let start = Instant::now();
+        assert_eq!(
+            watchdog.tick(true, true, false, start),
+            NoVideoStartupAction::None
+        );
+        assert!(matches!(
+            watchdog.tick(true, true, false, start + NO_VIDEO_START_TIMEOUT),
+            NoVideoStartupAction::Refresh { .. }
+        ));
+
+        assert_eq!(
+            watchdog.tick(true, true, true, start + NO_VIDEO_START_TIMEOUT),
+            NoVideoStartupAction::None
+        );
+        assert_eq!(
+            watchdog.tick(true, true, false, start + NO_VIDEO_START_TIMEOUT),
+            NoVideoStartupAction::None
+        );
     }
 }

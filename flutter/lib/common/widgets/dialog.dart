@@ -340,7 +340,19 @@ Future<String> changePairingPassphrase(
 }) async {
   final controller = TextEditingController(text: "");
   final obscure = true.obs;
+  var completed = false;
   await gFFI.dialogManager.show((setState, close, context) {
+    submit() async {
+      if (completed) {
+        return;
+      }
+      completed = true;
+      if (controller.text.isNotEmpty) {
+        await bind.mainSetOption(key: optionKey, value: controller.text);
+      }
+      close();
+    }
+
     return CustomAlertDialog(
       title: Text(translate(title)),
       content: Column(
@@ -383,13 +395,9 @@ Future<String> changePairingPassphrase(
       ),
       actions: [
         dialogButton('Cancel', onPressed: close, isOutline: true),
-        dialogButton('OK', onPressed: () async {
-          if (controller.text.isNotEmpty) {
-            await bind.mainSetOption(key: optionKey, value: controller.text);
-          }
-          close();
-        }),
+        dialogButton('OK', onPressed: submit),
       ],
+      onSubmit: submit,
       onCancel: close,
     );
   });
@@ -409,9 +417,9 @@ Future<String> changeDirectAccessPairingPassphrase(String currentValue) async {
 Future<String> changePeerPairingPassphrase(String currentValue) async {
   return changePairingPassphrase(
     currentValue,
-    title: "Peer pairing passphrase",
+    title: "Rendezvous pairing passphrase",
     description:
-        "Require this passphrase for first secure peer connections before the device key is trusted.",
+        "Require this passphrase for first rendezvous-mediated connections before the device key is trusted.",
     optionKey: kOptionPeerPairingPassphrase,
   );
 }
@@ -1240,7 +1248,7 @@ void showRequestElevationDialog(
       color: MyTheme.currentThemeMode() == ThemeMode.dark
           ? Color.fromARGB(135, 87, 87, 90)
           : Colors.grey[100],
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: BorderRadius.circular(4.0),
       border: Border.all(color: Colors.grey),
     ),
     child: Row(
@@ -1444,13 +1452,13 @@ showSetOSPassword(
   Function()? closeCallback,
 ) async {
   final controller = TextEditingController();
-  osPassword ??=
+  final initialOsPassword = osPassword ??
       await bind.sessionGetOption(sessionId: sessionId, arg: 'os-password') ??
-          '';
+      '';
   var autoLogin =
       await bind.sessionGetOption(sessionId: sessionId, arg: 'auto-login') !=
           '';
-  controller.text = osPassword;
+  controller.text = initialOsPassword;
   dialogManager.show((setState, close, context) {
     closeWithCallback([dynamic]) {
       close();
@@ -1636,7 +1644,7 @@ Widget buildNoteTextField({
     decoration: InputDecoration(
       hintText: translate('input note here'),
       border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(4.0),
       ),
       contentPadding: EdgeInsets.all(12),
     ),
@@ -1918,8 +1926,10 @@ void showConfirmSwitchSidesDialog(
 customImageQualityDialog(SessionID sessionId, String id, FFI ffi) async {
   double initQuality = kDefaultQuality;
   double initFps = kDefaultFps;
+  String initFpsMode = kCustomFpsModeAdaptive;
   bool qualitySet = false;
   bool fpsSet = false;
+  bool fpsModeSet = false;
 
   bool? direct;
   try {
@@ -1932,16 +1942,30 @@ customImageQualityDialog(SessionID sessionId, String id, FFI ffi) async {
       (await bind.mainIsUsingPublicServer() && direct != true) ||
           versionCmp(ffi.ffiModel.pi.version, '1.2.2') < 0;
 
-  setCustomValues({double? quality, double? fps}) async {
-    debugPrint("setCustomValues quality:$quality, fps:$fps");
+  int fpsForMode(double fps, String mode) {
+    final value = fps.toInt();
+    return mode == kCustomFpsModeFixed ? -value : value;
+  }
+
+  setCustomValues({double? quality, double? fps, String? fpsMode}) async {
+    debugPrint("setCustomValues quality:$quality, fps:$fps, fpsMode:$fpsMode");
     if (quality != null) {
       qualitySet = true;
       await bind.sessionSetCustomImageQuality(
           sessionId: sessionId, value: quality.toInt());
     }
+    if (fpsMode != null) {
+      fpsModeSet = true;
+      initFpsMode =
+          fpsMode == kCustomFpsModeFixed ? fpsMode : kCustomFpsModeAdaptive;
+      await bind.sessionPeerOption(
+          sessionId: sessionId, name: kOptionCustomFpsMode, value: initFpsMode);
+    }
     if (fps != null) {
       fpsSet = true;
-      await bind.sessionSetCustomFps(sessionId: sessionId, fps: fps.toInt());
+      initFps = fps;
+      await bind.sessionSetCustomFps(
+          sessionId: sessionId, fps: fpsForMode(initFps, initFpsMode));
     }
     if (!qualitySet) {
       qualitySet = true;
@@ -1951,7 +1975,12 @@ customImageQualityDialog(SessionID sessionId, String id, FFI ffi) async {
     if (!hideFps && !fpsSet) {
       fpsSet = true;
       await bind.sessionSetCustomFps(
-          sessionId: sessionId, fps: initFps.toInt());
+          sessionId: sessionId, fps: fpsForMode(initFps, initFpsMode));
+    }
+    if (!hideFps && !fpsModeSet) {
+      fpsModeSet = true;
+      await bind.sessionPeerOption(
+          sessionId: sessionId, name: kOptionCustomFpsMode, value: initFpsMode);
     }
   }
 
@@ -1971,19 +2000,26 @@ customImageQualityDialog(SessionID sessionId, String id, FFI ffi) async {
   }
   // fps
   final fpsOption =
-      await bind.sessionGetOption(sessionId: sessionId, arg: 'custom-fps');
+      await bind.sessionGetOption(sessionId: sessionId, arg: kOptionCustomFps);
   initFps = fpsOption == null
       ? kDefaultFps
       : double.tryParse(fpsOption) ?? kDefaultFps;
   if (initFps < kMinFps || initFps > kMaxFps) {
     initFps = kDefaultFps;
   }
+  final fpsModeOption = await bind.sessionGetOption(
+      sessionId: sessionId, arg: kOptionCustomFpsMode);
+  initFpsMode = fpsModeOption == kCustomFpsModeFixed
+      ? kCustomFpsModeFixed
+      : kCustomFpsModeAdaptive;
 
   final content = customImageQualityWidget(
       initQuality: initQuality,
       initFps: initFps,
+      initFpsMode: initFpsMode,
       setQuality: (v) => setCustomValues(quality: v),
       setFps: (v) => setCustomValues(fps: v),
+      setFpsMode: (v) => setCustomValues(fpsMode: v, fps: initFps),
       showFps: !hideFps,
       showMoreQuality: !hideMoreQuality);
   msgBoxCommon(ffi.dialogManager, 'Custom Image Quality', content, [btnClose]);
@@ -2886,6 +2922,419 @@ class TrustedDevice {
     devices.sort((a, b) => b.time.compareTo(a.time));
     return devices;
   }
+}
+
+void confrimDeletePairedViewersDialog(
+    RxList<PairedViewer> pairedViewers, RxList<Uint8List> selectedViewers) {
+  CommonConfirmDialog(gFFI.dialogManager, '${translate('Confirm Delete')}?',
+      () async {
+    if (selectedViewers.isEmpty) return;
+    if (selectedViewers.length == pairedViewers.length) {
+      await bind.mainSetCommon(key: 'clear-paired-viewers', value: '');
+      pairedViewers.clear();
+      selectedViewers.clear();
+    } else {
+      final json = jsonEncode(selectedViewers.map((e) => e.toList()).toList());
+      await bind.mainSetCommon(key: 'remove-paired-viewers', value: json);
+      pairedViewers.removeWhere((element) {
+        return selectedViewers.contains(element.signPk);
+      });
+      selectedViewers.clear();
+    }
+  });
+}
+
+void managePairedViewersDialog() async {
+  RxList<PairedViewer> pairedViewers = (await PairedViewer.get()).obs;
+  RxList<Uint8List> selectedViewers = RxList.empty();
+  gFFI.dialogManager.show((setState, close, context) {
+    return CustomAlertDialog(
+      title: Text(translate("Manage paired viewers")),
+      content: pairedViewersTable(pairedViewers, selectedViewers),
+      actions: [
+        Obx(() => dialogButton(translate("Delete"),
+                onPressed: selectedViewers.isEmpty
+                    ? null
+                    : () {
+                        confrimDeletePairedViewersDialog(
+                          pairedViewers,
+                          selectedViewers,
+                        );
+                      },
+                isOutline: false)
+            .marginOnly(top: 12)),
+        dialogButton(translate("Close"), onPressed: close, isOutline: true)
+            .marginOnly(top: 12),
+      ],
+      onCancel: close,
+    );
+  });
+}
+
+class PairedViewer {
+  late final Uint8List signPk;
+  late final int time;
+  late final String id;
+  late final String name;
+  late final String platform;
+  late final String scope;
+
+  PairedViewer.fromJson(Map<String, dynamic> json) {
+    final signPkList = json['sign_pk'] as List<dynamic>;
+    signPk = Uint8List.fromList(signPkList.cast<int>());
+    time = json['time'];
+    id = json['id'];
+    name = json['name'] ?? '';
+    platform = json['platform'] ?? '';
+    scope = json['scope'] ?? '';
+  }
+
+  String daysRemaining() {
+    final expiry = time + 30 * 24 * 60 * 60 * 1000;
+    final remaining = expiry - DateTime.now().millisecondsSinceEpoch;
+    if (remaining < 0) {
+      return '0';
+    }
+    return (remaining / (24 * 60 * 60 * 1000)).toStringAsFixed(0);
+  }
+
+  String keyFingerprint() {
+    final prefix = signPk.take(8).map((v) {
+      return v.toRadixString(16).padLeft(2, '0');
+    }).join(':');
+    return signPk.length > 8 ? '$prefix...' : prefix;
+  }
+
+  static Future<List<PairedViewer>> get() async {
+    final List<PairedViewer> viewers = List.empty(growable: true);
+    try {
+      final viewersJson = await bind.mainGetCommon(key: 'paired-viewers');
+      if (viewersJson.isNotEmpty) {
+        final viewersList = json.decode(viewersJson);
+        if (viewersList is List) {
+          for (var viewer in viewersList) {
+            viewers.add(PairedViewer.fromJson(viewer));
+          }
+        }
+      }
+    } catch (e) {
+      print(e.toString());
+    }
+    viewers.sort((a, b) => b.time.compareTo(a.time));
+    return viewers;
+  }
+}
+
+void confirmManageKnownHostsDialog({
+  required String content,
+  required RxList<KnownHost> hosts,
+  required RxList<String> selectedHosts,
+  required Future<void> Function(String id) action,
+}) {
+  CommonConfirmDialog(gFFI.dialogManager, content, () async {
+    if (selectedHosts.isEmpty) return;
+    final ids = selectedHosts.toList();
+    for (final id in ids) {
+      await action(id);
+    }
+    selectedHosts.clear();
+    hosts.assignAll(await KnownHost.get());
+    bind.mainLoadRecentPeers();
+  });
+}
+
+void manageKnownHostsDialog() async {
+  RxList<KnownHost> hosts = (await KnownHost.get()).obs;
+  RxList<String> selectedHosts = RxList.empty();
+  gFFI.dialogManager.show((setState, close, context) {
+    bool hasSelectedWhere(bool Function(KnownHost host) test) {
+      return hosts.any((host) => selectedHosts.contains(host.id) && test(host));
+    }
+
+    return CustomAlertDialog(
+      title: Text(translate("Manage known hosts")),
+      content: knownHostsTable(hosts, selectedHosts),
+      actions: [
+        Obx(() => dialogButton(translate("Forget passwords"),
+                onPressed: hasSelectedWhere((host) => host.hasPassword)
+                    ? () {
+                        confirmManageKnownHostsDialog(
+                          content: '${translate('Forget passwords')}?',
+                          hosts: hosts,
+                          selectedHosts: selectedHosts,
+                          action: (id) => bind.mainForgetPassword(id: id),
+                        );
+                      }
+                    : null,
+                isOutline: true)
+            .marginOnly(top: 12)),
+        Obx(() => dialogButton(translate("Clear pinned keys"),
+                onPressed: hasSelectedWhere((host) => host.hasPinnedKey)
+                    ? () {
+                        confirmManageKnownHostsDialog(
+                          content: '${translate('Clear pinned keys')}?',
+                          hosts: hosts,
+                          selectedHosts: selectedHosts,
+                          action: (id) => bind.mainSetPeerOption(
+                              id: id,
+                              key: KnownHost.pinnedSigningKey,
+                              value: ''),
+                        );
+                      }
+                    : null,
+                isOutline: true)
+            .marginOnly(top: 12)),
+        Obx(() => dialogButton(translate("Clear pairing memory"),
+                onPressed: hasSelectedWhere((host) =>
+                        host.hasDirectPairingMemory ||
+                        host.hasRendezvousPairingMemory)
+                    ? () {
+                        confirmManageKnownHostsDialog(
+                          content: '${translate('Clear pairing memory')}?',
+                          hosts: hosts,
+                          selectedHosts: selectedHosts,
+                          action: (id) async {
+                            await bind.mainSetPeerOption(
+                                id: id,
+                                key: KnownHost.directPairingConfirmed,
+                                value: '');
+                            await bind.mainSetPeerOption(
+                                id: id,
+                                key: KnownHost.rendezvousPairingConfirmed,
+                                value: '');
+                          },
+                        );
+                      }
+                    : null,
+                isOutline: true)
+            .marginOnly(top: 12)),
+        Obx(() => dialogButton(translate("Delete"),
+                onPressed: selectedHosts.isEmpty
+                    ? null
+                    : () {
+                        confirmManageKnownHostsDialog(
+                          content: '${translate('Delete selected hosts')}?',
+                          hosts: hosts,
+                          selectedHosts: selectedHosts,
+                          action: (id) => bind.mainRemovePeer(id: id),
+                        );
+                      },
+                isOutline: false)
+            .marginOnly(top: 12)),
+        dialogButton(translate("Close"), onPressed: close, isOutline: true)
+            .marginOnly(top: 12),
+      ],
+      onCancel: close,
+    );
+  });
+}
+
+class KnownHost {
+  static const pinnedSigningKey = 'pinned-signing-key';
+  static const directPairingConfirmed = 'direct-paired-viewer-confirmed';
+  static const rendezvousPairingConfirmed =
+      'rendezvous-paired-viewer-confirmed';
+
+  final Peer peer;
+  final bool hasPassword;
+  final bool hasPinnedKey;
+  final bool hasDirectPairingMemory;
+  final bool hasRendezvousPairingMemory;
+
+  KnownHost({
+    required this.peer,
+    required this.hasPassword,
+    required this.hasPinnedKey,
+    required this.hasDirectPairingMemory,
+    required this.hasRendezvousPairingMemory,
+  });
+
+  String get id => peer.id;
+
+  String get displayName {
+    if (peer.alias.isNotEmpty) return peer.alias;
+    if (peer.hostname.isNotEmpty) return peer.hostname;
+    return peer.id;
+  }
+
+  String get userAndHost {
+    final parts = [
+      if (peer.username.isNotEmpty) peer.username,
+      if (peer.hostname.isNotEmpty) peer.hostname,
+    ];
+    return parts.isEmpty ? '-' : parts.join('@');
+  }
+
+  String get pairingMemory {
+    final scopes = [
+      if (hasDirectPairingMemory) translate('Direct'),
+      if (hasRendezvousPairingMemory) translate('Rendezvous'),
+    ];
+    return scopes.isEmpty ? '-' : scopes.join(', ');
+  }
+
+  static Future<List<KnownHost>> get() async {
+    final List<KnownHost> hosts = List.empty(growable: true);
+    try {
+      final hostsJson = await bind.mainLoadRecentPeersForAb(filter: '[]');
+      if (hostsJson.isEmpty) return hosts;
+      final hostsList = json.decode(hostsJson);
+      if (hostsList is! List) return hosts;
+      for (final host in hostsList) {
+        if (host is! Map<String, dynamic>) continue;
+        final peer = Peer.fromJson(host);
+        if (peer.id.isEmpty) continue;
+        final pinnedKey =
+            await bind.mainGetPeerOption(id: peer.id, key: pinnedSigningKey);
+        final directMemory = await bind.mainGetPeerOption(
+            id: peer.id, key: directPairingConfirmed);
+        final rendezvousMemory = await bind.mainGetPeerOption(
+            id: peer.id, key: rendezvousPairingConfirmed);
+        hosts.add(KnownHost(
+          peer: peer,
+          hasPassword: peer.hash.isNotEmpty,
+          hasPinnedKey: pinnedKey.isNotEmpty,
+          hasDirectPairingMemory: directMemory.isNotEmpty,
+          hasRendezvousPairingMemory: rendezvousMemory.isNotEmpty,
+        ));
+      }
+    } catch (e) {
+      print(e.toString());
+    }
+    hosts.sort((a, b) => a.displayName.compareTo(b.displayName));
+    return hosts;
+  }
+}
+
+Widget pairedViewersTable(
+    RxList<PairedViewer> viewers, RxList<Uint8List> selectedViewers) {
+  RxBool selectAll = false.obs;
+  setSelectAll() {
+    if (selectedViewers.isNotEmpty &&
+        selectedViewers.length == viewers.length) {
+      selectAll.value = true;
+    } else {
+      selectAll.value = false;
+    }
+  }
+
+  viewers.listen((_) {
+    setSelectAll();
+  });
+  selectedViewers.listen((_) {
+    setSelectAll();
+  });
+  return FittedBox(
+    child: Obx(() => DataTable(
+          columns: [
+            DataColumn(
+                label: Checkbox(
+              value: selectAll.value,
+              onChanged: (value) {
+                if (value == true) {
+                  selectedViewers.clear();
+                  selectedViewers.addAll(viewers.map((e) => e.signPk));
+                } else {
+                  selectedViewers.clear();
+                }
+              },
+            )),
+            DataColumn(label: Text(translate('Scope'))),
+            DataColumn(label: Text(translate('ID'))),
+            DataColumn(label: Text(translate('Key'))),
+            DataColumn(label: Text(translate('Days remaining'))),
+          ],
+          rows: viewers.map((viewer) {
+            return DataRow(cells: [
+              DataCell(Checkbox(
+                value: selectedViewers.contains(viewer.signPk),
+                onChanged: (value) {
+                  if (value == null) return;
+                  if (value) {
+                    selectedViewers.remove(viewer.signPk);
+                    selectedViewers.add(viewer.signPk);
+                  } else {
+                    selectedViewers.remove(viewer.signPk);
+                  }
+                },
+              )),
+              DataCell(Text(viewer.scope.isEmpty ? '-' : viewer.scope)),
+              DataCell(Text(viewer.id.isEmpty ? '-' : viewer.id)),
+              DataCell(Text(viewer.keyFingerprint())),
+              DataCell(Text(viewer.daysRemaining())),
+            ]);
+          }).toList(),
+        )),
+  );
+}
+
+Widget knownHostsTable(RxList<KnownHost> hosts, RxList<String> selectedHosts) {
+  RxBool selectAll = false.obs;
+  setSelectAll() {
+    if (selectedHosts.isNotEmpty && selectedHosts.length == hosts.length) {
+      selectAll.value = true;
+    } else {
+      selectAll.value = false;
+    }
+  }
+
+  hosts.listen((_) {
+    setSelectAll();
+  });
+  selectedHosts.listen((_) {
+    setSelectAll();
+  });
+  return FittedBox(
+    child: Obx(() => DataTable(
+          columns: [
+            DataColumn(
+                label: Checkbox(
+              value: selectAll.value,
+              onChanged: hosts.isEmpty
+                  ? null
+                  : (value) {
+                      if (value == true) {
+                        selectedHosts.clear();
+                        selectedHosts.addAll(hosts.map((e) => e.id));
+                      } else {
+                        selectedHosts.clear();
+                      }
+                    },
+            )),
+            DataColumn(label: Text(translate('Name'))),
+            DataColumn(label: Text(translate('ID'))),
+            DataColumn(label: Text(translate('User/Host'))),
+            DataColumn(label: Text(translate('Platform'))),
+            DataColumn(label: Text(translate('Password'))),
+            DataColumn(label: Text(translate('Pinned key'))),
+            DataColumn(label: Text(translate('Pairing memory'))),
+          ],
+          rows: hosts.map((host) {
+            return DataRow(cells: [
+              DataCell(Checkbox(
+                value: selectedHosts.contains(host.id),
+                onChanged: (value) {
+                  if (value == null) return;
+                  if (value) {
+                    selectedHosts.remove(host.id);
+                    selectedHosts.add(host.id);
+                  } else {
+                    selectedHosts.remove(host.id);
+                  }
+                },
+              )),
+              DataCell(Text(host.displayName)),
+              DataCell(Text(host.id)),
+              DataCell(Text(host.userAndHost)),
+              DataCell(
+                  Text(host.peer.platform.isEmpty ? '-' : host.peer.platform)),
+              DataCell(Text(translate(host.hasPassword ? 'Yes' : 'No'))),
+              DataCell(Text(translate(host.hasPinnedKey ? 'Yes' : 'No'))),
+              DataCell(Text(host.pairingMemory)),
+            ]);
+          }).toList(),
+        )),
+  );
 }
 
 Widget trustedDevicesTable(

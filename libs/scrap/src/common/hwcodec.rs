@@ -30,6 +30,7 @@ pub const DEFAULT_FPS: i32 = 30;
 const DEFAULT_GOP: i32 = i32::MAX;
 const DEFAULT_HW_QUALITY: Quality = Quality_Default;
 pub const ERR_HEVC_POC: i32 = HwcodecErrno::HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC as i32;
+pub const ERR_NO_PACKET: i32 = HwcodecErrno::HWCODEC_ERR_NO_PACKET as i32;
 
 crate::generate_call_macro!(call_yuv, false);
 
@@ -203,10 +204,6 @@ impl EncoderApi for HwRamEncoder {
     fn is_hardware(&self) -> bool {
         true
     }
-
-    fn disable(&self) {
-        HwCodecConfig::clear(false, true);
-    }
 }
 
 impl HwRamEncoder {
@@ -236,7 +233,8 @@ impl HwRamEncoder {
                 data.append(v);
                 Ok(data)
             }
-            Err(_) => Ok(Vec::<EncodeFrame>::new()),
+            Err(ERR_NO_PACKET) => Err(anyhow!("no valid frame")),
+            Err(err) => Err(anyhow!("hw encoder failed: {err}")),
         }
     }
 
@@ -494,6 +492,8 @@ pub struct HwCodecConfig {
     #[serde(default)]
     pub ram_encode: Vec<CodecInfo>,
     #[serde(default)]
+    pub transient_probe_failure: bool,
+    #[serde(default)]
     pub ram_decode: Vec<CodecInfo>,
     #[cfg(feature = "vram")]
     #[serde(default)]
@@ -519,16 +519,24 @@ struct HwCodecConfig2 {
 impl HwCodecConfig {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn set(config: String) {
-        let config = serde_json::from_str(&config).unwrap_or_default();
+        let config: HwCodecConfig = serde_json::from_str(&config).unwrap_or_default();
         log::info!("set hwcodec config");
         log::debug!("{config:?}");
         #[cfg(any(windows, target_os = "macos"))]
-        hbb_common::config::common_store(
-            &HwCodecConfig2 {
-                config: serde_json::to_string_pretty(&config).unwrap_or_default(),
-            },
-            "_hwcodec",
-        );
+        {
+            if config.transient_probe_failure {
+                log::warn!(
+                    "hwcodec probe had transient failures; keeping config in memory without updating cached _hwcodec"
+                );
+            } else {
+                hbb_common::config::common_store(
+                    &HwCodecConfig2 {
+                        config: serde_json::to_string_pretty(&config).unwrap_or_default(),
+                    },
+                    "_hwcodec",
+                );
+            }
+        }
         *CONFIG.lock().unwrap() = Some(config);
         *CONFIG_SET_BY_IPC.lock().unwrap() = true;
     }
@@ -649,6 +657,13 @@ impl HwCodecConfig {
         CONFIG_SET_BY_IPC.lock().unwrap().clone()
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn reset() {
+        log::info!("reset hwcodec config");
+        *CONFIG.lock().unwrap() = None;
+        *CONFIG_SET_BY_IPC.lock().unwrap() = false;
+    }
+
     pub fn clear(vram: bool, encode: bool) {
         log::info!("clear hwcodec config, vram: {vram}, encode: {encode}");
         #[cfg(target_os = "android")]
@@ -701,8 +716,10 @@ pub fn check_available_hwcodec() -> String {
     let vram_string = vram.2;
     #[cfg(not(feature = "vram"))]
     let vram_string = "".to_owned();
+    let ram_encode = Encoder::available_encoders_with_probe_report(ctx, Some(vram_string));
     let c = HwCodecConfig {
-        ram_encode: Encoder::available_encoders(ctx, Some(vram_string)),
+        ram_encode: ram_encode.codecs,
+        transient_probe_failure: ram_encode.transient_failure,
         ram_decode: Decoder::available_decoders(),
         #[cfg(feature = "vram")]
         vram_encode: vram.0,
@@ -716,48 +733,64 @@ pub fn check_available_hwcodec() -> String {
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn start_check_process() {
-    if !enable_hwcodec_option() || HwCodecConfig::already_set() {
+    start_check_process_inner(false);
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn recheck_hwcodec() {
+    HwCodecConfig::reset();
+    start_check_process_inner(true);
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn start_check_process_inner(force: bool) {
+    if !enable_hwcodec_option() || (!force && HwCodecConfig::already_set()) {
         return;
     }
-    use hbb_common::allow_err;
     use std::sync::Once;
-    let f = || {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(_) = exe.file_name().to_owned() {
-                let arg = "--check-hwcodec-config";
-                if let Ok(mut child) = std::process::Command::new(exe).arg(arg).spawn() {
-                    #[cfg(windows)]
-                    hwcodec::common::child_exit_when_parent_exit(child.id());
-                    // wait up to 30 seconds, it maybe slow on windows startup for poorly performing machines
-                    for _ in 0..30 {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        if let Ok(Some(_)) = child.try_wait() {
-                            break;
-                        }
+    if force {
+        std::thread::spawn(run_check_process);
+        return;
+    }
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(run_check_process);
+    });
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn run_check_process() {
+    use hbb_common::allow_err;
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(_) = exe.file_name().to_owned() {
+            let arg = "--check-hwcodec-config";
+            if let Ok(mut child) = std::process::Command::new(exe).arg(arg).spawn() {
+                #[cfg(windows)]
+                hwcodec::common::child_exit_when_parent_exit(child.id());
+                // wait up to 30 seconds, it maybe slow on windows startup for poorly performing machines
+                for _ in 0..30 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if let Ok(Some(_)) = child.try_wait() {
+                        break;
                     }
-                    allow_err!(child.kill());
-                    std::thread::sleep(std::time::Duration::from_millis(30));
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            log::info!("Check hwcodec config, exit with: {status}")
-                        }
-                        Ok(None) => {
-                            log::info!(
-                                "Check hwcodec config, status not ready yet, let's really wait"
-                            );
-                            let res = child.wait();
-                            log::info!("Check hwcodec config, wait result: {res:?}");
-                        }
-                        Err(e) => {
-                            log::error!("Check hwcodec config, error attempting to wait: {e}")
-                        }
+                }
+                allow_err!(child.kill());
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        log::info!("Check hwcodec config, exit with: {status}")
+                    }
+                    Ok(None) => {
+                        log::info!("Check hwcodec config, status not ready yet, let's really wait");
+                        let res = child.wait();
+                        log::info!("Check hwcodec config, wait result: {res:?}");
+                    }
+                    Err(e) => {
+                        log::error!("Check hwcodec config, error attempting to wait: {e}")
                     }
                 }
             }
-        };
+        }
     };
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        std::thread::spawn(f);
-    });
 }

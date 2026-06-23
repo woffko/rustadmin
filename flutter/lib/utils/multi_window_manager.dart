@@ -230,6 +230,8 @@ class RustDeskMultiWindowManager {
     bool? isRDP,
     bool? isSharedPassword,
     String? connToken,
+    String? sessionId,
+    String? pendingCachedPeerData,
   }) async {
     var params = {
       "type": type.index,
@@ -249,13 +251,19 @@ class RustDeskMultiWindowManager {
     if (connToken != null) {
       params['connToken'] = connToken;
     }
+    if (sessionId != null) {
+      params['session_id'] = sessionId;
+    }
+    if (pendingCachedPeerData != null) {
+      params['pending_cached_peer_data'] = pendingCachedPeerData;
+    }
     final msg = jsonEncode(params);
 
     // separate window for file transfer is not supported
     bool openInTabs = type != WindowType.RemoteDesktop ||
         mainGetLocalBoolOptionSync(kOptionOpenNewConnInTabs);
 
-    if (windows.length > 1 || !openInTabs) {
+    if (sessionId == null && (windows.length > 1 || !openInTabs)) {
       for (final windowId in windows) {
         if (await DesktopMultiWindow.invokeMethod(
             windowId, kWindowEventActiveSession, remoteId)) {
@@ -273,6 +281,8 @@ class RustDeskMultiWindowManager {
     bool? isSharedPassword,
     String? switchUuid,
     bool? forceRelay,
+    String? sessionId,
+    String? pendingCachedPeerData,
   }) async {
     return await newSession(
       WindowType.RemoteDesktop,
@@ -283,7 +293,23 @@ class RustDeskMultiWindowManager {
       forceRelay: forceRelay,
       switchUuid: switchUuid,
       isSharedPassword: isSharedPassword,
+      sessionId: sessionId,
+      pendingCachedPeerData: pendingCachedPeerData,
     );
+  }
+
+  Future<bool> activateRemoteDesktop(String remoteId) async {
+    for (final windowId in _remoteDesktopWindows) {
+      try {
+        if (await DesktopMultiWindow.invokeMethod(
+            windowId, kWindowEventActiveSession, remoteId)) {
+          return true;
+        }
+      } catch (e) {
+        debugPrint('Failed to activate remote desktop $remoteId: $e');
+      }
+    }
+    return false;
   }
 
   Future<MultiWindowCallResult> newFileTransfer(
@@ -472,7 +498,8 @@ class RustDeskMultiWindowManager {
     }
     for (int i = 0; i < windows.length; i++) {
       final wId = windows[i];
-      final shouldSavePos = type != WindowType.Terminal || i == windows.length - 1;
+      final shouldSavePos =
+          type != WindowType.Terminal || i == windows.length - 1;
       if (shouldSavePos) {
         debugPrint("closing multi window, type: ${type.toString()} id: $wId");
         try {

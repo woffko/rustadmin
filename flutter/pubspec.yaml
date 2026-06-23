@@ -16,7 +16,7 @@ publish_to: "none" # Remove this line if you wish to publish to pub.dev
 # Read more about iOS versioning at
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # 1.1.9-1 works for android, but for ios it becomes 1.1.91, need to set it to 1.1.9-a.1 for iOS, will get 1.1.9.1, but iOS store not allow 4 numbers
-version: 1.4.6+64
+version: 2.0.2+1
 
 environment:
   sdk: '^3.1.0'
@@ -39,8 +39,7 @@ dependencies:
   url_launcher_ios: ^6.3.2
   toggle_switch: ^2.1.0
   dash_chat_2:
-    git:
-      url: https://github.com/rustdesk-org/Dash-Chat-2
+    path: third_party/dash_chat_2
   draggable_float_widget: ^0.1.0
   settings_ui: ^2.0.2
   flutter_breadcrumb: ^1.0.1
@@ -70,7 +69,7 @@ dependencies:
   desktop_drop: ^0.4.4
   scroll_pos: ^0.4.0
   debounce_throttle: ^2.0.0
-  file_picker: ^10.3.3
+  file_picker: ^8.0.0
   flutter_svg: ^2.0.5
   uni_links:
     git:
@@ -85,6 +84,7 @@ dependencies:
   password_strength: ^0.2.0
   flutter_launcher_icons: ^0.13.1
   flutter_keyboard_visibility: ^5.4.0
+  flutter_plugin_android_lifecycle: 2.0.17
   texture_rgba_renderer:
     git:
       url: https://github.com/rustdesk-org/flutter_texture_rgba_renderer
@@ -99,16 +99,14 @@ dependencies:
   auto_size_text_field: ^2.2.1
   flex_color_picker: ^3.3.0
   dynamic_layouts:
-    git:
-      url: https://github.com/rustdesk-org/dynamic_layouts.git
-      ref: 24cb88413fa5181d949ddacbb30a65d5c459e7d9
+    path: third_party/dynamic_layouts
   pull_down_button: ^0.9.3
   device_info_plus: ^9.1.0
   qr_flutter: ^4.1.0
-  extended_text: ^15.0.2
+  extended_text: ^14.0.0
   xterm: 4.0.0
   sqflite: 2.2.0
-  google_fonts: ^8.0.2
+  google_fonts: ^6.2.1
   vector_math: ^2.1.4
 
 dev_dependencies:
@@ -119,10 +117,6 @@ dev_dependencies:
   freezed: ^2.4.2
   flutter_lints: ^2.0.2
   ffigen: ^8.0.2
-
-dependency_overrides:
-  intl: ^0.19.0
-  flutter_plugin_android_lifecycle: 2.0.17
 
 # rerun: flutter pub run flutter_launcher_icons
 flutter_icons:

@@ -255,9 +255,28 @@ class ConnectionManagerState extends State<ConnectionManager>
                                     mask: false,
                                   ))),
                   ]);
+                  final permissionRequest = serverModel.permissionRequest;
                   return Container(
                     color: Theme.of(context).scaffoldBackgroundColor,
-                    child: row,
+                    child: Stack(
+                      children: [
+                        row,
+                        if (permissionRequest != null)
+                          Positioned.fill(
+                            child: PermissionRequestOverlay(
+                              client: permissionRequest.client,
+                              title: permissionRequest.title,
+                              risk: permissionRequest.risk,
+                              onDecline: () =>
+                                  serverModel.respondPermissionRequest(
+                                      permissionRequest, false),
+                              onAllow: () =>
+                                  serverModel.respondPermissionRequest(
+                                      permissionRequest, true),
+                            ),
+                          ),
+                      ],
+                    ),
                   );
                 },
               ),
@@ -442,7 +461,7 @@ class _CmHeaderState extends State<_CmHeader>
     super.build(context);
     return Container(
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(10.0),
+        borderRadius: BorderRadius.circular(4.0),
         gradient: LinearGradient(
           begin: Alignment.topRight,
           end: Alignment.bottomLeft,
@@ -584,7 +603,7 @@ class _CmHeaderState extends State<_CmHeader>
       alignment: Alignment.center,
       decoration: BoxDecoration(
         color: str2color(client.name),
-        borderRadius: BorderRadius.circular(15.0),
+        borderRadius: BorderRadius.circular(4.0),
       ),
       child: Text(
         client.name.isNotEmpty ? client.name[0] : '?',
@@ -617,7 +636,7 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
       child: Container(
         decoration: BoxDecoration(
           color: enabled ? MyTheme.accent : Colors.grey[700],
-          borderRadius: BorderRadius.circular(10.0),
+          borderRadius: BorderRadius.circular(4.0),
         ),
         padding: EdgeInsets.all(8.0),
         child: InkWell(
@@ -649,7 +668,7 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
       margin: EdgeInsets.all(5.0),
       padding: EdgeInsets.all(5.0),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(10.0),
+        borderRadius: BorderRadius.circular(4.0),
         color: Theme.of(context).colorScheme.background,
         boxShadow: [
           BoxShadow(
@@ -684,9 +703,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                               connId: client.id,
                               name: "audio",
                               enabled: enabled);
-                          setState(() {
-                            client.audio = enabled;
-                          });
                         },
                         translate('Enable audio'),
                       ),
@@ -698,9 +714,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                               connId: client.id,
                               name: "recording",
                               enabled: enabled);
-                          setState(() {
-                            client.recording = enabled;
-                          });
                         },
                         translate('Enable recording session'),
                       ),
@@ -714,9 +727,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                               connId: client.id,
                               name: "keyboard",
                               enabled: enabled);
-                          setState(() {
-                            client.keyboard = enabled;
-                          });
                         },
                         translate('Enable keyboard/mouse'),
                       ),
@@ -728,9 +738,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                               connId: client.id,
                               name: "clipboard",
                               enabled: enabled);
-                          setState(() {
-                            client.clipboard = enabled;
-                          });
                         },
                         translate('Enable clipboard'),
                       ),
@@ -742,9 +749,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                               connId: client.id,
                               name: "audio",
                               enabled: enabled);
-                          setState(() {
-                            client.audio = enabled;
-                          });
                         },
                         translate('Enable audio'),
                       ),
@@ -756,9 +760,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                               connId: client.id,
                               name: "file",
                               enabled: enabled);
-                          setState(() {
-                            client.file = enabled;
-                          });
                         },
                         translate('Enable file copy and paste'),
                       ),
@@ -770,9 +771,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                               connId: client.id,
                               name: "restart",
                               enabled: enabled);
-                          setState(() {
-                            client.restart = enabled;
-                          });
                         },
                         translate('Enable remote restart'),
                       ),
@@ -784,9 +782,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                               connId: client.id,
                               name: "recording",
                               enabled: enabled);
-                          setState(() {
-                            client.recording = enabled;
-                          });
                         },
                         translate('Enable recording session'),
                       ),
@@ -800,9 +795,6 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                                 connId: client.id,
                                 name: "block_input",
                                 enabled: enabled);
-                            setState(() {
-                              client.blockInput = enabled;
-                            });
                           },
                           translate('Enable blocking user input'),
                         )
@@ -1094,23 +1086,29 @@ class _CmControlPanel extends StatelessWidget {
     assert(!(onClick == null && onTapDown == null));
     Widget textWidget;
     if (icon != null) {
-      textWidget = Text(
-        translate(text),
-        style: TextStyle(color: textColor),
-        textAlign: TextAlign.center,
-      );
-    } else {
-      textWidget = Expanded(
+      textWidget = Transform.translate(
+        offset: const Offset(0, MyTheme.desktopButtonContentOffsetY),
         child: Text(
           translate(text),
-          style: TextStyle(color: textColor),
+          style: MyTheme.desktopButtonTextStyle.copyWith(color: textColor),
           textAlign: TextAlign.center,
         ),
       );
+    } else {
+      textWidget = Expanded(
+        child: Transform.translate(
+          offset: const Offset(0, MyTheme.desktopButtonContentOffsetY),
+          child: Text(
+            translate(text),
+            style: MyTheme.desktopButtonTextStyle.copyWith(color: textColor),
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
     }
-    final borderRadius = BorderRadius.circular(10.0);
+    final borderRadius = BorderRadius.circular(4.0);
     final btn = Container(
-      height: 28,
+      height: MyTheme.desktopButtonTargetHeight,
       decoration: BoxDecoration(
           color: color, borderRadius: borderRadius, border: border),
       child: InkWell(
@@ -1192,6 +1190,12 @@ void checkClickTime(int id, Function() callback) async {
 }
 
 bool allowRemoteCMModification() {
+  if (!isWeb &&
+      bind.mainGetCommonSync(
+              key: "should-block-rustadmin-gui-for-active-sessions") ==
+          "true") {
+    return false;
+  }
   return option2bool(kOptionAllowRemoteCmModification,
       bind.mainGetLocalOption(key: kOptionAllowRemoteCmModification));
 }
@@ -1214,7 +1218,7 @@ class __FileTransferLogPageState extends State<_FileTransferLogPage> {
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         borderRadius: BorderRadius.all(
-          Radius.circular(15.0),
+          Radius.circular(4.0),
         ),
       ),
       child: child,
@@ -1356,7 +1360,7 @@ class __FileTransferLogPageState extends State<_FileTransferLogPage> {
                                               center: Text(
                                                 '${(item.finishedSize / item.totalSize * 100).toStringAsFixed(0)}%',
                                               ),
-                                              barRadius: Radius.circular(15),
+                                              barRadius: Radius.circular(4.0),
                                               percent: item.finishedSize /
                                                   item.totalSize,
                                               progressColor: MyTheme.accent,

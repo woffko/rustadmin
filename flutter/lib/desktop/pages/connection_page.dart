@@ -65,10 +65,14 @@ class NetworkModeInfo {
 Future<NetworkModeInfo> loadNetworkModeInfo() async {
   Future<NetworkModeInfo> fallbackFromOptions({String trustPhrase = ''}) async {
     final usingPublicServer = await bind.mainIsUsingPublicServer();
-    final apiServer = await bind.mainGetApiServer();
-    final rendezvousServer =
-        await bind.mainGetOption(key: 'custom-rendezvous-server');
-    final relayServer = await bind.mainGetOption(key: 'relay-server');
+    final useIdRelayServer = option2bool(kOptionAllowIdRelayServer,
+        await bind.mainGetOption(key: kOptionAllowIdRelayServer));
+    final apiServer = useIdRelayServer ? await bind.mainGetApiServer() : '';
+    final rendezvousServer = useIdRelayServer
+        ? await bind.mainGetOption(key: 'custom-rendezvous-server')
+        : '';
+    final relayServer =
+        useIdRelayServer ? await bind.mainGetOption(key: 'relay-server') : '';
     final directAccessEnabled = option2bool(kOptionDirectServer,
         await bind.mainGetOption(key: kOptionDirectServer));
     final pairingRequired =
@@ -292,7 +296,7 @@ class _NetworkStatusPanelBodyState extends State<NetworkStatusPanelBody> {
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
           decoration: BoxDecoration(
             color: color.withOpacity(0.14),
-            borderRadius: BorderRadius.circular(6),
+            borderRadius: BorderRadius.circular(4.0),
             border: Border.all(color: color.withOpacity(0.4)),
           ),
           child: Text(
@@ -343,7 +347,7 @@ class _NetworkStatusPanelBodyState extends State<NetworkStatusPanelBody> {
             children: [
               if (widget.mode == 'local_only' || widget.pairingRequired)
                 buildStatusLine(
-                  'Pairing passphrase',
+                  'Local pairing passphrase',
                   widget.pairingRequired ? 'Required' : 'Disabled',
                 ),
               if (directAccessValue.isNotEmpty) ...[
@@ -476,7 +480,7 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
               height: 8,
               width: 8,
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(4),
+                borderRadius: BorderRadius.circular(4.0),
                 color: statusColor(),
               ),
             ).marginSymmetric(horizontal: em),
@@ -716,7 +720,7 @@ class _ConnectionPageState extends State<ConnectionPage>
       width: 320 + 20 * 2,
       padding: const EdgeInsets.fromLTRB(20, 24, 20, 22),
       decoration: BoxDecoration(
-          borderRadius: const BorderRadius.all(Radius.circular(13)),
+          borderRadius: const BorderRadius.all(Radius.circular(4.0)),
           border: Border.all(color: Theme.of(context).colorScheme.background)),
       child: Ink(
         child: Column(
@@ -852,7 +856,7 @@ class _ConnectionPageState extends State<ConnectionPage>
                             ],
                           ),
                           child: ClipRRect(
-                              borderRadius: BorderRadius.circular(5),
+                              borderRadius: BorderRadius.circular(4.0),
                               child: Material(
                                 elevation: 4,
                                 child: ConstrainedBox(
@@ -893,7 +897,7 @@ class _ConnectionPageState extends State<ConnectionPage>
               padding: const EdgeInsets.only(top: 13.0),
               child: Row(mainAxisAlignment: MainAxisAlignment.end, children: [
                 SizedBox(
-                  height: 28.0,
+                  height: MyTheme.desktopButtonTargetHeight,
                   child: ElevatedButton(
                     onPressed: () {
                       onConnect();
@@ -903,11 +907,11 @@ class _ConnectionPageState extends State<ConnectionPage>
                 ),
                 const SizedBox(width: 8),
                 Container(
-                  height: 28.0,
-                  width: 28.0,
+                  height: MyTheme.desktopButtonTargetHeight,
+                  width: MyTheme.desktopButtonTargetHeight,
                   decoration: BoxDecoration(
                     border: Border.all(color: Theme.of(context).dividerColor),
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(4.0),
                   ),
                   child: Center(
                     child: StatefulBuilder(

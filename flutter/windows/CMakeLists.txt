@@ -1,10 +1,10 @@
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.14)
-project(rustdesk LANGUAGES CXX)
+project(rustadmin LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "rustdesk")
+set(BINARY_NAME "rustadmin")
 
 # Explicitly opt into modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -111,6 +111,9 @@ endif()
 set(RUSTDESK_LIB
     "${RUSTDESK_TARGET_DIR}/${RUSTDESK_LIB_BUILD_TYPE}/librustdesk.dll")
 message(STATUS "rustdesk lib path: ${RUSTDESK_LIB}")
+install(CODE "
+  file(REMOVE \"${INSTALL_BUNDLE_LIB_DIR}/librustdesk.dll\")
+  " COMPONENT Runtime)
 install(FILES "${RUSTDESK_LIB}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
 COMPONENT Runtime RENAME librustdesk.dll)
 

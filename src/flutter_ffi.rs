@@ -3,7 +3,7 @@ use crate::keyboard::input_source::{change_input_source, get_cur_session_input_s
 #[cfg(target_os = "linux")]
 use crate::platform::linux::is_x11;
 use crate::{
-    client::file_trait::FileManager,
+    client::{self, file_trait::FileManager},
     common::{make_fd_to_json, make_vec_fd_to_json},
     flutter::{
         self, session_add, session_add_existed, session_start_, sessions, try_sync_peer_option,
@@ -287,6 +287,7 @@ pub fn will_session_close_close_session(session_id: SessionID) -> SyncReturn<boo
 }
 
 pub fn session_close(session_id: SessionID) {
+    log::info!("diag session_close FFI requested: session_id={session_id}");
     if let Some(session) = sessions::remove_session_by_session_id(&session_id) {
         // `release_remote_keys` is not required for mobile platforms in common cases.
         // But we still call it to make the code more stable.
@@ -294,6 +295,10 @@ pub fn session_close(session_id: SessionID) {
         crate::keyboard::release_remote_keys("map");
         session.close_event_stream(session_id);
         session.close();
+    } else {
+        log::info!(
+            "diag session_close FFI ignored: session_id={session_id}, reason=missing_session"
+        );
     }
 }
 
@@ -352,7 +357,10 @@ pub fn session_toggle_option(session_id: SessionID, value: String) {
         try_sync_peer_option(&session, &session_id, &value, None);
     }
     #[cfg(not(target_os = "ios"))]
-    if sessions::get_session_by_session_id(&session_id).is_some() && value == "disable-clipboard" {
+    if sessions::get_session_by_session_id(&session_id).is_some()
+        && (value == "disable-clipboard"
+            || value.starts_with(client::CLIPBOARD_DIRECTION_TOGGLE_PREFIX))
+    {
         crate::flutter::update_text_clipboard_required();
     }
     #[cfg(feature = "unix-file-copy-paste")]
@@ -366,6 +374,12 @@ pub fn session_toggle_option(session_id: SessionID, value: String) {
 pub fn session_toggle_privacy_mode(session_id: SessionID, impl_key: String, on: bool) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.toggle_privacy_mode(impl_key, on);
+    }
+}
+
+pub fn session_request_permission(session_id: SessionID, name: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.request_permission(name);
     }
 }
 
@@ -561,6 +575,12 @@ pub fn session_set_custom_fps(session_id: SessionID, fps: i32) {
     }
 }
 
+pub fn session_set_capture_backend(session_id: SessionID, value: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.set_capture_backend(value);
+    }
+}
+
 pub fn session_get_trackpad_speed(session_id: SessionID) -> Option<i32> {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         Some(session.get_trackpad_speed())
@@ -631,21 +651,30 @@ pub fn session_handle_flutter_raw_key_event(
     }
 }
 
-// SyncReturn<()> is used to make sure enter() and leave() are executed in the sequence this function is called.
-//
 // If the cursor jumps between remote page of two connections, leave view and enter view will be called.
 // session_enter_or_leave() will be called then.
-// As rust is multi-thread, it is possible that enter() is called before leave().
-// This will cause the keyboard input to take no effect.
+// As Rust is multi-threaded, enter() can be called before leave().
+// The Rust-side grab ownership state filters stale transitions.
 pub fn session_enter_or_leave(_session_id: SessionID, _enter: bool) -> SyncReturn<()> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if let Some(session) = sessions::get_session_by_session_id(&_session_id) {
         let keyboard_mode = session.get_keyboard_mode();
+        // Use the full per-window UUID (not lc.session_id which is per-connection)
+        // so that two windows viewing the same peer get distinct grab owners.
+        let window_id = _session_id.as_u128();
         if _enter {
             set_cur_session_id_(_session_id, &keyboard_mode);
-            session.enter(keyboard_mode);
+            crate::keyboard::client::change_grab_status(
+                crate::common::GrabState::Run,
+                &keyboard_mode,
+                window_id,
+            );
         } else {
-            session.leave(keyboard_mode);
+            crate::keyboard::client::change_grab_status(
+                crate::common::GrabState::Wait,
+                &keyboard_mode,
+                window_id,
+            );
         }
     }
     SyncReturn(())
@@ -989,6 +1018,7 @@ pub fn main_show_option(_key: String) -> SyncReturn<bool> {
 }
 
 pub fn main_set_option(key: String, value: String) {
+    let mirror_local_config = key.eq(config::keys::OPTION_ALLOW_UNVERIFIED_PEER_TRUST);
     #[cfg(target_os = "android")]
     if key.eq(config::keys::OPTION_ENABLE_KEYBOARD) {
         crate::ui_cm_interface::switch_permission_all(
@@ -1010,20 +1040,25 @@ pub fn main_set_option(key: String, value: String) {
     let is_allow_tls_fallback = key.eq(config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK);
     if is_allow_tls_fallback
         || key.eq("custom-rendezvous-server")
+        || key.eq(config::keys::OPTION_ALLOW_ID_RELAY_SERVER)
         || key.eq(config::keys::OPTION_ALLOW_WEBSOCKET)
         || key.eq(config::keys::OPTION_DISABLE_UDP)
+        || key.eq(config::keys::OPTION_RELAY_SERVER)
         || key.eq("api-server")
     {
         if is_allow_tls_fallback {
             hbb_common::tls::reset_tls_cache();
         }
-        set_option(key, value.clone());
+        set_option(key.clone(), value.clone());
         #[cfg(target_os = "android")]
         crate::rendezvous_mediator::RendezvousMediator::restart();
         #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
         crate::common::test_rendezvous_server();
     } else {
-        set_option(key, value.clone());
+        set_option(key.clone(), value.clone());
+    }
+    if mirror_local_config {
+        config::Config::set_option(key, value);
     }
 }
 
@@ -2177,6 +2212,21 @@ pub fn cm_switch_permission(conn_id: i32, name: String, enabled: bool) {
     crate::ui_cm_interface::switch_permission(conn_id, name, enabled)
 }
 
+pub fn cm_respond_permission_request(
+    conn_id: i32,
+    request_id: String,
+    name: String,
+    enabled: bool,
+    approved: bool,
+) {
+    #[cfg(not(any(target_os = "ios")))]
+    if let Ok(request_id) = request_id.parse::<u64>() {
+        crate::ui_cm_interface::respond_permission_request(
+            conn_id, request_id, name, enabled, approved,
+        )
+    }
+}
+
 pub fn cm_can_elevate() -> SyncReturn<bool> {
     SyncReturn(crate::ui_cm_interface::can_elevate())
 }
@@ -2187,7 +2237,7 @@ pub fn cm_elevate_portable(conn_id: i32) {
 }
 
 pub fn cm_switch_back(conn_id: i32) {
-    #[cfg(not(any(target_os = "ios")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     crate::ui_cm_interface::switch_back(conn_id);
 }
 
@@ -2792,6 +2842,10 @@ pub fn main_get_common(key: String) -> String {
             None => "",
         }
         .to_string();
+    } else if key == "should-block-rustadmin-gui-for-active-sessions" {
+        return ui_interface::should_block_rustadmin_gui_for_active_sessions()
+            .unwrap_or_else(crate::server::should_block_rustadmin_gui_for_active_sessions)
+            .to_string();
     } else if key == "has-gnome-shortcuts-inhibitor-permission" {
         #[cfg(target_os = "linux")]
         return crate::platform::linux::has_gnome_shortcuts_inhibitor_permission().to_string();
@@ -2812,6 +2866,8 @@ pub fn main_get_common(key: String) -> String {
             "pairing_required": info.pairing_required,
         })
         .to_string();
+    } else if key == "paired-viewers" {
+        return ui_interface::get_paired_viewers();
     } else {
         if key.starts_with("download-data-") {
             let id = key.replace("download-data-", "");
@@ -2860,6 +2916,14 @@ pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
 }
 
 pub fn main_set_common(_key: String, _value: String) {
+    if _key == "remove-paired-viewers" {
+        ui_interface::remove_paired_viewers(&_value);
+        return;
+    }
+    if _key == "clear-paired-viewers" {
+        ui_interface::clear_paired_viewers();
+        return;
+    }
     #[cfg(target_os = "windows")]
     if _key == "install-printer" && crate::platform::is_win_10_or_greater() {
         std::thread::spawn(move || {

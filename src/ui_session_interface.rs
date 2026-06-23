@@ -180,6 +180,11 @@ impl SessionPermissionConfig {
         *self.server_clipboard_enabled.read().unwrap()
             && *self.server_keyboard_enabled.read().unwrap()
             && !self.lc.read().unwrap().disable_clipboard.v
+            && self
+                .lc
+                .read()
+                .unwrap()
+                .is_local_to_remote_clipboard_allowed()
     }
 
     #[cfg(feature = "unix-file-copy-paste")]
@@ -402,6 +407,23 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg_out));
     }
 
+    pub fn request_permission(&self, name: String) {
+        let mut request_id = hbb_common::rand::random::<u64>();
+        if request_id == 0 {
+            request_id = 1;
+        }
+        let mut misc = Misc::new();
+        misc.set_session_permission_request(SessionPermissionRequest {
+            request_id,
+            name,
+            enabled: true,
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_misc(misc);
+        self.send(Data::Message(msg_out));
+    }
+
     pub fn get_toggle_option(&self, name: String) -> bool {
         self.lc.read().unwrap().get_toggle_option(&name)
     }
@@ -416,6 +438,11 @@ impl<T: InvokeUiSession> Session<T> {
         *self.server_clipboard_enabled.read().unwrap()
             && *self.server_keyboard_enabled.read().unwrap()
             && !self.lc.read().unwrap().disable_clipboard.v
+            && self
+                .lc
+                .read()
+                .unwrap()
+                .is_local_to_remote_clipboard_allowed()
     }
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -502,6 +529,12 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg));
     }
 
+    pub fn set_capture_backend(&self, value: String) {
+        let msg = self.lc.write().unwrap().set_capture_backend(value, true);
+        self.send(Data::Message(msg));
+        self.send(Data::Message(LoginConfigHandler::refresh()));
+    }
+
     pub fn get_remember(&self) -> bool {
         self.lc.read().unwrap().remember
     }
@@ -548,6 +581,7 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn update_supported_decodings(&self) {
         let msg = self.lc.write().unwrap().update_supported_decodings();
+        log::info!("diag viewer sending supported_decoding update");
         self.send(Data::Message(msg));
     }
 
@@ -875,12 +909,14 @@ impl<T: InvokeUiSession> Session<T> {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn enter(&self, keyboard_mode: String) {
-        keyboard::client::change_grab_status(GrabState::Run, &keyboard_mode);
+        let session_id = self.lc.read().unwrap().session_id as u128;
+        keyboard::client::change_grab_status(GrabState::Run, &keyboard_mode, session_id);
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn leave(&self, keyboard_mode: String) {
-        keyboard::client::change_grab_status(GrabState::Wait, &keyboard_mode);
+        let session_id = self.lc.read().unwrap().session_id as u128;
+        keyboard::client::change_grab_status(GrabState::Wait, &keyboard_mode, session_id);
     }
 
     // flutter only TODO new input
@@ -1285,8 +1321,20 @@ impl<T: InvokeUiSession> Session<T> {
         let mut connection_round_state_lock = self.connection_round_state.lock().unwrap();
         if self.thread.lock().unwrap().is_some() {
             match connection_round_state_lock.state {
-                ConnectionState::Connecting => return,
-                ConnectionState::Connected => self.send(Data::Close),
+                ConnectionState::Connecting => {
+                    log::info!(
+                        "diag session reconnect ignored while connecting: id={}, force_relay={force_relay}",
+                        self.get_id()
+                    );
+                    return;
+                }
+                ConnectionState::Connected => {
+                    log::info!(
+                        "diag session reconnect closing current connection: id={}, force_relay={force_relay}",
+                        self.get_id()
+                    );
+                    self.send(Data::Close)
+                }
                 ConnectionState::Disconnected => {}
             }
         }
@@ -1398,6 +1446,12 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn close(&self) {
+        log::info!(
+            "diag session close requested: id={}, thread_active={}, sender_ready={}",
+            self.get_id(),
+            self.thread.lock().unwrap().is_some(),
+            self.sender.read().unwrap().is_some()
+        );
         self.confirm_direct_trust_response(false);
         self.submit_direct_pairing_passphrase_response(None);
         self.send(Data::Close);
@@ -1491,10 +1545,11 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::ElevateWithLogon(username, password));
     }
 
-    #[cfg(any(target_os = "ios"))]
+    #[cfg(any(target_os = "android", target_os = "ios", not(feature = "flutter")))]
     pub fn switch_sides(&self) {}
 
-    #[cfg(not(any(target_os = "ios")))]
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     #[tokio::main(flavor = "current_thread")]
     pub async fn switch_sides(&self) {
         match crate::ipc::connect(1000, "").await {
@@ -1511,6 +1566,8 @@ impl<T: InvokeUiSession> Session<T> {
                                     let mut misc = Misc::new();
                                     misc.set_switch_sides_request(SwitchSidesRequest {
                                         uuid: Bytes::from(uuid.as_bytes().to_vec()),
+                                        direct_endpoints:
+                                            crate::common::get_direct_access_endpoints(),
                                         ..Default::default()
                                     });
                                     let mut msg_out = Message::new();
@@ -1814,6 +1871,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                 "fingerprint": fingerprint,
                 "trust_phrase": trust_phrase,
                 "direct": direct,
+                "allow_unverified_peer_trust": crate::common::allow_unverified_peer_trust(),
             })
             .to_string();
             self.ui_handler.msgbox(
@@ -1859,7 +1917,11 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             .to_string();
             self.ui_handler.msgbox(
                 "input-pairing-passphrase",
-                "Pairing passphrase required",
+                if direct {
+                    "Local pairing passphrase required"
+                } else {
+                    "Rendezvous pairing passphrase required"
+                },
                 &payload,
                 "",
                 false,
@@ -1997,6 +2059,16 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             self.update_quality_status(QualityStatus {
                 delay: Some(t.last_delay as _),
                 target_bitrate: Some(t.target_bitrate as _),
+                host_video_fps: (!t.host_video_fps.is_empty()).then_some(t.host_video_fps.clone()),
+                host_video_codec: (!t.host_video_codec.is_empty())
+                    .then_some(t.host_video_codec.clone()),
+                host_video_qos: (!t.host_video_qos.is_empty()).then_some(t.host_video_qos.clone()),
+                host_video_wait: (!t.host_video_wait.is_empty())
+                    .then_some(t.host_video_wait.clone()),
+                host_video_backend: (!t.host_video_backend.is_empty())
+                    .then_some(t.host_video_backend.clone()),
+                host_video_fallback: (!t.host_video_fallback.is_empty())
+                    .then_some(t.host_video_fallback.clone()),
                 ..Default::default()
             });
             handle_test_delay(t, peer).await;
@@ -2112,7 +2184,7 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
                 || handler.args[2].parse::<i32>().unwrap_or(0) <= 0
                 || port <= 0
             {
-                handler.on_error("Invalid arguments, usage:<br><br> rustdesk --port-forward remote-id listen-port remote-host remote-port");
+                handler.on_error("Invalid arguments, usage:<br><br> rustadmin --port-forward remote-id listen-port remote-host remote-port");
             }
             let remote_host = handler.args[1].clone();
             let remote_port = handler.args[2].parse::<i32>().unwrap_or(0);

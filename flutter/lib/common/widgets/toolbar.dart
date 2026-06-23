@@ -172,26 +172,72 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
         connToken: connToken);
   }
 
+  requestPermission(String name) {
+    bind.sessionRequestPermission(sessionId: sessionId, name: name);
+    showToast(translate('Permission request sent'));
+  }
+
+  requestOrConnect(String requestName, VoidCallback connect) {
+    final permissionRequestMode = perms['clipboard'] == false ||
+        perms['audio'] == false ||
+        perms['file'] == false ||
+        perms['restart'] == false ||
+        perms['recording'] == false;
+    if (!permissionRequestMode || perms[requestName] == true) {
+      connect();
+    } else {
+      requestPermission(requestName);
+    }
+  }
+
+  addPermissionRequest(String name, String label) {
+    if (perms[name] == false) {
+      v.add(TTextMenu(
+          child: Text('${translate('Request')} ${translate(label)}'),
+          onPressed: () => requestPermission(name)));
+    }
+  }
+
   if (isDefaultConn && isDesktop) {
+    addPermissionRequest('clipboard', 'clipboard');
+    addPermissionRequest('audio', 'audio');
+    addPermissionRequest('file', 'file copy and paste');
+    addPermissionRequest('restart', 'remote restart');
+    addPermissionRequest('recording', 'session recording');
+    if (isWindows) {
+      addPermissionRequest('block_input', 'blocking local input');
+    }
     v.add(
       TTextMenu(
-          child: Text(translate('Transfer file')),
-          onPressed: () => connectWithToken(isFileTransfer: true)),
+          child: Text(translate(perms['file_transfer'] == true
+              ? 'Transfer file'
+              : 'Request file transfer')),
+          onPressed: () => requestOrConnect(
+              'file_transfer', () => connectWithToken(isFileTransfer: true))),
     );
     v.add(
       TTextMenu(
-          child: Text(translate('View camera')),
-          onPressed: () => connectWithToken(isViewCamera: true)),
+          child: Text(translate(perms['view_camera'] == true
+              ? 'View camera'
+              : 'Request camera access')),
+          onPressed: () => requestOrConnect(
+              'view_camera', () => connectWithToken(isViewCamera: true))),
     );
     v.add(
       TTextMenu(
-          child: Text('${translate('Terminal')} (beta)'),
-          onPressed: () => connectWithToken(isTerminal: true)),
+          child: Text(perms['terminal'] == true
+              ? '${translate('Terminal')} (beta)'
+              : translate('Request terminal')),
+          onPressed: () => requestOrConnect(
+              'terminal', () => connectWithToken(isTerminal: true))),
     );
     v.add(
       TTextMenu(
-          child: Text(translate('TCP tunneling')),
-          onPressed: () => connectWithToken(isTcpTunneling: true)),
+          child: Text(translate(perms['port_forward'] == true
+              ? 'TCP tunneling'
+              : 'Request TCP tunneling')),
+          onPressed: () => requestOrConnect(
+              'port_forward', () => connectWithToken(isTcpTunneling: true))),
     );
   }
   // note
@@ -477,6 +523,51 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
   ];
 }
 
+Future<List<TRadioMenu<String>>> toolbarCaptureBackend(FFI ffi) async {
+  if (ffi.ffiModel.pi.platform != kPeerPlatformWindows ||
+      !ffi.ffiModel.pi.supportCaptureBackend ||
+      ffi.connType != ConnType.defaultConn) {
+    return [];
+  }
+  final sessionId = ffi.sessionId;
+  var groupValue = await bind.sessionGetOption(
+          sessionId: sessionId, arg: kOptionCaptureBackend) ??
+      '';
+  if (groupValue.isEmpty) {
+    groupValue = 'auto';
+  }
+
+  onChanged(String? value) async {
+    if (value == null) return;
+    await bind.sessionPeerOption(
+        sessionId: sessionId,
+        name: kOptionCaptureBackend,
+        value: value == 'auto' ? '' : value);
+    await bind.sessionSetCaptureBackend(sessionId: sessionId, value: value);
+  }
+
+  TRadioMenu<String> radio(String label, String value) {
+    return TRadioMenu<String>(
+        child: Text(label),
+        value: value,
+        groupValue: groupValue,
+        onChanged: onChanged);
+  }
+
+  var autoLabel = translate('Auto');
+  if (groupValue == 'auto' &&
+      ffi.qualityMonitorModel.data.hostVideoBackend != null) {
+    autoLabel = '$autoLabel (${ffi.qualityMonitorModel.data.hostVideoBackend})';
+  }
+  return [
+    radio(autoLabel, 'auto'),
+    radio('DXGI', 'dxgi'),
+    radio('WGC', 'wgc'),
+    radio('WinMag', 'winmag'),
+    radio('GDI', 'gdi'),
+  ];
+}
+
 Future<List<TToggleMenu>> toolbarCursor(
     BuildContext context, String id, FFI ffi) async {
   List<TToggleMenu> v = [];
@@ -538,9 +629,9 @@ Future<List<TToggleMenu>> toolbarCursor(
         onChanged: (value) async {
           if (value == null) return;
           await bind.sessionToggleOption(sessionId: sessionId, value: option);
-          value = bind.sessionGetToggleOptionSync(
+          final followRemoteCursor = bind.sessionGetToggleOptionSync(
               sessionId: sessionId, arg: option);
-          showCursorLockState.value = value;
+          showCursorLockState.value = followRemoteCursor;
           if (!showCursorEnabled) {
             await bind.sessionToggleOption(
                 sessionId: sessionId, value: showCursorOption);
@@ -600,16 +691,6 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
   final sessionId = ffi.sessionId;
   final isDefaultConn = ffi.connType == ConnType.defaultConn;
 
-  // show quality monitor
-  final option = 'show-quality-monitor';
-  v.add(TToggleMenu(
-      value: bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option),
-      onChanged: (value) async {
-        if (value == null) return;
-        await bind.sessionToggleOption(sessionId: sessionId, value: option);
-        ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
-      },
-      child: Text(translate('Show quality monitor'))));
   // mute
   if (isDefaultConn && perms['audio'] != false) {
     final option = 'disable-audio';
@@ -650,23 +731,7 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
             : null,
         child: Text(translate('Enable file copy and paste'))));
   }
-  // disable clipboard
-  if (isDefaultConn && ffiModel.keyboard && perms['clipboard'] != false) {
-    final enabled = !ffiModel.viewOnly;
-    final option = 'disable-clipboard';
-    var value =
-        bind.sessionGetToggleOptionSync(sessionId: sessionId, arg: option);
-    if (ffiModel.viewOnly) value = true;
-    v.add(TToggleMenu(
-        value: value,
-        onChanged: enabled
-            ? (value) {
-                if (value == null) return;
-                bind.sessionToggleOption(sessionId: sessionId, value: option);
-              }
-            : null,
-        child: Text(translate('Disable clipboard'))));
-  }
+  // Clipboard direction is exposed as a radio submenu in the desktop toolbar.
   // lock after session end
   if (isDefaultConn && ffiModel.keyboard && !ffiModel.isPeerAndroid) {
     final enabled = !ffiModel.viewOnly;
@@ -750,6 +815,118 @@ Future<List<TToggleMenu>> toolbarDisplayToggle(
         child: Text(translate('View Mode'))));
   }
   return v;
+}
+
+Future<List<TRadioMenu<String>>> toolbarQualityMonitorPosition(FFI ffi) async {
+  const disabled = 'disabled';
+  final sessionId = ffi.sessionId;
+  final showQualityMonitor = bind.sessionGetToggleOptionSync(
+      sessionId: sessionId, arg: 'show-quality-monitor');
+  final position = normalizeQualityMonitorPosition(await bind.sessionGetOption(
+          sessionId: sessionId, arg: kOptionQualityMonitorPosition) ??
+      '');
+  final groupValue = showQualityMonitor ? position : disabled;
+
+  Future<void> onChanged(String? value) async {
+    if (value == null || value == groupValue) return;
+    if (value == disabled) {
+      if (showQualityMonitor) {
+        await bind.sessionToggleOption(
+            sessionId: sessionId, value: 'show-quality-monitor');
+      }
+    } else {
+      await bind.sessionPeerOption(
+          sessionId: sessionId,
+          name: kOptionQualityMonitorPosition,
+          value: normalizeQualityMonitorPosition(value));
+      if (!showQualityMonitor) {
+        await bind.sessionToggleOption(
+            sessionId: sessionId, value: 'show-quality-monitor');
+      }
+    }
+    ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
+  }
+
+  TRadioMenu<String> item(String value, String label) {
+    return TRadioMenu<String>(
+      value: value,
+      groupValue: groupValue,
+      onChanged: onChanged,
+      child: Text(translate(label)),
+    );
+  }
+
+  return [
+    item(disabled, 'Disabled'),
+    item(kQualityMonitorPositionTopRight,
+        qualityMonitorPositionLabel(kQualityMonitorPositionTopRight)),
+    item(kQualityMonitorPositionTopLeft,
+        qualityMonitorPositionLabel(kQualityMonitorPositionTopLeft)),
+    item(kQualityMonitorPositionBottomRight,
+        qualityMonitorPositionLabel(kQualityMonitorPositionBottomRight)),
+    item(kQualityMonitorPositionBottomLeft,
+        qualityMonitorPositionLabel(kQualityMonitorPositionBottomLeft)),
+  ];
+}
+
+Future<TToggleMenu> toolbarQualityMonitorDebugMode(FFI ffi) async {
+  final sessionId = ffi.sessionId;
+  final debugMode = (await bind.sessionGetOption(
+          sessionId: sessionId, arg: kOptionQualityMonitorDebugMode)) ==
+      'Y';
+  return TToggleMenu(
+    value: debugMode,
+    onChanged: (value) async {
+      if (value == null) return;
+      await bind.sessionPeerOption(
+          sessionId: sessionId,
+          name: kOptionQualityMonitorDebugMode,
+          value: value ? 'Y' : 'N');
+      ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
+    },
+    child: Text(translate('Debug mode')),
+  );
+}
+
+Future<List<TRadioMenu<String>>> toolbarClipboardDirection(FFI ffi) async {
+  final ffiModel = ffi.ffiModel;
+  final perms = ffiModel.permissions;
+  final sessionId = ffi.sessionId;
+  final isDefaultConn = ffi.connType == ConnType.defaultConn;
+  if (!isDefaultConn || !ffiModel.keyboard || perms['clipboard'] == false) {
+    return [];
+  }
+
+  final disabled = ffiModel.viewOnly ||
+      bind.sessionGetToggleOptionSync(
+          sessionId: sessionId, arg: 'disable-clipboard');
+  final sessionPolicy = await bind.sessionGetOption(
+        sessionId: sessionId,
+        arg: kOptionClipboardDirection,
+      ) ??
+      '';
+  final currentPolicy = disabled
+      ? kClipboardDirectionOff
+      : normalizeClipboardDirectionPolicy(sessionPolicy.isEmpty
+          ? bind.mainGetLocalOption(key: kOptionClipboardDirection)
+          : sessionPolicy);
+  final enabled = !ffiModel.viewOnly;
+  return clipboardDirectionMenuKeys()
+      .map((key) => TRadioMenu<String>(
+            value: key,
+            groupValue: currentPolicy,
+            onChanged: enabled
+                ? (value) {
+                    if (value == null) return;
+                    bind.sessionToggleOption(
+                      sessionId: sessionId,
+                      value: sessionClipboardDirectionToggleValue(value),
+                    );
+                  }
+                : null,
+            child: Text(translate(clipboardDirectionPolicyLabel(key))),
+          ))
+      .toList();
 }
 
 var togglePrivacyModeTime = DateTime.now().subtract(const Duration(hours: 1));

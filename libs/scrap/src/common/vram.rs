@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     codec::{enable_vram_option, EncoderApi, EncoderCfg},
-    hwcodec::HwCodecConfig,
+    hwcodec::{HwCodecConfig, ERR_NO_PACKET},
     AdapterDevice, CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
 use hbb_common::{
@@ -200,10 +200,6 @@ impl EncoderApi for VRamEncoder {
     fn is_hardware(&self) -> bool {
         true
     }
-
-    fn disable(&self) {
-        HwCodecConfig::clear(true, true);
-    }
 }
 
 impl VRamEncoder {
@@ -279,7 +275,8 @@ impl VRamEncoder {
                 data.append(v);
                 Ok(data)
             }
-            Err(_) => Ok(Vec::<EncodeFrame>::new()),
+            Err(ERR_NO_PACKET) => Err(anyhow!("no valid frame")),
+            Err(err) => Err(anyhow!("vram encoder failed: {err}")),
         }
     }
 

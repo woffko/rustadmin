@@ -537,14 +537,11 @@ class _ViewCameraPageState extends State<ViewCameraPage>
       }))
     ];
 
-    paints.add(
-      Positioned(
-        top: 10,
-        right: 10,
-        child: _buildRawTouchAndPointerRegion(
-            QualityMonitor(_ffi.qualityMonitorModel), null, null, null),
-      ),
-    );
+    paints.add(PositionedQualityMonitor(
+      qualityMonitorModel: _ffi.qualityMonitorModel,
+      childBuilder: (child) =>
+          _buildRawTouchAndPointerRegion(child, null, null, null),
+    ));
     return Stack(
       children: paints,
     );
@@ -607,6 +604,7 @@ class _ImagePaintState extends State<ImagePaint> {
           paintSize,
           c.scrollHorizontal,
           c.scrollVertical,
+          showScrollbars: c.scrollStyle != ScrollStyle.scrolledgeaccel,
         )),
       );
     } else {
@@ -683,8 +681,7 @@ class _ImagePaintState extends State<ImagePaint> {
 
   MouseCursor _buildCustomCursor(BuildContext context, double scale) {
     final cursor = Provider.of<CursorModel>(context);
-    final cache = cursor.cache ?? preDefaultCursor.cache;
-    return buildCursorOfCache(cursor, scale, cache);
+    return buildCursorOfCache(cursor, scale, cursor.cache);
   }
 
   MouseCursor _buildDisabledCursor(BuildContext context, double scale) {
@@ -699,8 +696,9 @@ class _ImagePaintState extends State<ImagePaint> {
     Size layoutSize,
     Size size,
     ScrollController horizontal,
-    ScrollController vertical,
-  ) {
+    ScrollController vertical, {
+    required bool showScrollbars,
+  }) {
     var widget = child;
     if (layoutSize.width < size.width) {
       widget = ScrollConfiguration(
@@ -745,7 +743,7 @@ class _ImagePaintState extends State<ImagePaint> {
         ],
       );
     }
-    if (layoutSize.width < size.width) {
+    if (showScrollbars && layoutSize.width < size.width) {
       widget = RawScrollbar(
         thickness: kScrollbarThickness,
         thumbColor: Colors.grey,
@@ -758,7 +756,7 @@ class _ImagePaintState extends State<ImagePaint> {
         child: widget,
       );
     }
-    if (layoutSize.height < size.height) {
+    if (showScrollbars && layoutSize.height < size.height) {
       widget = RawScrollbar(
         thickness: kScrollbarThickness,
         thumbColor: Colors.grey,

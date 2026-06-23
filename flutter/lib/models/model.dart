@@ -56,6 +56,33 @@ typedef HandleMsgBox = Function(Map<String, dynamic> evt, String id);
 typedef ReconnectHandle = Function(OverlayDialogManager, SessionID, bool);
 final _constSessionId = Uuid().v4obj();
 
+const kRustAdminDefaultSessionPermissions = <String, bool>{
+  'keyboard': true,
+  'clipboard': false,
+  'audio': false,
+  'file': false,
+  'restart': false,
+  'recording': false,
+  'block_input': false,
+  'file_transfer': false,
+  'port_forward': false,
+  'view_camera': false,
+  'terminal': false,
+};
+
+const _kInitialSessionPermissionNames = <String>{
+  'keyboard',
+  'clipboard',
+  'audio',
+  'file',
+  'restart',
+  'recording',
+  'block_input',
+};
+
+Map<String, bool> rustAdminDefaultSessionPermissions() =>
+    Map<String, bool>.of(kRustAdminDefaultSessionPermissions);
+
 class CachedPeerData {
   Map<String, dynamic> updatePrivacyMode = {};
   Map<String, dynamic> peerInfo = {};
@@ -130,6 +157,10 @@ class FfiModel with ChangeNotifier {
   Timer? waitForImageTimer;
   RxBool waitForFirstImage = true.obs;
   bool isRefreshing = false;
+  bool _authenticatedHandoffPeerInfoReady = false;
+  bool _authenticatedHandoffNotified = false;
+  final _receivedInitialPermissions = <String>{};
+  Timer? _authenticatedHandoffFallbackTimer;
 
   Timer? timerScreenshot;
 
@@ -144,6 +175,7 @@ class FfiModel with ChangeNotifier {
   Map<String, bool> get permissions => _permissions;
   setPermissions(Map<String, bool> permissions) {
     _permissions.clear();
+    _permissions.addAll(kRustAdminDefaultSessionPermissions);
     _permissions.addAll(permissions);
   }
 
@@ -216,11 +248,18 @@ class FfiModel with ChangeNotifier {
   updatePermission(Map<String, dynamic> evt, String id) {
     // Track previous keyboard permission to detect revocation.
     final hadKeyboardPerm = _permissions['keyboard'] != false;
+    final updatedPermissions = <String>[];
 
     evt.forEach((k, v) {
       if (k == 'name' || k.isEmpty) return;
       _permissions[k] = v == 'true';
+      if (_kInitialSessionPermissionNames.contains(k)) {
+        updatedPermissions.add(k);
+      }
     });
+    if (updatedPermissions.isNotEmpty) {
+      _receivedInitialPermissions.addAll(updatedPermissions);
+    }
     // Only inited at remote page
     if (parent.target?.connType == ConnType.defaultConn) {
       KeyboardEnabledState.find(id).value = _permissions['keyboard'] != false;
@@ -239,6 +278,7 @@ class FfiModel with ChangeNotifier {
 
     debugPrint('updatePermission: $_permissions');
     notifyListeners();
+    _tryNotifyAuthenticatedHandoff(id);
   }
 
   bool get keyboard => _permissions['keyboard'] != false;
@@ -252,6 +292,11 @@ class FfiModel with ChangeNotifier {
     _timer = null;
     clearPermissions();
     waitForImageTimer?.cancel();
+    _authenticatedHandoffFallbackTimer?.cancel();
+    _authenticatedHandoffFallbackTimer = null;
+    _authenticatedHandoffPeerInfoReady = false;
+    _authenticatedHandoffNotified = false;
+    _receivedInitialPermissions.clear();
     timerScreenshot?.cancel();
   }
 
@@ -300,6 +345,7 @@ class FfiModel with ChangeNotifier {
   clearPermissions() {
     _inputBlocked = false;
     _permissions.clear();
+    _permissions.addAll(kRustAdminDefaultSessionPermissions);
   }
 
   handleCachedPeerData(CachedPeerData data, String peerId) async {
@@ -320,6 +366,56 @@ class FfiModel with ChangeNotifier {
       updateLastCursorId(data.lastCursorId);
       handleCursorId(data.lastCursorId);
     }
+  }
+
+  void _tryNotifyAuthenticatedHandoff(String peerId,
+      {bool allowPartialSnapshot = false}) {
+    final ffi = parent.target;
+    final onAuthenticated = ffi?.onAuthenticated;
+    if (ffi == null ||
+        onAuthenticated == null ||
+        _authenticatedHandoffNotified ||
+        !_authenticatedHandoffPeerInfoReady) {
+      return;
+    }
+    if (!allowPartialSnapshot &&
+        !_receivedInitialPermissions
+            .containsAll(_kInitialSessionPermissionNames)) {
+      return;
+    }
+    if (allowPartialSnapshot &&
+        !_receivedInitialPermissions
+            .containsAll(_kInitialSessionPermissionNames)) {
+      debugPrint(
+          'Opening authenticated remote window with partial permission snapshot: $_receivedInitialPermissions');
+    }
+    if (!_initialCursorReadyForAuthenticatedHandoff()) {
+      if (!allowPartialSnapshot) {
+        return;
+      }
+      debugPrint(
+          'Opening authenticated remote window before initial cursor data was received.');
+    }
+    _authenticatedHandoffNotified = true;
+    _authenticatedHandoffFallbackTimer?.cancel();
+    _authenticatedHandoffFallbackTimer = null;
+    ffi.onAuthenticated = null;
+    unawaited(onAuthenticated(ffi, peerId));
+  }
+
+  // Cursor data can arrive after peer_info and permissions. Wait for it during
+  // pre-auth handoff so the attached desktop window does not render fallback.
+  bool _initialCursorReadyForAuthenticatedHandoff() {
+    final ffi = parent.target;
+    if (ffi == null || ffi.connType != ConnType.defaultConn) {
+      return true;
+    }
+    if (_pi.cursorEmbedded || _pi.isWayland) {
+      return true;
+    }
+    return cachedPeerData.cursorDataList.isNotEmpty ||
+        ffi.cursorModel.image != null ||
+        ffi.cursorModel.cache != null;
   }
 
   // todo: why called by two position
@@ -346,7 +442,7 @@ class FfiModel with ChangeNotifier {
         handleSwitchDisplay(evt, sessionId, peerId);
       } else if (name == 'cursor_data') {
         updateLastCursorId(evt);
-        await handleCursorData(evt);
+        await handleCursorData(evt, peerId: peerId);
       } else if (name == 'cursor_id') {
         updateLastCursorId(evt);
         handleCursorId(evt);
@@ -390,6 +486,10 @@ class FfiModel with ChangeNotifier {
         parent.target?.serverModel.addConnection(evt);
       } else if (name == 'on_client_remove') {
         parent.target?.serverModel.onClientRemove(evt);
+      } else if (name == 'permission_update') {
+        parent.target?.serverModel.updateClientPermission(evt);
+      } else if (name == 'permission_request') {
+        parent.target?.serverModel.handlePermissionRequest(evt);
       } else if (name == 'update_quality_status') {
         parent.target?.qualityMonitorModel.updateQualityStatus(evt);
       } else if (name == 'update_block_input_state') {
@@ -644,7 +744,7 @@ class FfiModel with ChangeNotifier {
                                         : MyTheme.button.withOpacity(0.5))
                                     : Theme.of(context).cardColor,
                                 borderRadius: BorderRadius.all(
-                                  Radius.circular(5.0),
+                                  Radius.circular(4.0),
                                 ),
                               ),
                               key: ValueKey(printerNames[index]),
@@ -987,6 +1087,10 @@ class FfiModel with ChangeNotifier {
 
   void showPeerTrustDialog(
       SessionID sessionId, OverlayDialogManager dialogManager, String text) {
+    final dialogTag = '$sessionId-confirm-peer-trust';
+    if (dialogManager.hasDialog(dialogTag)) {
+      return;
+    }
     Map<String, dynamic> details = const {};
     try {
       final decoded = jsonDecode(text);
@@ -999,13 +1103,19 @@ class FfiModel with ChangeNotifier {
     final fingerprint = (details['fingerprint'] ?? '').toString();
     final trustPhrase = (details['trust_phrase'] ?? '').toString();
     final direct = details['direct'] == true;
+    final allowUnverifiedPeerTrust =
+        details['allow_unverified_peer_trust'] == true;
+    final mustEnableUnverifiedPeerTrust = !allowUnverifiedPeerTrust;
     final controller = TextEditingController();
+    var enableUnverifiedPeerTrust = !mustEnableUnverifiedPeerTrust;
+    var enablingUnverifiedPeerTrust = false;
+    var enableUnverifiedPeerTrustError = '';
     String normalizePhrase(String value) =>
         value.trim().toLowerCase().split(RegExp(r'\s+')).join(' ');
     final normalizedTrustPhrase = normalizePhrase(trustPhrase);
     final invalidTrustPayload = normalizedTrustPhrase.isEmpty;
     dialogManager.show(
-      tag: '$sessionId-confirm-peer-trust',
+      tag: dialogTag,
       (setState, close, context) {
         final phraseConfirmed = !invalidTrustPayload &&
             normalizePhrase(controller.text) == normalizedTrustPhrase;
@@ -1021,6 +1131,24 @@ class FfiModel with ChangeNotifier {
 
         void approve() {
           () async {
+            if (mustEnableUnverifiedPeerTrust &&
+                !mainGetBoolOptionSync(kOptionAllowUnverifiedPeerTrust)) {
+              setState(() {
+                enablingUnverifiedPeerTrust = true;
+                enableUnverifiedPeerTrustError = '';
+              });
+              await mainSetBoolOption(kOptionAllowUnverifiedPeerTrust, true);
+              final enabled =
+                  mainGetBoolOptionSync(kOptionAllowUnverifiedPeerTrust);
+              if (!enabled) {
+                setState(() {
+                  enablingUnverifiedPeerTrust = false;
+                  enableUnverifiedPeerTrustError =
+                      'Could not enable Allow unverified peer trust. Check administrator privileges or policy.';
+                });
+                return;
+              }
+            }
             await bind.sessionConfirmDirectTrust(
                 sessionId: sessionId, approved: true);
             close();
@@ -1031,18 +1159,29 @@ class FfiModel with ChangeNotifier {
           if (value.isEmpty) {
             return const SizedBox.shrink();
           }
+          final baseStyle = Theme.of(context).textTheme.bodyMedium ??
+              DefaultTextStyle.of(context).style;
+          final valueStyle = label == 'Endpoint'
+              ? baseStyle.copyWith(
+                  color: Colors.amber.shade700,
+                  decoration: TextDecoration.none,
+                )
+              : baseStyle.copyWith(decoration: TextDecoration.none);
           return Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: SelectionArea(
               child: RichText(
                 text: TextSpan(
-                  style: DefaultTextStyle.of(context).style,
+                  style: baseStyle.copyWith(decoration: TextDecoration.none),
                   children: [
                     TextSpan(
                       text: '$label: ',
-                      style: const TextStyle(fontWeight: FontWeight.w600),
+                      style: baseStyle.copyWith(
+                        fontWeight: FontWeight.w600,
+                        decoration: TextDecoration.none,
+                      ),
                     ),
-                    TextSpan(text: value),
+                    TextSpan(text: value, style: valueStyle),
                   ],
                 ),
               ),
@@ -1073,6 +1212,30 @@ class FfiModel with ChangeNotifier {
                   'The trust information from the remote side is missing or invalid. Reject this connection.',
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ).marginOnly(bottom: 12),
+              if (mustEnableUnverifiedPeerTrust)
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  visualDensity: VisualDensity.compact,
+                  controlAffinity: ListTileControlAffinity.leading,
+                  value: enableUnverifiedPeerTrust,
+                  onChanged: enablingUnverifiedPeerTrust
+                      ? null
+                      : (value) {
+                          setState(() {
+                            enableUnverifiedPeerTrust = value == true;
+                            enableUnverifiedPeerTrustError = '';
+                          });
+                        },
+                  title: Text(translate('Allow unverified peer trust')),
+                  subtitle: const Text(
+                    'This enables first-contact trust-on-use for this pairing path before the device key is saved.',
+                  ),
+                ),
+              if (enableUnverifiedPeerTrustError.isNotEmpty)
+                Text(
+                  enableUnverifiedPeerTrustError,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ).marginOnly(bottom: 12),
               TextField(
                 controller: controller,
                 autofocus: true,
@@ -1086,7 +1249,13 @@ class FfiModel with ChangeNotifier {
           ),
           actions: [
             dialogButton('Reject', onPressed: reject, isOutline: true),
-            dialogButton('Trust', onPressed: phraseConfirmed ? approve : null),
+            dialogButton(
+                mustEnableUnverifiedPeerTrust ? 'Enable & Trust' : 'Trust',
+                onPressed: phraseConfirmed &&
+                        enableUnverifiedPeerTrust &&
+                        !enablingUnverifiedPeerTrust
+                    ? approve
+                    : null),
           ],
           onCancel: reject,
         );
@@ -1096,6 +1265,10 @@ class FfiModel with ChangeNotifier {
 
   void showPairingPassphraseDialog(
       SessionID sessionId, OverlayDialogManager dialogManager, String text) {
+    final dialogTag = '$sessionId-input-pairing-passphrase';
+    if (dialogManager.hasDialog(dialogTag)) {
+      return;
+    }
     Map<String, dynamic> details = const {};
     try {
       final decoded = jsonDecode(text);
@@ -1108,8 +1281,9 @@ class FfiModel with ChangeNotifier {
     final direct = details['direct'] == true;
     final controller = TextEditingController();
     bool obscure = true;
+    bool submitting = false;
     dialogManager.show(
-      tag: '$sessionId-input-pairing-passphrase',
+      tag: dialogTag,
       (setState, close, context) {
         void cancel() {
           () async {
@@ -1124,6 +1298,10 @@ class FfiModel with ChangeNotifier {
         }
 
         void submit() {
+          if (submitting || controller.text.isEmpty) {
+            return;
+          }
+          submitting = true;
           () async {
             await bind.sessionSubmitDirectPairingPassphrase(
               sessionId: sessionId,
@@ -1138,18 +1316,29 @@ class FfiModel with ChangeNotifier {
           if (value.isEmpty) {
             return const SizedBox.shrink();
           }
+          final baseStyle = Theme.of(context).textTheme.bodyMedium ??
+              DefaultTextStyle.of(context).style;
+          final valueStyle = label == 'Endpoint'
+              ? baseStyle.copyWith(
+                  color: Colors.amber.shade700,
+                  decoration: TextDecoration.none,
+                )
+              : baseStyle.copyWith(decoration: TextDecoration.none);
           return Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: SelectionArea(
               child: RichText(
                 text: TextSpan(
-                  style: DefaultTextStyle.of(context).style,
+                  style: baseStyle.copyWith(decoration: TextDecoration.none),
                   children: [
                     TextSpan(
                       text: '$label: ',
-                      style: const TextStyle(fontWeight: FontWeight.w600),
+                      style: baseStyle.copyWith(
+                        fontWeight: FontWeight.w600,
+                        decoration: TextDecoration.none,
+                      ),
                     ),
-                    TextSpan(text: value),
+                    TextSpan(text: value, style: valueStyle),
                   ],
                 ),
               ),
@@ -1158,15 +1347,17 @@ class FfiModel with ChangeNotifier {
         }
 
         return CustomAlertDialog(
-          title: Text(translate('Pairing passphrase required')),
+          title: Text(translate(direct
+              ? 'Pairing passphrase required'
+              : 'Rendezvous pairing passphrase required')),
           content: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
                 direct
-                    ? 'Enter the local pairing passphrase to continue this direct connection.'
-                    : 'Enter the secure pairing passphrase to continue this connection.',
+                    ? 'Enter the local or rendezvous pairing passphrase to continue this direct connection.'
+                    : 'Enter the rendezvous pairing passphrase to continue this connection.',
               ).marginOnly(bottom: 12),
               buildLine(direct ? 'Endpoint' : 'Peer', peer),
               buildLine('Peer ID', peerId),
@@ -1178,7 +1369,9 @@ class FfiModel with ChangeNotifier {
                 maxLength: bind.mainMaxEncryptLen(),
                 onChanged: (_) => setState(() {}),
                 decoration: InputDecoration(
-                  labelText: 'Pairing passphrase',
+                  labelText: direct
+                      ? 'Pairing passphrase'
+                      : 'Rendezvous pairing passphrase',
                   suffixIcon: IconButton(
                     onPressed: () => setState(() {
                       obscure = !obscure;
@@ -1198,6 +1391,7 @@ class FfiModel with ChangeNotifier {
               onPressed: controller.text.isEmpty ? null : submit,
             ),
           ],
+          onSubmit: controller.text.isEmpty ? null : submit,
           onCancel: cancel,
         );
       },
@@ -1217,7 +1411,7 @@ class FfiModel with ChangeNotifier {
         void onReset() {
           () async {
             try {
-              final ok = await bind.sessionResetPeerTrust(sessionId: sessionId);
+              final ok = bind.sessionResetPeerTrust(sessionId: sessionId);
               if (!ok) {
                 showToast('Failed to reset peer trust');
                 return;
@@ -1722,7 +1916,21 @@ class FfiModel with ChangeNotifier {
     notifyListeners();
 
     if (!isCache) {
-      tryUseAllMyDisplaysForTheRemoteSession(peerId);
+      final onAuthenticated = parent.target?.onAuthenticated;
+      if (onAuthenticated != null) {
+        _authenticatedHandoffPeerInfoReady = true;
+        _authenticatedHandoffFallbackTimer?.cancel();
+        _authenticatedHandoffFallbackTimer =
+            Timer(const Duration(milliseconds: 500), () {
+          _tryNotifyAuthenticatedHandoff(
+            peerId,
+            allowPartialSnapshot: true,
+          );
+        });
+        _tryNotifyAuthenticatedHandoff(peerId);
+      } else {
+        tryUseAllMyDisplaysForTheRemoteSession(peerId);
+      }
     }
   }
 
@@ -1875,7 +2083,11 @@ class FfiModel with ChangeNotifier {
   updateLastCursorId(Map<String, dynamic> evt) {
     // int.parse(evt['id']) may cause FormatException
     // Unhandled Exception: FormatException: Positive input exceeds the limit of integer 18446744071749110741
-    parent.target?.cursorModel.id = evt['id'];
+    final id = evt['id']?.toString();
+    if (id == null || id.isEmpty) {
+      return;
+    }
+    parent.target?.cursorModel.id = id;
   }
 
   handleCursorId(Map<String, dynamic> evt) {
@@ -1883,9 +2095,12 @@ class FfiModel with ChangeNotifier {
     parent.target?.cursorModel.updateCursorId(evt);
   }
 
-  handleCursorData(Map<String, dynamic> evt) async {
+  handleCursorData(Map<String, dynamic> evt, {String? peerId}) async {
     cachedPeerData.cursorDataList.add(evt);
     await parent.target?.cursorModel.updateCursorData(evt);
+    if (peerId != null) {
+      _tryNotifyAuthenticatedHandoff(peerId);
+    }
   }
 
   /// Handle the peer info synchronization event based on [evt].
@@ -2520,6 +2735,7 @@ class CanvasModel with ChangeNotifier {
   double get devicePixelRatio => _devicePixelRatio;
   Size get size => _size;
   ScrollStyle get scrollStyle => _scrollStyle;
+  int get edgeScrollEdgeThickness => _edgeScrollEdgeThickness;
   ViewStyle get viewStyle => _lastViewStyle;
   RxBool get imageOverflow => _imageOverflow;
 
@@ -3181,7 +3397,7 @@ class CursorData {
     required this.width,
     required this.height,
   })  : hotx = hotxOrigin * scale,
-        hoty = hotxOrigin * scale;
+        hoty = hotyOrigin * scale;
 
   int _doubleToInt(double v) => (v * 10e6).round().toInt();
 
@@ -3190,7 +3406,7 @@ class CursorData {
     if (scale != 1.0) {
       // Update data if scale changed.
       final tgtWidth = (width * scale).toInt();
-      final tgtHeight = (width * scale).toInt();
+      final tgtHeight = (height * scale).toInt();
       if (tgtWidth < kMinCursorSize || tgtHeight < kMinCursorSize) {
         double sw = kMinCursorSize.toDouble() / width;
         double sh = kMinCursorSize.toDouble() / height;
@@ -3729,7 +3945,10 @@ class CursorModel with ChangeNotifier {
   }
 
   updateCursorData(Map<String, dynamic> evt) async {
-    final id = evt['id'];
+    final id = evt['id']?.toString();
+    if (id == null || id.isEmpty) {
+      return;
+    }
     final hotx = double.parse(evt['hotx']);
     final hoty = double.parse(evt['hoty']);
     final width = int.parse(evt['width']);
@@ -3804,11 +4023,23 @@ class CursorModel with ChangeNotifier {
       }
       return true;
     } else {
+      if (_image != null || _cache != null) {
+        _image = null;
+        _cache = null;
+        _hotx = 0;
+        _hoty = 0;
+        notifyListeners();
+      }
       return false;
     }
   }
 
   updateCursorId(Map<String, dynamic> evt) {
+    final id = evt['id']?.toString();
+    if (id == null || id.isEmpty) {
+      return;
+    }
+    _id = id;
     if (!_updateCurData()) {
       debugPrint(
           'WARNING: updateCursorId $_id, cache is ${_cache == null ? "null" : "not null"}. without notifyListeners()');
@@ -3855,7 +4086,7 @@ class CursorModel with ChangeNotifier {
 
   clear() {
     _x = -10000;
-    _x = -10000;
+    _y = -10000;
     _image = null;
     _firstUpdateMouseTime = null;
     gotMouseControl = true;
@@ -3872,6 +4103,7 @@ class CursorModel with ChangeNotifier {
       debugPrint("deleting cursor with key $k");
       deleteCustomCursor(k);
     }
+    _cacheKeys.clear();
     resetSystemCursor();
   }
 
@@ -3895,6 +4127,33 @@ class QualityMonitorData {
   String? targetBitrate;
   String? codecFormat;
   String? chroma;
+  String? codecPath;
+  String? renderPath;
+  String? frameResolution;
+  String? queueLen;
+  String? decodeFps;
+  String? autoFps;
+  String? fpsMode;
+  String? direct;
+  String? mediacodecInputQueueMs;
+  String? mediacodecOutputDequeueMs;
+  String? yuvToRgbaMs;
+  String? mediacodecDecodeMs;
+  String? handleFrameMs;
+  String? flutterHandoffMs;
+  String? endToEndMs;
+  String? rgbaBytes;
+  String? rgbaReallocated;
+  String? outputBufferBytes;
+  String? mediaFormat;
+  String? hostVideoFps;
+  String? hostVideoCodec;
+  String? hostVideoQos;
+  String? hostVideoWait;
+  String? hostVideoBackend;
+  String? hostVideoFallback;
+  String? hostVersion;
+  String? clientVersion;
 }
 
 class QualityMonitorModel with ChangeNotifier {
@@ -3902,22 +4161,86 @@ class QualityMonitorModel with ChangeNotifier {
 
   QualityMonitorModel(this.parent);
   var _show = false;
+  var _position = kQualityMonitorPositionTopRight;
+  var _debugMode = false;
   final _data = QualityMonitorData();
+  DateTime? _lastPipelineUpdate;
 
   bool get show => _show;
+  String get position => _position;
+  bool get debugMode => _debugMode;
   QualityMonitorData get data => _data;
+
+  Future<bool> _refreshVersionInfo() async {
+    var changed = false;
+    final hostVersion = parent.target?.ffiModel.pi.fullVersion;
+    if (hostVersion != null &&
+        hostVersion.isNotEmpty &&
+        _data.hostVersion != hostVersion) {
+      _data.hostVersion = hostVersion;
+      changed = true;
+    }
+
+    var clientVersion = '';
+    try {
+      clientVersion = await bind.mainGetVersion();
+    } catch (_) {
+      //
+    }
+    if (clientVersion.isEmpty) {
+      clientVersion = version;
+    }
+    if (clientVersion.isNotEmpty && _data.clientVersion != clientVersion) {
+      _data.clientVersion = clientVersion;
+      changed = true;
+    }
+    return changed;
+  }
 
   checkShowQualityMonitor(SessionID sessionId) async {
     final show = await bind.sessionGetToggleOption(
             sessionId: sessionId, arg: 'show-quality-monitor') ==
         true;
-    if (_show != show) {
+    final position = normalizeQualityMonitorPosition(
+        await bind.sessionGetOption(
+                sessionId: sessionId, arg: kOptionQualityMonitorPosition) ??
+            '');
+    final debugMode = (await bind.sessionGetOption(
+            sessionId: sessionId, arg: kOptionQualityMonitorDebugMode)) ==
+        'Y';
+    var changed = false;
+    if (_show != show || _position != position || _debugMode != debugMode) {
       _show = show;
+      _position = position;
+      _debugMode = debugMode;
+      changed = true;
+    }
+    if (show) {
+      changed = await _refreshVersionInfo() || changed;
+    }
+    if (changed) {
       notifyListeners();
     }
   }
 
+  setDebugMode(bool value) async {
+    final sessionId = parent.target?.sessionId;
+    if (sessionId == null) return;
+    _debugMode = value;
+    notifyListeners();
+    await bind.sessionPeerOption(
+        sessionId: sessionId,
+        name: kOptionQualityMonitorDebugMode,
+        value: value ? 'Y' : 'N');
+  }
+
   updateQualityStatus(Map<String, dynamic> evt) {
+    String? nonEmptyString(String key) {
+      final value = evt[key];
+      if (value is! String || value.isEmpty) return null;
+      return value;
+    }
+
     try {
       if (evt.containsKey('speed') && (evt['speed'] as String).isNotEmpty) {
         _data.speed = evt['speed'];
@@ -3956,6 +4279,64 @@ class QualityMonitorModel with ChangeNotifier {
       }
       if (evt.containsKey('chroma') && (evt['chroma'] as String).isNotEmpty) {
         _data.chroma = evt['chroma'];
+      }
+      final hostVersion = parent.target?.ffiModel.pi.fullVersion;
+      if (hostVersion != null && hostVersion.isNotEmpty) {
+        _data.hostVersion = hostVersion;
+      }
+      _data.hostVideoFps =
+          nonEmptyString('host_video_fps') ?? _data.hostVideoFps;
+      _data.hostVideoCodec =
+          nonEmptyString('host_video_codec') ?? _data.hostVideoCodec;
+      _data.hostVideoQos =
+          nonEmptyString('host_video_qos') ?? _data.hostVideoQos;
+      _data.hostVideoWait =
+          nonEmptyString('host_video_wait') ?? _data.hostVideoWait;
+      _data.hostVideoBackend =
+          nonEmptyString('host_video_backend') ?? _data.hostVideoBackend;
+      _data.hostVideoFallback =
+          nonEmptyString('host_video_fallback') ?? _data.hostVideoFallback;
+
+      final hasPipelineUpdate =
+          evt.containsKey('codec_path') || evt.containsKey('decode_fps');
+      final now = DateTime.now();
+      final shouldUpdatePipeline = !hasPipelineUpdate ||
+          _lastPipelineUpdate == null ||
+          now.difference(_lastPipelineUpdate!).inMilliseconds >= 1000;
+      if (shouldUpdatePipeline) {
+        if (hasPipelineUpdate) {
+          _lastPipelineUpdate = now;
+        }
+        _data.codecPath = nonEmptyString('codec_path') ?? _data.codecPath;
+        _data.renderPath = nonEmptyString('render_path') ?? _data.renderPath;
+        _data.frameResolution =
+            nonEmptyString('frame_resolution') ?? _data.frameResolution;
+        _data.queueLen = nonEmptyString('queue_len') ?? _data.queueLen;
+        _data.decodeFps = nonEmptyString('decode_fps') ?? _data.decodeFps;
+        _data.autoFps = nonEmptyString('auto_fps') ?? _data.autoFps;
+        _data.fpsMode = nonEmptyString('fps_mode') ?? _data.fpsMode;
+        _data.direct = nonEmptyString('direct') ?? _data.direct;
+        _data.mediacodecInputQueueMs =
+            nonEmptyString('mediacodec_input_queue_ms') ??
+                _data.mediacodecInputQueueMs;
+        _data.mediacodecOutputDequeueMs =
+            nonEmptyString('mediacodec_output_dequeue_ms') ??
+                _data.mediacodecOutputDequeueMs;
+        _data.yuvToRgbaMs =
+            nonEmptyString('yuv_to_rgba_ms') ?? _data.yuvToRgbaMs;
+        _data.mediacodecDecodeMs =
+            nonEmptyString('mediacodec_decode_ms') ?? _data.mediacodecDecodeMs;
+        _data.handleFrameMs =
+            nonEmptyString('handle_frame_ms') ?? _data.handleFrameMs;
+        _data.flutterHandoffMs =
+            nonEmptyString('flutter_handoff_ms') ?? _data.flutterHandoffMs;
+        _data.endToEndMs = nonEmptyString('end_to_end_ms') ?? _data.endToEndMs;
+        _data.rgbaBytes = nonEmptyString('rgba_bytes') ?? _data.rgbaBytes;
+        _data.rgbaReallocated =
+            nonEmptyString('rgba_reallocated') ?? _data.rgbaReallocated;
+        _data.outputBufferBytes =
+            nonEmptyString('output_buffer_bytes') ?? _data.outputBufferBytes;
+        _data.mediaFormat = nonEmptyString('media_format') ?? _data.mediaFormat;
       }
       notifyListeners();
     } catch (e) {
@@ -4019,6 +4400,7 @@ class FFI {
   var version = '';
   var connType = ConnType.defaultConn;
   var closed = false;
+  Future<void> Function(FFI ffi, String peerId)? onAuthenticated;
 
   /// dialogManager use late to ensure init after main page binding [globalKey]
   late final dialogManager = OverlayDialogManager();
@@ -4047,6 +4429,7 @@ class FFI {
 
   // Terminal model registry for multiple terminals
   final Map<int, TerminalModel> _terminalModels = {};
+  int _sessionEventGeneration = 0;
 
   // Getter for terminal models
   Map<int, TerminalModel> get terminalModels => _terminalModels;
@@ -4107,6 +4490,8 @@ class FFI {
     int? tabWindowId,
     int? display,
     List<int>? displays,
+    bool attachExisting = false,
+    String? cachedPeerData,
   }) {
     closed = false;
     if (isMobile) mobileReset();
@@ -4137,7 +4522,7 @@ class FFI {
     final isNewPeer = tabWindowId == null;
     // If tabWindowId != null, this session is a "tab -> window" one.
     // Else this session is a new one.
-    if (isNewPeer) {
+    if (isNewPeer && !attachExisting) {
       // ignore: unused_local_variable
       final addRes = bind.sessionAddSync(
         sessionId: sessionId,
@@ -4207,17 +4592,37 @@ class FFI {
     }
 
     final cb = ffiModel.startEventListener(sessionId, id);
+    Future<void> handleCachedSessionData(
+      String cachedData, {
+      bool runAuthenticatedSetup = false,
+    }) async {
+      final data = CachedPeerData.fromString(cachedData);
+      if (data == null) {
+        debugPrint('Unreachable, the cached data cannot be decoded.');
+        return;
+      }
+      ffiModel.setPermissions(data.permissions);
+      await ffiModel.handleCachedPeerData(data, id);
+      await sessionRefreshVideo(sessionId, ffiModel.pi);
+      await bind.sessionRequestNewDisplayInitMsgs(
+          sessionId: sessionId, display: ffiModel.pi.currentDisplay);
+      if (runAuthenticatedSetup && connType == ConnType.defaultConn) {
+        unawaited(ffiModel.tryUseAllMyDisplaysForTheRemoteSession(id));
+      }
+    }
 
     imageModel.updateUserTextureRender();
     final hasGpuTextureRender = bind.mainHasGpuTextureRender();
     final SimpleWrapper<bool> isToNewWindowNotified = SimpleWrapper(false);
+    final sessionEventGeneration = ++_sessionEventGeneration;
     // Preserved for the rgba data.
     stream.listen((message) {
-      if (closed) return;
+      if (closed || sessionEventGeneration != _sessionEventGeneration) return;
       if (tabWindowId != null && !isToNewWindowNotified.value) {
         // Session is read to be moved to a new window.
         // Get the cached data and handle the cached data.
         Future.delayed(Duration.zero, () async {
+          if (sessionEventGeneration != _sessionEventGeneration) return;
           final args = jsonEncode({'id': id, 'close': display == null});
           final cachedData = await DesktopMultiWindow.invokeMethod(
               tabWindowId, kWindowEventGetCachedSessionData, args);
@@ -4226,16 +4631,7 @@ class FFI {
             debugPrint('Unreachable, the cached data is empty.');
             return;
           }
-          final data = CachedPeerData.fromString(cachedData);
-          if (data == null) {
-            debugPrint('Unreachable, the cached data cannot be decoded.');
-            return;
-          }
-          ffiModel.setPermissions(data.permissions);
-          await ffiModel.handleCachedPeerData(data, id);
-          await sessionRefreshVideo(sessionId, ffiModel.pi);
-          await bind.sessionRequestNewDisplayInitMsgs(
-              sessionId: sessionId, display: ffiModel.pi.currentDisplay);
+          await handleCachedSessionData(cachedData);
         });
         isToNewWindowNotified.value = true;
       }
@@ -4287,6 +4683,14 @@ class FFI {
     });
     // every instance will bind a stream
     this.id = id;
+    if (cachedPeerData != null) {
+      Future.delayed(Duration.zero, () async {
+        await handleCachedSessionData(
+          cachedPeerData,
+          runAuthenticatedSetup: attachExisting && tabWindowId == null,
+        );
+      });
+    }
   }
 
   void onEvent2UIRgba() async {
@@ -4324,7 +4728,8 @@ class FFI {
   }
 
   /// Close the remote session.
-  Future<void> close({bool closeSession = true}) async {
+  Future<void> close(
+      {bool closeSession = true, bool saveCanvasConfig = true}) async {
     closed = true;
     chatModel.close();
     // Close all terminal models
@@ -4332,7 +4737,7 @@ class FFI {
       model.dispose();
     }
     _terminalModels.clear();
-    if (imageModel.image != null && !isWebDesktop) {
+    if (saveCanvasConfig && imageModel.image != null && !isWebDesktop) {
       await setCanvasConfig(
           sessionId,
           cursorModel.x,
@@ -4488,6 +4893,10 @@ class PeerInfo with ChangeNotifier {
       platformAdditions[kPlatformAdditionsIddImpl] == 'rustdesk_idd';
   bool get isAmyuniIdd =>
       platformAdditions[kPlatformAdditionsIddImpl] == 'amyuni_idd';
+  String get fullVersion =>
+      platformAdditions[kPlatformAdditionsFullVersion] as String? ?? version;
+  bool get supportCaptureBackend =>
+      platformAdditions[kPlatformAdditionsSupportCaptureBackend] == true;
 
   Display? tryGetDisplay({int? display}) {
     if (displays.isEmpty) {

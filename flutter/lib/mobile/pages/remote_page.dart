@@ -126,6 +126,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   Future<void> dispose() async {
     WidgetsBinding.instance.removeObserver(this);
+    unawaited(bind.sessionClose(sessionId: gFFI.sessionId));
     // https://github.com/flutter/flutter/issues/64935
     super.dispose();
     gFFI.dialogManager.hideMobileActionsOverlay(store: false);
@@ -177,6 +178,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       );
 
   void onSoftKeyboardChanged(bool visible) {
+    if (gFFI.dialogManager.hasOpenDialogs) {
+      _timer?.cancel();
+      _iosKeyboardWorkaroundTimer?.cancel();
+      _iosKeyboardWorkaroundTimer = null;
+      return;
+    }
+
     if (!visible) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
       // [pi.version.isNotEmpty] -> check ready or not, avoid login without soft-keyboard
@@ -570,11 +578,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         child: Stack(children: () {
           final paints = [
             ImagePaint(ffiModel: gFFI.ffiModel),
-            Positioned(
-              top: 10,
-              right: 10,
-              child: QualityMonitor(gFFI.qualityMonitorModel),
-            ),
+            PositionedQualityMonitor(
+                qualityMonitorModel: gFFI.qualityMonitorModel),
             KeyHelpTools(
                 keyboardIsVisible: keyboardIsVisible,
                 showGestureHelp: _showGestureHelp),
@@ -857,7 +862,7 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           //limits the touch area to the button area
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(5.0),
+            borderRadius: BorderRadius.circular(4.0),
           ),
           backgroundColor: active == true ? MyTheme.accent80 : null,
         ),
@@ -1152,7 +1157,7 @@ void showOptions(
               height: 40,
               decoration: BoxDecoration(
                   border: Border.all(color: Theme.of(context).hintColor),
-                  borderRadius: BorderRadius.circular(2),
+                  borderRadius: BorderRadius.circular(2.0),
                   color: i == cur ? numBgSelected : null),
               child: Center(
                   child: Text((i + 1).toString(),
@@ -1178,6 +1183,13 @@ void showOptions(
   List<TRadioMenu<String>> imageQualityRadios =
       await toolbarImageQuality(context, id, gFFI);
   List<TRadioMenu<String>> codecRadios = await toolbarCodec(context, id, gFFI);
+  List<TRadioMenu<String>> captureBackendRadios =
+      await toolbarCaptureBackend(gFFI);
+  List<TRadioMenu<String>> qualityMonitorRadios =
+      await toolbarQualityMonitorPosition(gFFI);
+  final qualityMonitorDebugToggle = await toolbarQualityMonitorDebugMode(gFFI);
+  List<TRadioMenu<String>> clipboardRadios =
+      await toolbarClipboardDirection(gFFI);
   List<TToggleMenu> cursorToggles = await toolbarCursor(context, id, gFFI);
   List<TToggleMenu> displayToggles =
       await toolbarDisplayToggle(context, id, gFFI);
@@ -1199,6 +1211,17 @@ void showOptions(
         (imageQualityRadios.isNotEmpty ? imageQualityRadios[0].groupValue : '')
             .obs;
     var codec = (codecRadios.isNotEmpty ? codecRadios[0].groupValue : '').obs;
+    var captureBackend = (captureBackendRadios.isNotEmpty
+            ? captureBackendRadios[0].groupValue
+            : '')
+        .obs;
+    var qualityMonitor = (qualityMonitorRadios.isNotEmpty
+            ? qualityMonitorRadios[0].groupValue
+            : '')
+        .obs;
+    var qualityMonitorDebug = qualityMonitorDebugToggle.value.obs;
+    var clipboard =
+        (clipboardRadios.isNotEmpty ? clipboardRadios[0].groupValue : '').obs;
     final radios = [
       for (var e in viewStyleRadios)
         Obx(() => getRadio<String>(
@@ -1240,6 +1263,87 @@ void showOptions(
                   }
                 : null)),
       if (codecRadios.isNotEmpty) const Divider(color: MyTheme.border),
+      if (captureBackendRadios.isNotEmpty)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2),
+            child: Text(translate('Capture'),
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ),
+      for (var e in captureBackendRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            captureBackend.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) captureBackend.value = v;
+                  }
+                : null)),
+      if (captureBackendRadios.isNotEmpty) const Divider(color: MyTheme.border),
+      if (qualityMonitorRadios.isNotEmpty)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2),
+            child: Text(translate('Quality monitor'),
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ),
+      for (var e in qualityMonitorRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            qualityMonitor.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) qualityMonitor.value = v;
+                  }
+                : null)),
+      if (qualityMonitorRadios.isNotEmpty)
+        Obx(() => CheckboxListTile(
+            contentPadding: EdgeInsets.zero,
+            visualDensity: VisualDensity.compact,
+            side: BorderSide(
+                color:
+                    Theme.of(context).colorScheme.onSurface.withOpacity(0.72),
+                width: 1.5),
+            activeColor: Theme.of(context).colorScheme.primary,
+            checkColor: Theme.of(context).colorScheme.onPrimary,
+            value: qualityMonitorDebug.value,
+            onChanged: qualityMonitorDebugToggle.onChanged != null
+                ? (v) {
+                    qualityMonitorDebugToggle.onChanged?.call(v);
+                    if (v != null) qualityMonitorDebug.value = v;
+                  }
+                : null,
+            title: qualityMonitorDebugToggle.child)),
+      if (qualityMonitorRadios.isNotEmpty) const Divider(color: MyTheme.border),
+      if (clipboardRadios.isNotEmpty)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2),
+            child: Text(translate('Clipboard direction'),
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ),
+      for (var e in clipboardRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            clipboard.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) clipboard.value = v;
+                  }
+                : null)),
+      if (clipboardRadios.isNotEmpty) const Divider(color: MyTheme.border),
     ];
     final rxCursorToggleValues = cursorToggles.map((e) => e.value.obs).toList();
     final cursorTogglesList = cursorToggles

@@ -366,11 +366,8 @@ class _ViewCameraPageState extends State<ViewCameraPage>
         child: Stack(children: () {
           final paints = [
             ImagePaint(),
-            Positioned(
-              top: 10,
-              right: 10,
-              child: QualityMonitor(gFFI.qualityMonitorModel),
-            ),
+            PositionedQualityMonitor(
+                qualityMonitorModel: gFFI.qualityMonitorModel),
             SizedBox(
               width: 0,
               height: 0,
@@ -605,7 +602,7 @@ void showOptions(
               height: 40,
               decoration: BoxDecoration(
                   border: Border.all(color: Theme.of(context).hintColor),
-                  borderRadius: BorderRadius.circular(2),
+                  borderRadius: BorderRadius.circular(2.0),
                   color: i == cur ? numBgSelected : null),
               child: Center(
                   child: Text((i + 1).toString(),
@@ -631,6 +628,12 @@ void showOptions(
   List<TRadioMenu<String>> imageQualityRadios =
       await toolbarImageQuality(context, id, gFFI);
   List<TRadioMenu<String>> codecRadios = await toolbarCodec(context, id, gFFI);
+  List<TRadioMenu<String>> captureBackendRadios =
+      await toolbarCaptureBackend(gFFI);
+  List<TRadioMenu<String>> qualityMonitorRadios =
+      await toolbarQualityMonitorPosition(gFFI);
+  List<TRadioMenu<String>> clipboardRadios =
+      await toolbarClipboardDirection(gFFI);
   List<TToggleMenu> displayToggles =
       await toolbarDisplayToggle(context, id, gFFI);
 
@@ -641,6 +644,16 @@ void showOptions(
         (imageQualityRadios.isNotEmpty ? imageQualityRadios[0].groupValue : '')
             .obs;
     var codec = (codecRadios.isNotEmpty ? codecRadios[0].groupValue : '').obs;
+    var captureBackend = (captureBackendRadios.isNotEmpty
+            ? captureBackendRadios[0].groupValue
+            : '')
+        .obs;
+    var qualityMonitor = (qualityMonitorRadios.isNotEmpty
+            ? qualityMonitorRadios[0].groupValue
+            : '')
+        .obs;
+    var clipboard =
+        (clipboardRadios.isNotEmpty ? clipboardRadios[0].groupValue : '').obs;
     final radios = [
       for (var e in viewStyleRadios)
         Obx(() => getRadio<String>(
@@ -678,6 +691,70 @@ void showOptions(
                   }
                 : null)),
       if (codecRadios.isNotEmpty) const Divider(color: MyTheme.border),
+      if (captureBackendRadios.isNotEmpty)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2),
+            child: Text(translate('Capture'),
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ),
+      for (var e in captureBackendRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            captureBackend.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) captureBackend.value = v;
+                  }
+                : null)),
+      if (captureBackendRadios.isNotEmpty)
+        const Divider(color: MyTheme.border),
+      if (qualityMonitorRadios.isNotEmpty)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2),
+            child: Text(translate('Quality monitor'),
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ),
+      for (var e in qualityMonitorRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            qualityMonitor.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) qualityMonitor.value = v;
+                  }
+                : null)),
+      if (qualityMonitorRadios.isNotEmpty) const Divider(color: MyTheme.border),
+      if (clipboardRadios.isNotEmpty)
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2),
+            child: Text(translate('Clipboard direction'),
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ),
+      for (var e in clipboardRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            clipboard.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) clipboard.value = v;
+                  }
+                : null)),
+      if (clipboardRadios.isNotEmpty) const Divider(color: MyTheme.border),
     ];
 
     final rxToggleValues = displayToggles.map((e) => e.value.obs).toList();

@@ -71,6 +71,7 @@ lazy_static::lazy_static! {
     static ref ASYNC_HTTP_STATUS : Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     static ref TEMPORARY_PASSWD : Arc<Mutex<String>> = Arc::new(Mutex::new("".to_owned()));
     static ref IS_REMOTE_MODIFY_ENABLED_BY_CONTROL_PERMISSIONS : Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    static ref SHOULD_BLOCK_RUSTADMIN_GUI_FOR_ACTIVE_SESSIONS : Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -301,7 +302,25 @@ pub fn forget_password(id: String) {
 #[inline]
 pub fn get_peer_option(id: String, name: String) -> String {
     let c = PeerConfig::load(&id);
-    c.options.get(&name).unwrap_or(&"".to_owned()).to_owned()
+    match name.as_str() {
+        OPTION_IMAGE_QUALITY => c.image_quality,
+        OPTION_CUSTOM_IMAGE_QUALITY => c
+            .custom_image_quality
+            .first()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        OPTION_SHOW_QUALITY_MONITOR => bool_peer_option(c.show_quality_monitor.v),
+        OPTION_DISABLE_AUDIO => bool_peer_option(c.disable_audio.v),
+        OPTION_ENABLE_FILE_COPY_PASTE => bool_peer_option(c.enable_file_copy_paste.v),
+        OPTION_DISABLE_CLIPBOARD => bool_peer_option(c.disable_clipboard.v),
+        OPTION_LOCK_AFTER_SESSION_END => bool_peer_option(c.lock_after_session_end.v),
+        OPTION_TERMINAL_PERSISTENT => bool_peer_option(c.terminal_persistent.v),
+        OPTION_PRIVACY_MODE => bool_peer_option(c.privacy_mode.v),
+        "allow_swap_key" => bool_peer_option(c.allow_swap_key.v),
+        OPTION_VIEW_ONLY => bool_peer_option(c.view_only.v),
+        "keyboard_mode" => c.keyboard_mode,
+        _ => c.options.get(&name).cloned().unwrap_or_default(),
+    }
 }
 
 #[inline]
@@ -326,12 +345,70 @@ pub fn set_peer_flutter_option(id: String, name: String, value: String) {
 #[inline]
 pub fn set_peer_option(id: String, name: String, value: String) {
     let mut c = PeerConfig::load(&id);
-    if value.is_empty() {
-        c.options.remove(&name);
-    } else {
-        c.options.insert(name, value);
+    match name.as_str() {
+        OPTION_IMAGE_QUALITY => {
+            if value.is_empty() {
+                c.image_quality.clear();
+            } else if matches!(value.as_str(), "best" | "balanced" | "low" | "custom") {
+                c.image_quality = value;
+            }
+        }
+        OPTION_CUSTOM_IMAGE_QUALITY => {
+            if let Ok(v) = value.parse::<i32>() {
+                if (10..=0xFFF).contains(&v) {
+                    c.custom_image_quality = vec![v];
+                }
+            }
+        }
+        OPTION_SHOW_QUALITY_MONITOR => {
+            c.show_quality_monitor.v = config::option2bool(&name, &value);
+        }
+        OPTION_DISABLE_AUDIO => {
+            c.disable_audio.v = config::option2bool(&name, &value);
+        }
+        OPTION_ENABLE_FILE_COPY_PASTE => {
+            c.enable_file_copy_paste.v = config::option2bool(&name, &value);
+        }
+        OPTION_DISABLE_CLIPBOARD => {
+            c.disable_clipboard.v = config::option2bool(&name, &value);
+        }
+        OPTION_LOCK_AFTER_SESSION_END => {
+            c.lock_after_session_end.v = config::option2bool(&name, &value);
+        }
+        OPTION_TERMINAL_PERSISTENT => {
+            c.terminal_persistent.v = config::option2bool(&name, &value);
+        }
+        OPTION_PRIVACY_MODE => {
+            c.privacy_mode.v = config::option2bool(&name, &value);
+        }
+        "allow_swap_key" => {
+            c.allow_swap_key.v = config::option2bool(&name, &value);
+        }
+        OPTION_VIEW_ONLY => {
+            c.view_only.v = config::option2bool(&name, &value);
+        }
+        "keyboard_mode" => {
+            if value.is_empty() || matches!(value.as_str(), "legacy" | "map" | "translate") {
+                c.keyboard_mode = value;
+            }
+        }
+        _ => {
+            if value.is_empty() {
+                c.options.remove(&name);
+            } else {
+                c.options.insert(name, value);
+            }
+        }
     }
     c.store(&id);
+}
+
+fn bool_peer_option(value: bool) -> String {
+    if value {
+        "Y".to_owned()
+    } else {
+        "N".to_owned()
+    }
 }
 
 #[inline]
@@ -761,7 +838,7 @@ pub fn get_new_version() -> String {
 
 #[inline]
 pub fn get_version() -> String {
-    crate::VERSION.to_owned()
+    crate::FULL_VERSION.to_owned()
 }
 
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
@@ -1294,6 +1371,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
 
     loop {
         if let Ok(mut c) = ipc::connect(1000, "").await {
+            c.send(&ipc::Data::SystemInfo(None)).await.ok();
             let mut timer = crate::rustdesk_interval(time::interval(time::Duration::from_secs(1)));
             loop {
                 tokio::select! {
@@ -1325,6 +1403,9 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                                     *TEMPORARY_PASSWD.lock().unwrap() = value;
                                 }
                             }
+                            Ok(Some(ipc::Data::SystemInfo(Some(info)))) => {
+                                log::info!("server system info: {}", info);
+                            }
                             #[cfg(feature = "flutter")]
                             Ok(Some(ipc::Data::VideoConnCount(Some(n)))) => {
                                 video_conn_count = n;
@@ -1352,6 +1433,9 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                             Ok(Some(ipc::Data::ControlPermissionsRemoteModify(v))) => {
                                 *IS_REMOTE_MODIFY_ENABLED_BY_CONTROL_PERMISSIONS.lock().unwrap() = v;
                             }
+                            Ok(Some(ipc::Data::ShouldBlockRustAdminGuiForActiveSessions(v))) => {
+                                *SHOULD_BLOCK_RUSTADMIN_GUI_FOR_ACTIVE_SESSIONS.lock().unwrap() = v;
+                            }
                             #[cfg(target_os = "windows")]
                             Ok(Some(ipc::Data::FileTransferEnabledState(v))) => {
                                 if let Some(enabled) = v {
@@ -1375,6 +1459,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                         c.send(&ipc::Data::Config(("temporary-password".to_owned(), None))).await.ok();
                         #[cfg(feature = "flutter")]
                         c.send(&ipc::Data::VideoConnCount(None)).await.ok();
+                        c.send(&ipc::Data::ShouldBlockRustAdminGuiForActiveSessions(None)).await.ok();
                         c.send(&ipc::Data::ControlPermissionsRemoteModify(None)).await.ok();
                         #[cfg(target_os = "windows")]
                         c.send(&ipc::Data::FileTransferEnabledState(None)).await.ok();
@@ -1467,6 +1552,10 @@ pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
     let rendezvous_servers = crate::ipc::get_rendezvous_servers(1_000).await;
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let rendezvous_servers = Config::get_rendezvous_servers();
+
+    if rendezvous_servers.is_empty() {
+        return "No rendezvous server configured";
+    }
 
     let mut futs = Vec::new();
     let err: Arc<Mutex<&str>> = Default::default();
@@ -1616,17 +1705,12 @@ pub fn check_hwcodec() {
     #[cfg(feature = "hwcodec")]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        use std::sync::Once;
-        static ONCE: Once = Once::new();
-
-        ONCE.call_once(|| {
-            if crate::platform::is_installed() {
-                ipc::notify_server_to_check_hwcodec().ok();
-                ipc::client_get_hwcodec_config_thread(3);
-            } else {
-                scrap::hwcodec::start_check_process();
-            }
-        })
+        if crate::platform::is_installed() {
+            ipc::notify_server_to_check_hwcodec().ok();
+            ipc::client_recheck_hwcodec_config_thread(3);
+        } else {
+            scrap::hwcodec::recheck_hwcodec();
+        }
     }
 }
 
@@ -1675,12 +1759,43 @@ pub fn clear_trusted_devices() {
 }
 
 #[cfg(feature = "flutter")]
+pub fn get_paired_viewers() -> String {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    return Config::get_paired_viewers_json();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    return ipc::get_paired_viewers();
+}
+
+#[cfg(feature = "flutter")]
+pub fn remove_paired_viewers(json: &str) {
+    let sign_pks = serde_json::from_str::<Vec<Bytes>>(json).unwrap_or_default();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    Config::remove_paired_viewers(&sign_pks);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    ipc::remove_paired_viewers(sign_pks);
+}
+
+#[cfg(feature = "flutter")]
+pub fn clear_paired_viewers() {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    Config::clear_paired_viewers();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    ipc::clear_paired_viewers();
+}
+
+#[cfg(feature = "flutter")]
 pub fn max_encrypt_len() -> usize {
     hbb_common::config::ENCRYPT_MAX_LEN
 }
 
 pub fn is_remote_modify_enabled_by_control_permissions() -> Option<bool> {
     *IS_REMOTE_MODIFY_ENABLED_BY_CONTROL_PERMISSIONS
+        .lock()
+        .unwrap()
+}
+
+pub fn should_block_rustadmin_gui_for_active_sessions() -> Option<bool> {
+    *SHOULD_BLOCK_RUSTADMIN_GUI_FOR_ACTIVE_SESSIONS
         .lock()
         .unwrap()
 }
@@ -1696,6 +1811,72 @@ mod tests {
     use uuid::Uuid;
 
     static TEST_UI_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_peer_option_bridge_updates_typed_peer_fields() {
+        let _guard = TEST_UI_LOCK.lock().unwrap();
+        let peer_id = format!("ui-peer-options-{}", Uuid::new_v4());
+        PeerConfig::remove(&peer_id);
+
+        set_peer_option(
+            peer_id.clone(),
+            OPTION_IMAGE_QUALITY.to_owned(),
+            "custom".to_owned(),
+        );
+        set_peer_option(
+            peer_id.clone(),
+            OPTION_CUSTOM_IMAGE_QUALITY.to_owned(),
+            "125".to_owned(),
+        );
+        set_peer_option(
+            peer_id.clone(),
+            OPTION_SHOW_QUALITY_MONITOR.to_owned(),
+            "Y".to_owned(),
+        );
+        set_peer_option(
+            peer_id.clone(),
+            "keyboard_mode".to_owned(),
+            "map".to_owned(),
+        );
+        set_peer_option(
+            peer_id.clone(),
+            "quality-monitor-position".to_owned(),
+            "bottom-left".to_owned(),
+        );
+
+        assert_eq!(
+            get_peer_option(peer_id.clone(), OPTION_IMAGE_QUALITY.to_owned()),
+            "custom"
+        );
+        assert_eq!(
+            get_peer_option(peer_id.clone(), OPTION_CUSTOM_IMAGE_QUALITY.to_owned()),
+            "125"
+        );
+        assert_eq!(
+            get_peer_option(peer_id.clone(), OPTION_SHOW_QUALITY_MONITOR.to_owned()),
+            "Y"
+        );
+        assert_eq!(
+            get_peer_option(peer_id.clone(), "keyboard_mode".to_owned()),
+            "map"
+        );
+        assert_eq!(
+            get_peer_option(peer_id.clone(), "quality-monitor-position".to_owned()),
+            "bottom-left"
+        );
+
+        let config = PeerConfig::load(&peer_id);
+        assert_eq!(config.image_quality, "custom");
+        assert_eq!(config.custom_image_quality, vec![125]);
+        assert!(config.show_quality_monitor.v);
+        assert_eq!(config.keyboard_mode, "map");
+        assert_eq!(
+            config.options.get("quality-monitor-position"),
+            Some(&"bottom-left".to_owned())
+        );
+
+        PeerConfig::remove(&peer_id);
+    }
 
     #[test]
     fn test_get_lan_peers_hides_identity_until_trusted() {

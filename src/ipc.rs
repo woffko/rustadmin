@@ -3,17 +3,24 @@ use crate::{
     privacy_mode::PrivacyModeState,
     ui_interface::{get_local_option, set_local_option},
 };
+#[path = "ipc/auth.rs"]
+mod ipc_auth;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "ipc/fs.rs"]
+mod ipc_fs;
 use bytes::Bytes;
 use parity_tokio_ipc::{
     Connection as Conn, ConnectionClient as ConnClient, Endpoint, Incoming, SecurityAttributes,
 };
 use serde_derive::{Deserialize, Serialize};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::cell::Cell;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicBool, Ordering},
 };
-#[cfg(not(windows))]
-use std::{fs::File, io::prelude::*};
 
 #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -40,10 +47,81 @@ use hbb_common::{
 };
 
 use crate::{common::is_server, privacy_mode, rendezvous_mediator::RendezvousMediator};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use ipc_auth::active_uid;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use ipc_auth::authorize_service_scoped_ipc_connection;
+#[cfg(windows)]
+pub(crate) use ipc_auth::authorize_windows_portable_service_ipc_connection;
+#[cfg(windows)]
+pub(crate) use ipc_auth::ensure_peer_executable_matches_current_by_pid_opt;
+#[cfg(windows)]
+pub(crate) use ipc_auth::log_rejected_windows_ipc_connection;
+#[cfg(windows)]
+use ipc_auth::{
+    authorize_windows_main_ipc_connection, portable_service_listener_security_attributes,
+    should_allow_everyone_create_on_windows,
+};
+#[cfg(target_os = "linux")]
+pub(crate) use ipc_auth::{
+    ensure_peer_executable_matches_current_by_fd, is_allowed_service_peer_uid,
+    log_rejected_uinput_connection, peer_uid_from_fd,
+};
+#[cfg(target_os = "linux")]
+use ipc_fs::terminal_count_candidate_uids;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use ipc_fs::{
+    check_pid, ensure_secure_ipc_parent_dir, scrub_secure_ipc_parent_dir,
+    should_scrub_parent_entries_after_check_pid, write_pid,
+};
 
 // IPC actions here.
 pub const IPC_ACTION_CLOSE: &str = "close";
+#[cfg(windows)]
+const PORTABLE_SERVICE_IPC_HANDSHAKE_TIMEOUT_MS: u64 = 3_000;
+#[cfg(windows)]
+pub(crate) const IPC_TOKEN_LEN: usize = 64;
+#[cfg(windows)]
+const IPC_TOKEN_RANDOM_BYTES: usize = IPC_TOKEN_LEN / 2;
+#[cfg(windows)]
+const _: () = assert!(IPC_TOKEN_LEN % 2 == 0);
 pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+thread_local! {
+    static USE_USER_MAIN_IPC: Cell<bool> = Cell::new(false);
+}
+
+#[must_use = "bind this guard to a local variable to keep the IPC scope active"]
+/// Thread-local guard for routing root main IPC to the active user on Linux/macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct UserMainIpcScope {
+    previous: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl UserMainIpcScope {
+    pub(crate) fn new() -> Self {
+        let previous = USE_USER_MAIN_IPC.with(|use_user_main| {
+            let previous = use_user_main.get();
+            use_user_main.set(true);
+            previous
+        });
+        Self { previous }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for UserMainIpcScope {
+    fn drop(&mut self) {
+        USE_USER_MAIN_IPC.with(|use_user_main| use_user_main.set(self.previous));
+    }
+}
+
+#[inline]
+pub async fn connect_service(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnClient>> {
+    connect(ms_timeout, crate::POSTFIX_SERVICE).await
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "t", content = "c")]
@@ -207,6 +285,8 @@ pub enum DataControl {
 pub enum DataPortableService {
     Ping,
     Pong,
+    AuthToken(String),
+    AuthResult(bool),
     ConnCount(Option<usize>),
     Mouse((Vec<u8>, i32, String, u32, bool, bool)),
     Pointer((Vec<u8>, i32)),
@@ -246,6 +326,21 @@ pub enum Data {
         name: String,
         enabled: bool,
     },
+    PermissionUpdate {
+        name: String,
+        enabled: bool,
+    },
+    PermissionRequest {
+        request_id: u64,
+        name: String,
+        enabled: bool,
+    },
+    PermissionRequestResult {
+        request_id: u64,
+        name: String,
+        enabled: bool,
+        approved: bool,
+    },
     SystemInfo(Option<String>),
     ClickTime(i64),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -270,6 +365,8 @@ pub enum Data {
     ClipboardFileEnabled(bool),
     #[cfg(target_os = "windows")]
     ClipboardNonFile(Option<(String, Vec<ClipboardNonFile>)>),
+    #[cfg(target_os = "windows")]
+    ClipboardDebug(Vec<String>),
     PrivacyModeState((i32, PrivacyModeState, String)),
     TestRendezvousServer,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -284,7 +381,14 @@ pub enum Data {
     Empty,
     Disconnected,
     DataPortableService(DataPortableService),
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     SwitchSidesRequest(String),
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    SwitchSidesUuid(String, String, Option<bool>),
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     SwitchSidesBack,
     UrlLink(String),
     VoiceCallIncoming,
@@ -324,7 +428,7 @@ pub enum Data {
     /// Empty data is supported. The IPC connection uses `BytesCodec` with `raw=false` (default),
     /// which prefixes each frame with a length header. So `send_raw(Bytes::new())` sends a
     /// 1-byte frame (length=0), and `next_raw()` correctly returns an empty `BytesMut`.
-    /// See `libs/hbb_common/src/bytes_codec.rs` test `test_codec2` for verification.
+    /// See `../hbb_common/src/bytes_codec.rs` test `test_codec2` for verification.
     FileBlockFromCM {
         id: i32,
         file_num: i32,
@@ -374,6 +478,8 @@ pub enum Data {
     HwCodecConfig(Option<String>),
     RemoveTrustedDevices(Vec<Bytes>),
     ClearTrustedDevices,
+    RemovePairedViewers(Vec<Bytes>),
+    ClearPairedViewers,
     #[cfg(all(target_os = "windows", feature = "flutter"))]
     PrinterData(Vec<u8>),
     InstallOption(Option<(String, String)>),
@@ -389,9 +495,15 @@ pub enum Data {
     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Whiteboard((String, crate::whiteboard::CustomEvent)),
+    ShouldBlockRustAdminGuiForActiveSessions(Option<bool>),
     ControlPermissionsRemoteModify(Option<bool>),
     #[cfg(target_os = "windows")]
     FileTransferEnabledState(Option<bool>),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn service_channel_accepts_data(data: &Data) -> bool {
+    matches!(data, Data::SyncConfig(_))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -403,6 +515,18 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                 Ok(stream) => {
                     let mut stream = Connection::new(stream);
                     let postfix = postfix.to_owned();
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    if config::is_service_ipc_postfix(&postfix) {
+                        if !authorize_service_scoped_ipc_connection(&stream, &postfix) {
+                            continue;
+                        }
+                    }
+                    #[cfg(windows)]
+                    if postfix.is_empty() {
+                        if !authorize_windows_main_ipc_connection(&stream, &postfix) {
+                            continue;
+                        }
+                    }
                     tokio::spawn(async move {
                         loop {
                             match stream.next().await {
@@ -411,9 +535,31 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                     break;
                                 }
                                 Ok(Some(data)) => {
+                                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                    if postfix == crate::POSTFIX_SERVICE {
+                                        if service_channel_accepts_data(&data) {
+                                            handle(data, &mut stream).await;
+                                        } else {
+                                            log::warn!(
+                                                "Rejected non-sync data on protected _service IPC channel: postfix={}, data_kind={:?}, peer_uid={:?}",
+                                                postfix,
+                                                std::mem::discriminant(&data),
+                                                stream.peer_uid()
+                                            );
+                                            break;
+                                        }
+                                        continue;
+                                    }
                                     handle(data, &mut stream).await;
                                 }
-                                _ => {}
+                                Ok(None) => {
+                                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                    {
+                                        if postfix == crate::POSTFIX_SERVICE {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     });
@@ -426,27 +572,134 @@ pub async fn start(postfix: &str) -> ResultType<()> {
     }
 }
 
+fn configured_ipc_endpoint(path: &str, postfix: &str) -> ResultType<Endpoint> {
+    let mut endpoint = Endpoint::new(path.to_owned());
+    let security_attrs = {
+        #[cfg(windows)]
+        {
+            if postfix == "_portable_service" {
+                portable_service_listener_security_attributes()
+            } else if should_allow_everyone_create_on_windows(postfix) {
+                SecurityAttributes::allow_everyone_create()
+            } else {
+                Ok(SecurityAttributes::empty())
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            SecurityAttributes::allow_everyone_create()
+        }
+    };
+    match security_attrs {
+        Ok(attr) => endpoint.set_security_attributes(attr),
+        Err(err) => {
+            log::error!("Failed to set ipc{} security: {}", postfix, err);
+            #[cfg(windows)]
+            if postfix == "_portable_service" {
+                return Err(err.into());
+            }
+        }
+    };
+    Ok(endpoint)
+}
+
+fn finish_new_listener(path: &str, postfix: &str, incoming: Incoming) -> ResultType<Incoming> {
+    if postfix == crate::POSTFIX_SERVICE {
+        log::info!("Started protected ipc service server: postfix={}", postfix);
+    } else {
+        log::info!("Started ipc{} server at path: {}", postfix, path);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let socket_mode = if config::is_service_ipc_postfix(postfix) {
+            0o666
+        } else {
+            0o600
+        };
+        if let Err(err) =
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(socket_mode))
+        {
+            log::error!(
+                "Failed to set permissions on ipc{} socket at path {}: {}",
+                postfix,
+                path,
+                err
+            );
+            std::fs::remove_file(path).ok();
+            return Err(err.into());
+        }
+        write_pid(postfix);
+    }
+    Ok(incoming)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_addr_in_use(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AddrInUse
+        || err.raw_os_error() == Some(hbb_common::libc::EADDRINUSE)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn retry_stale_ipc_listener_bind(
+    path: &str,
+    postfix: &str,
+    err: &std::io::Error,
+) -> ResultType<Option<Incoming>> {
+    if !is_addr_in_use(err) {
+        return Ok(None);
+    }
+    if check_pid(postfix).await {
+        log::warn!(
+            "ipc{} listener at path {} is already owned by another live RustAdmin process",
+            postfix,
+            path
+        );
+        return Ok(None);
+    }
+
+    log::warn!(
+        "ipc{} bind found a stale socket at path {}; scrubbing and retrying once",
+        postfix,
+        path
+    );
+    scrub_secure_ipc_parent_dir(path, postfix)?;
+
+    let mut endpoint = configured_ipc_endpoint(path, postfix)?;
+    match endpoint.incoming() {
+        Ok(incoming) => Ok(Some(incoming)),
+        Err(retry_err) => {
+            log::error!(
+                "Failed to start ipc{} server after stale socket retry at path {}: {}",
+                postfix,
+                path,
+                retry_err
+            );
+            Err(retry_err.into())
+        }
+    }
+}
+
 pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     let path = Config::ipc_path(postfix);
-    #[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
-    check_pid(postfix).await;
-    let mut endpoint = Endpoint::new(path.clone());
-    match SecurityAttributes::allow_everyone_create() {
-        Ok(attr) => endpoint.set_security_attributes(attr),
-        Err(err) => log::error!("Failed to set ipc{} security: {}", postfix, err),
-    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let should_scrub_parent_entries = ensure_secure_ipc_parent_dir(&path, postfix)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let existing_listener_alive = check_pid(postfix).await;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if should_scrub_parent_entries_after_check_pid(
+        should_scrub_parent_entries,
+        existing_listener_alive,
+    ) {
+        scrub_secure_ipc_parent_dir(&path, postfix)?;
+    }
+    let mut endpoint = configured_ipc_endpoint(&path, postfix)?;
     match endpoint.incoming() {
-        Ok(incoming) => {
-            log::info!("Started ipc{} server at path: {}", postfix, &path);
-            #[cfg(not(windows))]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0777)).ok();
-                write_pid(postfix);
-            }
-            Ok(incoming)
-        }
+        Ok(incoming) => finish_new_listener(&path, postfix, incoming),
         Err(err) => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let Some(incoming) = retry_stale_ipc_listener_bind(&path, postfix, &err).await? {
+                return finish_new_listener(&path, postfix, incoming);
+            }
             log::error!(
                 "Failed to start ipc{} server at path {}: {}",
                 postfix,
@@ -466,6 +719,8 @@ pub struct CheckIfRestart {
     ws: String,
     disable_udp: String,
     allow_insecure_tls_fallback: String,
+    allow_id_relay_server: String,
+    relay_server: String,
     api_server: String,
 }
 
@@ -481,6 +736,8 @@ impl CheckIfRestart {
             allow_insecure_tls_fallback: Config::get_option(
                 config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK,
             ),
+            allow_id_relay_server: Config::get_option(config::keys::OPTION_ALLOW_ID_RELAY_SERVER),
+            relay_server: Config::get_option(config::keys::OPTION_RELAY_SERVER),
             api_server: Config::get_option("api-server"),
         }
     }
@@ -497,6 +754,9 @@ impl Drop for CheckIfRestart {
             || self.rendezvous_servers != Config::get_rendezvous_servers()
             || self.ws != Config::get_option(OPTION_ALLOW_WEBSOCKET)
             || self.disable_udp != Config::get_option(config::keys::OPTION_DISABLE_UDP)
+            || self.allow_id_relay_server
+                != Config::get_option(config::keys::OPTION_ALLOW_ID_RELAY_SERVER)
+            || self.relay_server != Config::get_option(config::keys::OPTION_RELAY_SERVER)
             || self.api_server != Config::get_option("api-server")
         {
             if allow_insecure_tls_fallback_changed {
@@ -565,11 +825,18 @@ async fn handle(data: Data, stream: &mut Connection) {
                             .arg(&format!("/Applications/{}.app", crate::get_app_name()))
                             .spawn()
                             .ok();
+                        // This handler does not run on AppKit's main thread. Terminating NSApp
+                        // from here can abort Flutter during the first-run service handoff.
+                        hbb_common::sleep(0.3).await;
+                        std::process::exit(0);
                     }
-                    // leave above open a little time
-                    hbb_common::sleep(0.3).await;
-                    // in case below exit failed
-                    crate::platform::quit_gui();
+                    #[cfg(target_os = "linux")]
+                    {
+                        // leave above open a little time
+                        hbb_common::sleep(0.3).await;
+                        // in case below exit failed
+                        crate::platform::quit_gui();
+                    }
                 }
                 std::process::exit(-1); // to make sure --server luauchagent process can restart because SuccessfulExit used
             }
@@ -684,6 +951,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = Some(Config::get_unlock_pin());
                 } else if name == "trusted-devices" {
                     value = Some(Config::get_trusted_devices_json());
+                } else if name == "paired-viewers" {
+                    value = Some(Config::get_paired_viewers_json());
                 } else {
                     value = None;
                 }
@@ -770,12 +1039,27 @@ async fn handle(data: Data, stream: &mut Connection) {
         Data::TestRendezvousServer => {
             crate::test_rendezvous_server();
         }
+        #[cfg(feature = "flutter")]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Data::SwitchSidesRequest(id) => {
             let uuid = uuid::Uuid::new_v4();
             crate::server::insert_switch_sides_uuid(id, uuid.clone());
             allow_err!(
                 stream
                     .send(&Data::SwitchSidesRequest(uuid.to_string()))
+                    .await
+            );
+        }
+        #[cfg(feature = "flutter")]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        Data::SwitchSidesUuid(uuid, id, None) => {
+            let allowed = uuid
+                .parse::<uuid::Uuid>()
+                .map(|uuid| crate::server::remove_pending_switch_sides_uuid(&id, &uuid))
+                .unwrap_or(false);
+            allow_err!(
+                stream
+                    .send(&Data::SwitchSidesUuid(uuid, id, Some(allowed)))
                     .await
             );
         }
@@ -807,7 +1091,7 @@ async fn handle(data: Data, stream: &mut Connection) {
         #[cfg(feature = "hwcodec")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Data::CheckHwcodec => {
-            scrap::hwcodec::start_check_process();
+            scrap::hwcodec::recheck_hwcodec();
         }
         #[cfg(feature = "hwcodec")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -868,6 +1152,12 @@ async fn handle(data: Data, stream: &mut Connection) {
         Data::ClearTrustedDevices => {
             Config::clear_trusted_devices();
         }
+        Data::RemovePairedViewers(v) => {
+            Config::remove_paired_viewers(&v);
+        }
+        Data::ClearPairedViewers => {
+            Config::clear_paired_viewers();
+        }
         Data::InstallOption(opt) => match opt {
             Some((_k, _v)) => {
                 #[cfg(target_os = "windows")]
@@ -914,6 +1204,14 @@ async fn handle(data: Data, stream: &mut Connection) {
                     .await
             );
         }
+        Data::ShouldBlockRustAdminGuiForActiveSessions(_) => {
+            let state = crate::server::should_block_rustadmin_gui_for_active_sessions();
+            allow_err!(
+                stream
+                    .send(&Data::ShouldBlockRustAdminGuiForActiveSessions(Some(state)))
+                    .await
+            );
+        }
         #[cfg(target_os = "windows")]
         Data::FileTransferEnabledState(_) => {
             use hbb_common::rendezvous_proto::control_permissions::Permission;
@@ -934,9 +1232,200 @@ async fn handle(data: Data, stream: &mut Connection) {
 }
 
 pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmpl<ConnClient>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let use_user_main_ipc = USE_USER_MAIN_IPC.with(|use_user_main| use_user_main.get());
+        let is_root_main_ipc =
+            unsafe { hbb_common::libc::geteuid() == 0 } && postfix.is_empty() && use_user_main_ipc;
+        if is_root_main_ipc {
+            let uid = user_main_ipc_server_uid()?;
+            let path = Config::ipc_path_for_uid(uid, postfix);
+            return connect_with_path(ms_timeout, &path).await;
+        }
+    }
     let path = Config::ipc_path(postfix);
-    let client = timeout(ms_timeout, Endpoint::connect(&path)).await??;
+    connect_with_path(ms_timeout, &path).await
+}
+
+#[inline]
+async fn connect_with_path(ms_timeout: u64, path: &str) -> ResultType<ConnectionTmpl<ConnClient>> {
+    let client = timeout(ms_timeout, Endpoint::connect(path)).await??;
     Ok(ConnectionTmpl::new(client))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn select_server_uid_for_user_main_ipc(
+    server_uids: &[u32],
+    active_uid: Option<u32>,
+    prefer_root: bool,
+) -> ResultType<u32> {
+    let mut server_uids = server_uids.to_vec();
+    server_uids.sort_unstable();
+    server_uids.dedup();
+
+    match server_uids.as_slice() {
+        [] => {
+            if let Some(uid) = active_uid {
+                // If no `--server` processes are found but the active user is identifiable,
+                // try the active user anyway because the main process may also listen on "" IPC.
+                return Ok(uid);
+            }
+            bail!("No --server process found for user main IPC")
+        }
+        [uid] => return Ok(*uid),
+        _ => {}
+    }
+
+    if prefer_root && server_uids.contains(&0) {
+        return Ok(0);
+    }
+    if let Some(active_uid) = active_uid.filter(|uid| server_uids.contains(uid)) {
+        return Ok(active_uid);
+    }
+    bail!("Multiple --server processes found for user main IPC");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn running_server_uids_for_current_exe() -> ResultType<Vec<u32>> {
+    use hbb_common::sysinfo::{PidExt, ProcessExt, System, SystemExt};
+
+    let current_exe = std::env::current_exe()?;
+    let current_exe_path = std::fs::canonicalize(&current_exe)?;
+    let current_pid = hbb_common::sysinfo::Pid::from_u32(std::process::id());
+    let mut sys = System::new();
+    sys.refresh_processes();
+    let mut server_uids = Vec::new();
+    for process in sys.processes().values() {
+        if process.pid() == current_pid {
+            continue;
+        }
+        if process.cmd().get(1).map_or(true, |arg| arg != "--server") {
+            continue;
+        }
+        let Ok(process_path) = std::fs::canonicalize(process.exe()) else {
+            continue;
+        };
+        if process_path != current_exe_path {
+            continue;
+        }
+        let Some(uid) = process.user_id().map(|uid| **uid as u32) else {
+            // Root CLI management commands need a stable matching `--server` target.
+            // If this key process races during enumeration, failing the command is clearer
+            // than silently skipping it; `--server` is not expected to exit frequently.
+            bail!("Failed to read --server process uid");
+        };
+        server_uids.push(uid);
+    }
+    Ok(server_uids)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn user_main_ipc_server_uid() -> ResultType<u32> {
+    let server_uids = running_server_uids_for_current_exe()?;
+    #[cfg(target_os = "linux")]
+    let prefer_root = crate::platform::linux::is_login_screen_wayland();
+    #[cfg(target_os = "macos")]
+    let prefer_root = false;
+    select_server_uid_for_user_main_ipc(&server_uids, active_uid(), prefer_root)
+}
+
+#[cfg(windows)]
+pub(crate) fn generate_one_time_ipc_token() -> ResultType<String> {
+    use hbb_common::rand::{rngs::OsRng, RngCore as _};
+    use std::fmt::Write as _;
+
+    let mut random_bytes = [0u8; IPC_TOKEN_RANDOM_BYTES];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut random_bytes).map_err(|err| {
+        hbb_common::anyhow::anyhow!(
+            "failed to generate portable service ipc token from OsRng: {}",
+            err
+        )
+    })?;
+
+    let mut token = String::with_capacity(IPC_TOKEN_LEN);
+    for byte in random_bytes {
+        let _ = write!(token, "{:02x}", byte);
+    }
+    Ok(token)
+}
+
+#[cfg(windows)]
+pub(crate) fn constant_time_ipc_token_eq(expected: &str, candidate: &str) -> bool {
+    if expected.len() != IPC_TOKEN_LEN || candidate.len() != IPC_TOKEN_LEN {
+        return false;
+    }
+    expected
+        .as_bytes()
+        .iter()
+        .zip(candidate.as_bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+#[cfg(windows)]
+pub(crate) async fn portable_service_ipc_handshake_as_client<T>(
+    stream: &mut ConnectionTmpl<T>,
+    token: &str,
+) -> ResultType<()>
+where
+    T: AsyncRead + AsyncWrite + std::marker::Unpin,
+{
+    stream
+        .send(&Data::DataPortableService(DataPortableService::AuthToken(
+            token.to_owned(),
+        )))
+        .await?;
+    match stream
+        .next_timeout(PORTABLE_SERVICE_IPC_HANDSHAKE_TIMEOUT_MS)
+        .await?
+    {
+        Some(Data::DataPortableService(DataPortableService::AuthResult(true))) => Ok(()),
+        Some(Data::DataPortableService(DataPortableService::AuthResult(false))) => {
+            bail!("portable service ipc handshake was rejected by server")
+        }
+        Some(_) | None => bail!("portable service ipc handshake returned an unexpected response"),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn portable_service_ipc_handshake_as_server<T, F>(
+    stream: &mut ConnectionTmpl<T>,
+    mut validate_token: F,
+) -> ResultType<()>
+where
+    T: AsyncRead + AsyncWrite + std::marker::Unpin,
+    F: FnMut(&str) -> bool,
+{
+    let authorized = match stream
+        .next_timeout(PORTABLE_SERVICE_IPC_HANDSHAKE_TIMEOUT_MS)
+        .await?
+    {
+        Some(Data::DataPortableService(DataPortableService::AuthToken(token))) => {
+            validate_token(&token)
+        }
+        Some(_) | None => false,
+    };
+    stream
+        .send(&Data::DataPortableService(DataPortableService::AuthResult(
+            authorized,
+        )))
+        .await?;
+    if !authorized {
+        bail!("portable service ipc handshake failed")
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub async fn connect_for_uid(
+    ms_timeout: u64,
+    uid: u32,
+    postfix: &str,
+) -> ResultType<ConnectionTmpl<ConnClient>> {
+    let path = Config::ipc_path_for_uid(uid, postfix);
+    connect_with_path(ms_timeout, &path).await
 }
 
 #[cfg(target_os = "linux")]
@@ -1013,54 +1502,6 @@ pub async fn start_pa() {
         Err(err) => {
             log::error!("Failed to start pa ipc server: {}", err);
         }
-    }
-}
-
-#[inline]
-#[cfg(not(windows))]
-fn get_pid_file(postfix: &str) -> String {
-    let path = Config::ipc_path(postfix);
-    format!("{}.pid", path)
-}
-
-#[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
-async fn check_pid(postfix: &str) {
-    let pid_file = get_pid_file(postfix);
-    if let Ok(mut file) = File::open(&pid_file) {
-        let mut content = String::new();
-        file.read_to_string(&mut content).ok();
-        let pid = content.parse::<usize>().unwrap_or(0);
-        if pid > 0 {
-            use hbb_common::sysinfo::System;
-            let mut sys = System::new();
-            sys.refresh_processes();
-            if let Some(p) = sys.process(pid.into()) {
-                if let Some(current) = sys.process((std::process::id() as usize).into()) {
-                    if current.name() == p.name() {
-                        // double check with connect
-                        if connect(1000, postfix).await.is_ok() {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // if not remove old ipc file, the new ipc creation will fail
-    // if we remove a ipc file, but the old ipc process is still running,
-    // new connection to the ipc will connect to new ipc, old connection to old ipc still keep alive
-    std::fs::remove_file(&Config::ipc_path(postfix)).ok();
-}
-
-#[inline]
-#[cfg(not(windows))]
-fn write_pid(postfix: &str) {
-    let path = get_pid_file(postfix);
-    if let Ok(mut file) = File::create(&path) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0777)).ok();
-        file.write_all(&std::process::id().to_string().into_bytes())
-            .ok();
     }
 }
 
@@ -1336,6 +1777,30 @@ pub fn clear_trusted_devices() {
     allow_err!(set_data(&Data::ClearTrustedDevices));
 }
 
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn get_paired_viewers() -> String {
+    if let Ok(Some(v)) = get_config("paired-viewers") {
+        v
+    } else {
+        Config::get_paired_viewers_json()
+    }
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn remove_paired_viewers(sign_pks: Vec<Bytes>) {
+    Config::remove_paired_viewers(&sign_pks);
+    allow_err!(set_data(&Data::RemovePairedViewers(sign_pks)));
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn clear_paired_viewers() {
+    Config::clear_paired_viewers();
+    allow_err!(set_data(&Data::ClearPairedViewers));
+}
+
 pub fn get_id() -> String {
     if let Ok(Some(v)) = get_config("id") {
         // update salt also, so that next time reinstallation not causing first-time auto-login failure
@@ -1529,7 +1994,7 @@ pub fn close_all_instances() -> ResultType<bool> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn connect_to_user_session(usid: Option<u32>) -> ResultType<()> {
-    let mut stream = crate::ipc::connect(1000, crate::POSTFIX_SERVICE).await?;
+    let mut stream = crate::ipc::connect_service(1000).await?;
     timeout(1000, stream.send(&crate::ipc::Data::UserSid(usid))).await??;
     Ok(())
 }
@@ -1539,6 +2004,10 @@ pub async fn notify_server_to_check_hwcodec() -> ResultType<()> {
     connect(1_000, "").await?.send(&&Data::CheckHwcodec).await?;
     Ok(())
 }
+
+#[cfg(feature = "hwcodec")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const HWCODEC_CONFIG_IPC_TIMEOUT_MS: u64 = 500;
 
 #[cfg(target_os = "windows")]
 pub async fn get_port_forward_session_count(ms_timeout: u64) -> ResultType<usize> {
@@ -1554,12 +2023,27 @@ pub async fn get_port_forward_session_count(ms_timeout: u64) -> ResultType<usize
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tokio::main(flavor = "current_thread")]
 pub async fn get_hwcodec_config_from_server() -> ResultType<()> {
-    if !scrap::codec::enable_hwcodec_option() || scrap::hwcodec::HwCodecConfig::already_set() {
+    get_hwcodec_config_from_server_impl(false).await
+}
+
+#[cfg(feature = "hwcodec")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn recheck_hwcodec_config_from_server() -> ResultType<()> {
+    get_hwcodec_config_from_server_impl(true).await
+}
+
+#[cfg(feature = "hwcodec")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn get_hwcodec_config_from_server_impl(force: bool) -> ResultType<()> {
+    if !scrap::codec::enable_hwcodec_option()
+        || (!force && scrap::hwcodec::HwCodecConfig::already_set())
+    {
         return Ok(());
     }
-    let mut c = connect(50, "").await?;
+    let mut c = connect(HWCODEC_CONFIG_IPC_TIMEOUT_MS, "").await?;
     c.send(&Data::HwCodecConfig(None)).await?;
-    if let Some(Data::HwCodecConfig(v)) = c.next_timeout(50).await? {
+    if let Some(Data::HwCodecConfig(v)) = c.next_timeout(HWCODEC_CONFIG_IPC_TIMEOUT_MS).await? {
         match v {
             Some(v) => {
                 scrap::hwcodec::HwCodecConfig::set(v);
@@ -1576,26 +2060,54 @@ pub async fn get_hwcodec_config_from_server() -> ResultType<()> {
 #[cfg(feature = "hwcodec")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn client_get_hwcodec_config_thread(wait_sec: u64) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    client_get_hwcodec_config_thread_inner(wait_sec, false);
+}
+
+#[cfg(feature = "hwcodec")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn client_recheck_hwcodec_config_thread(wait_sec: u64) {
+    scrap::hwcodec::HwCodecConfig::reset();
+    client_get_hwcodec_config_thread_inner(wait_sec, true);
+}
+
+#[cfg(feature = "hwcodec")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn client_get_hwcodec_config_thread_inner(wait_sec: u64, force: bool) {
     if !crate::platform::is_installed()
         || !scrap::codec::enable_hwcodec_option()
-        || scrap::hwcodec::HwCodecConfig::already_set()
+        || (!force && scrap::hwcodec::HwCodecConfig::already_set())
     {
         return;
     }
+    if force {
+        spawn_hwcodec_config_fetcher(wait_sec, true);
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(move || {
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            let mut intervals: Vec<u64> = vec![wait_sec, 3, 3, 6, 9];
-            for i in intervals.drain(..) {
-                if i > 0 {
-                    std::thread::sleep(std::time::Duration::from_secs(i));
-                }
-                if get_hwcodec_config_from_server().is_ok() {
-                    break;
-                }
+        spawn_hwcodec_config_fetcher(wait_sec, false);
+    });
+}
+
+#[cfg(feature = "hwcodec")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn spawn_hwcodec_config_fetcher(wait_sec: u64, force: bool) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let mut intervals: Vec<u64> = vec![wait_sec, 3, 3, 6, 9, 12];
+        for i in intervals.drain(..) {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(i));
             }
-        });
+            let fetched = if force {
+                recheck_hwcodec_config_from_server().is_ok()
+            } else {
+                get_hwcodec_config_from_server().is_ok()
+            };
+            if fetched {
+                break;
+            }
+        }
     });
 }
 
@@ -1655,13 +2167,77 @@ pub async fn update_controlling_session_count(count: usize) -> ResultType<()> {
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
 pub async fn get_terminal_session_count() -> ResultType<usize> {
-    let ms_timeout = 1_000;
-    let mut c = connect(ms_timeout, "").await?;
-    c.send(&Data::TerminalSessionCount(0)).await?;
-    if let Some(Data::TerminalSessionCount(c)) = c.next_timeout(ms_timeout).await? {
-        return Ok(c);
+    let timeout_ms = 1_000;
+    // Safety: geteuid has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { hbb_common::libc::geteuid() as u32 };
+    let candidate_uids = terminal_count_candidate_uids(effective_uid);
+    let mut last_err: Option<hbb_common::anyhow::Error> = None;
+    for candidate_uid in candidate_uids {
+        let socket_path = Config::ipc_path_for_uid(candidate_uid, "");
+        let connect_result = timeout(timeout_ms, Endpoint::connect(&socket_path))
+            .await
+            .map_err(|err| {
+                hbb_common::anyhow::anyhow!(
+                    "Timeout connecting to terminal ipc at {}: {}",
+                    socket_path,
+                    err
+                )
+            });
+        let connection = match connect_result {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(err)) => {
+                last_err = Some(hbb_common::anyhow::anyhow!(
+                    "Failed to connect to terminal ipc at {}: {}",
+                    socket_path,
+                    err
+                ));
+                continue;
+            }
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
+        let mut ipc_conn = ConnectionTmpl::new(connection);
+        if let Err(err) = ipc_conn.send(&Data::TerminalSessionCount(0)).await {
+            last_err = Some(hbb_common::anyhow::anyhow!(
+                "Failed to request terminal session count via ipc at {}: {}",
+                socket_path,
+                err
+            ));
+            continue;
+        }
+        match ipc_conn.next_timeout(timeout_ms).await {
+            Ok(Some(Data::TerminalSessionCount(session_count))) => {
+                return Ok(session_count);
+            }
+            Ok(None) => {
+                last_err = Some(hbb_common::anyhow::anyhow!(
+                    "Invalid response when requesting terminal session count via ipc at {}",
+                    socket_path
+                ));
+            }
+            Ok(other) => {
+                last_err = Some(hbb_common::anyhow::anyhow!(
+                    "Unexpected response when requesting terminal session count via ipc at {}: {:?}",
+                    socket_path,
+                    other.map(|v| std::mem::discriminant(&v))
+                ));
+            }
+            Err(err) => {
+                last_err = Some(hbb_common::anyhow::anyhow!(
+                    "Failed to read terminal session count via ipc at {}: {}",
+                    socket_path,
+                    err
+                ));
+            }
+        }
     }
-    Ok(0)
+    if let Some(err) = last_err {
+        Err(err.into())
+    } else {
+        Ok(0)
+    }
 }
 
 async fn handle_wayland_screencast_restore_token(
@@ -1692,9 +2268,111 @@ pub async fn set_install_option(k: String, v: String) -> ResultType<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+
     #[test]
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 120);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_service_channel_allows_only_sync_config() {
+        assert!(service_channel_accepts_data(&Data::SyncConfig(None)));
+        assert!(!service_channel_accepts_data(&Data::Empty));
+        assert!(!service_channel_accepts_data(&Data::Config((
+            "x".to_owned(),
+            None
+        ))));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_ipc_retry_only_classifies_addr_in_use() {
+        let addr_in_use = std::io::Error::from_raw_os_error(hbb_common::libc::EADDRINUSE);
+        assert!(is_addr_in_use(&addr_in_use));
+
+        let not_found = std::io::Error::from_raw_os_error(hbb_common::libc::ENOENT);
+        assert!(!is_addr_in_use(&not_found));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_ipc_path_differs_by_uid_for_non_service_postfix() {
+        // Safety: geteuid has no preconditions and does not dereference pointers.
+        let effective_uid = unsafe { hbb_common::libc::geteuid() as u32 };
+        let other_uid = effective_uid.saturating_add(1);
+        let postfix = "_cm";
+
+        assert_eq!(
+            Config::ipc_path(postfix),
+            Config::ipc_path_for_uid(effective_uid, postfix)
+        );
+        assert_ne!(
+            Config::ipc_path(postfix),
+            Config::ipc_path_for_uid(other_uid, postfix)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_select_server_uid_fails_without_server_or_active_uid() {
+        assert!(select_server_uid_for_user_main_ipc(&[], None, false).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_select_server_uid_uses_active_uid_when_no_server_found() {
+        assert_eq!(
+            select_server_uid_for_user_main_ipc(&[], Some(501), false).unwrap(),
+            501
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_select_server_uid_uses_single_server_uid() {
+        assert_eq!(
+            select_server_uid_for_user_main_ipc(&[501], None, false).unwrap(),
+            501
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_select_server_uid_prefers_active_uid_with_multiple_servers() {
+        assert_eq!(
+            select_server_uid_for_user_main_ipc(&[0, 501], Some(501), false).unwrap(),
+            501
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_select_server_uid_prefers_root_on_wayland_login_screen() {
+        assert_eq!(
+            select_server_uid_for_user_main_ipc(&[0, 501], Some(501), true).unwrap(),
+            0
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_select_server_uid_fails_when_multiple_servers_are_ambiguous() {
+        assert!(select_server_uid_for_user_main_ipc(&[501, 502], None, false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_terminal_count_candidates_fallback_to_root_for_root_process() {
+        let non_root = terminal_count_candidate_uids(1000);
+        assert_eq!(non_root, vec![1000]);
+
+        let root = terminal_count_candidate_uids(0);
+        assert_eq!(root.last().copied(), Some(0));
+        assert!(root.len() <= 2);
+        if root.len() == 2 {
+            assert_ne!(root[0], root[1]);
+        }
     }
 }

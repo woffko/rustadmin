@@ -38,17 +38,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `src/platform/` - Platform-specific code
 - **`flutter/`** - Flutter UI code for desktop and mobile
 - **`libs/`** - Core libraries
-  - `libs/hbb_common/` - Video codec, config, network wrapper, protobuf, file transfer utilities
   - `libs/scrap/` - Screen capture functionality
   - `libs/enigo/` - Platform-specific keyboard/mouse control
   - `libs/clipboard/` - Cross-platform clipboard implementation
+- **`../hbb_common/`** - Shared protocol, config, network wrapper, protobuf, and file transfer utilities used by client and server
 
 ### Key Components
 - **Remote Desktop Protocol**: Custom protocol implemented in `src/rendezvous_mediator.rs` for communicating with rustdesk-server
 - **Screen Capture**: Platform-specific screen capture in `libs/scrap/`
 - **Input Handling**: Cross-platform input simulation in `libs/enigo/`
 - **Audio/Video Services**: Real-time audio/video streaming in `src/server/`
-- **File Transfer**: Secure file transfer implementation in `libs/hbb_common/`
+- **File Transfer**: Secure file transfer implementation in `../hbb_common/`
 
 ### UI Architecture
 - **Legacy UI**: Sciter-based (deprecated) - files in `src/ui/`
@@ -60,8 +60,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Important Build Notes
 
 ### Dependencies
-- Requires vcpkg for C++ dependencies: `libvpx`, `libyuv`, `opus`, `aom`
-- Set `VCPKG_ROOT` environment variable
+- This RustAdmin fork does not use vcpkg as the default dependency manager and prefers to avoid it for project work.
+- Prefer explicit system packages, native SDKs, CMake/pkg-config prefixes, or local WSL build prefixes for C/C++ dependencies.
+- Existing upstream docs/scripts may still mention vcpkg as a RustDesk compatibility option, but do not introduce new required vcpkg build steps unless the user explicitly asks for them.
+- Some upstream build logic may still read `VCPKG_ROOT`; when unavoidable, treat it only as a compatibility prefix variable, not as a requirement to run vcpkg.
 - Download appropriate Sciter library for legacy UI support
 
 ### Ignore Patterns
@@ -84,7 +86,7 @@ When working with files, ignore these directories:
 - `screencapturekit` - macOS ScreenCaptureKit (macOS only)
 
 ### Config
-All configurations or options are under `libs/hbb_common/src/config.rs` file, 4 types:
+All configurations or options are under `../hbb_common/src/config.rs` file, 4 types:
 - Settings
 - Local
 - Display
@@ -104,3 +106,8 @@ All configurations or options are under `libs/hbb_common/src/config.rs` file, 4 
 - Do not run repository-wide formatters or reflow unrelated code unless the
   user explicitly asks for formatting.
 - Keep diffs limited to semantic changes required for the task.
+- When making client code changes, bump `rustadmin_revision.txt` by one so
+  release archives and runtime version reporting get a new RustAdmin revision
+  number. Bump `../hbb_common/rustadmin_revision.txt` only when `hbb_common`
+  itself changes. Documentation-only changes do not require a revision bump
+  unless the user asks for one.

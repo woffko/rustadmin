@@ -129,7 +129,10 @@ pub fn core_main() -> Option<Vec<String>> {
     }
     if args.len() > 0 {
         if args[0] == "--version" {
-            println!("{}", crate::VERSION);
+            println!("{}", crate::FULL_VERSION);
+            return None;
+        } else if args[0] == "--revision" {
+            println!("{}", crate::RUSTADMIN_REVISION);
             return None;
         } else if args[0] == "--build-date" {
             println!("{}", crate::BUILD_DATE);
@@ -146,13 +149,42 @@ pub fn core_main() -> Option<Vec<String>> {
         crate::portable_service::client::set_quick_support(_is_quick_support);
     }
     let mut log_name = "".to_owned();
-    if args.len() > 0 && args[0].starts_with("--") {
+    #[cfg(windows)]
+    let has_portable_service_shmem_arg = args
+        .iter()
+        .any(|arg| arg.starts_with(crate::portable_service::SHMEM_ARG_PREFIX));
+    #[cfg(not(windows))]
+    let has_portable_service_shmem_arg = false;
+    if has_portable_service_shmem_arg {
+        log_name = "portable-service".to_owned();
+    } else if args.len() > 0 && args[0].starts_with("--") {
         let name = args[0].replace("--", "");
         if !name.is_empty() {
             log_name = name;
         }
     }
     hbb_common::init_log(false, &log_name);
+    install_panic_log_hook();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let role = if log_name.is_empty() {
+            "main"
+        } else {
+            log_name.as_str()
+        };
+        let exe = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        log::info!(
+            "process logging initialized: role={}, pid={}, exe={}, log_path={}, config={}, username={}",
+            role,
+            std::process::id(),
+            exe,
+            config::Config::log_path().display(),
+            config::Config::file().display(),
+            crate::username(),
+        );
+    }
 
     // linux uni (url) go here.
     #[cfg(all(target_os = "linux", feature = "flutter"))]
@@ -193,6 +225,20 @@ pub fn core_main() -> Option<Vec<String>> {
         }
         std::thread::spawn(move || crate::start_server(false, no_server));
     } else {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        // Root CLI management commands must talk to the user `--server` main IPC.
+        // Example: `sudo rustadmin --option custom-rendezvous-server` should query the
+        // user's IPC instead of root's `/tmp/<app>-0/ipc`; `connect()` still limits this
+        // routing to empty-postfix main IPC only.
+        let _user_main_ipc_scope = if crate::platform::is_installed()
+            && is_root()
+            && is_user_main_ipc_scope_cli_command(&args)
+        {
+            Some(crate::ipc::UserMainIpcScope::new())
+        } else {
+            None
+        };
+
         #[cfg(windows)]
         {
             use crate::platform;
@@ -242,11 +288,9 @@ pub fn core_main() -> Option<Vec<String>> {
                 if config::is_disable_installation() {
                     return None;
                 }
-                #[cfg(not(windows))]
-                let options = "desktopicon startmenu";
-                #[cfg(windows)]
-                let options = "desktopicon startmenu printer";
-                let res = platform::install_me(options, "".to_owned(), true, args.len() > 1);
+                let (printer_override, debug) = parse_silent_install_args(&args);
+                let options = platform::get_silent_install_options(printer_override);
+                let res = platform::install_me(options, "".to_owned(), true, debug);
                 let text = match res {
                     Ok(_) => translate("Installation Successful!".to_string()),
                     Err(err) => {
@@ -391,10 +435,10 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             #[cfg(target_os = "macos")]
             {
-                let handler = std::thread::spawn(move || crate::start_server(true, false));
-                crate::tray::start_tray();
-                // prevent server exit when encountering errors from tray
-                hbb_common::allow_err!(handler.join());
+                if !crate::check_process("--tray", true) {
+                    hbb_common::allow_err!(crate::run_me(vec!["--tray"]));
+                }
+                crate::start_server(true, false);
             }
             return None;
         } else if args[0] == "--import-config" {
@@ -721,8 +765,9 @@ fn import_config(path: &str) {
             log::info!("config written");
         }
     }
-    let config2: Config2 = load_path(path2.into());
+    let mut config2: Config2 = load_path(path2.into());
     if get_modified_time(&path2) > get_modified_time(&Config2::file()) {
+        config2.normalize_imported_options();
         if store_path(Config2::file(), config2).is_err() {
             log::info!("config2 written");
         }
@@ -838,6 +883,103 @@ fn is_root() -> bool {
     }
     #[allow(unreachable_code)]
     crate::platform::is_root()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn is_user_main_ipc_scope_cli_command(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("--password")
+            | Some("--set-unlock-pin")
+            | Some("--get-id")
+            | Some("--set-id")
+            | Some("--config")
+            | Some("--option")
+            | Some("--assign")
+    )
+}
+
+#[cfg(any(windows, test))]
+fn parse_silent_install_args(args: &[String]) -> (Option<bool>, bool) {
+    let mut printer_override = None;
+    let mut debug = false;
+
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "printer=1" => printer_override = Some(true),
+            "printer=0" => printer_override = Some(false),
+            "debug" => debug = true,
+            _ => {}
+        }
+    }
+
+    (printer_override, debug)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn user_main_ipc_scope_cli_command_matches_management_commands_only() {
+        for command in [
+            "--password",
+            "--set-unlock-pin",
+            "--get-id",
+            "--set-id",
+            "--config",
+            "--option",
+            "--assign",
+        ] {
+            assert!(is_user_main_ipc_scope_cli_command(&args(&[command])));
+        }
+
+        for command in [
+            "--service",
+            "--server",
+            "--tray",
+            "--cm",
+            "--check-hwcodec-config",
+            "--connect",
+            "--deploy",
+        ] {
+            assert!(!is_user_main_ipc_scope_cli_command(&args(&[command])));
+        }
+    }
+
+    #[test]
+    fn parse_silent_install_args_reads_printer_override_and_debug() {
+        assert_eq!(
+            parse_silent_install_args(&args(&["--silent-install"])),
+            (None, false)
+        );
+        assert_eq!(
+            parse_silent_install_args(&args(&["--silent-install", "printer=1", "debug"])),
+            (Some(true), true)
+        );
+        assert_eq!(
+            parse_silent_install_args(&args(&["--silent-install", "printer=0"])),
+            (Some(false), false)
+        );
+    }
+}
+
+fn install_panic_log_hook() {
+    static PANIC_LOG_HOOK: std::sync::Once = std::sync::Once::new();
+
+    PANIC_LOG_HOOK.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("<unnamed>");
+            log::error!("panic in thread {thread_name}: {info}");
+            default_hook(info);
+        }));
+    });
 }
 
 /// Check if the executable is a Quick Support version.

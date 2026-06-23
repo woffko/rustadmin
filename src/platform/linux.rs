@@ -2,11 +2,9 @@ use super::{gtk_sudo, CursorData, ResultType};
 use desktop::Desktop;
 pub use hbb_common::platform::linux::*;
 use hbb_common::{
-    allow_err,
-    anyhow::anyhow,
-    bail,
+    allow_err, bail,
     config::{keys::OPTION_ALLOW_LINUX_HEADLESS, Config},
-    libc::{c_char, c_int, c_long, c_uint, c_void},
+    libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void},
     log,
     message_proto::{DisplayInfo, Resolution},
     regex::{Captures, Regex},
@@ -24,7 +22,6 @@ use std::{
     time::{Duration, Instant},
 };
 use terminfo::{capability as cap, Database};
-use wallpaper;
 
 pub const PA_SAMPLE_RATE: u32 = 48000;
 static mut UNMODIFIED: bool = true;
@@ -97,10 +94,55 @@ thread_local! {
     static DISPLAY: RefCell<*mut c_void> = RefCell::new(unsafe { XOpenDisplay(std::ptr::null())});
 }
 
+// X11 error event structure for the custom error handler.
+// See: https://www.x.org/releases/current/doc/libX11/libX11/libX11.html#Using-the-Default-Error-Handlers
+#[repr(C)]
+struct XErrorEvent {
+    type_: c_int,
+    display: *mut c_void, // Display*
+    resourceid: c_ulong,  // XID
+    serial: c_ulong,
+    error_code: u8,
+    request_code: u8,
+    minor_code: u8,
+}
+
+type XErrorHandler = unsafe extern "C" fn(*mut c_void, *mut XErrorEvent) -> c_int;
+
+const X11_BAD_WINDOW: u8 = 3;
+const XDO_SUCCESS: c_int = 0;
+const XDO_ERROR: c_int = 1;
+
+/// Atomic flag set by the custom X error handler when a BadWindow error occurs.
+static X_BAD_WINDOW_DETECTED: AtomicBool = AtomicBool::new(false);
+static X_UNEXPECTED_ERROR_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// Custom X error handler that catches BadWindow errors (error_code == 3) instead of
+/// letting the default handler terminate the process.
+/// See issue: https://github.com/rustdesk/rustdesk/issues/9003
+unsafe extern "C" fn handle_x_error(_display: *mut c_void, event: *mut XErrorEvent) -> c_int {
+    if !event.is_null() && (*event).error_code == X11_BAD_WINDOW {
+        X_BAD_WINDOW_DETECTED.store(true, Ordering::SeqCst);
+        log::debug!("Caught X11 BadWindow error (suppressed), window was likely destroyed");
+        return 0;
+    }
+    X_UNEXPECTED_ERROR_DETECTED.store(true, Ordering::SeqCst);
+    if !event.is_null() {
+        log::warn!(
+            "X11 error: error_code={}, request_code={}, minor_code={}",
+            (*event).error_code,
+            (*event).request_code,
+            (*event).minor_code,
+        );
+    }
+    0
+}
+
 #[link(name = "X11")]
 extern "C" {
     fn XOpenDisplay(display_name: *const c_char) -> *mut c_void;
     // fn XCloseDisplay(d: *mut c_void) -> c_int;
+    fn XSetErrorHandler(handler: Option<XErrorHandler>) -> Option<XErrorHandler>;
 }
 
 #[link(name = "Xfixes")]
@@ -231,25 +273,47 @@ pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
                 if libxdo_sys::xdo_get_active_window(*xdo as *const _, &mut window) != 0 {
                     return;
                 }
-                if libxdo_sys::xdo_get_window_location(
+
+                // XSetErrorHandler is process-global, not scoped to this Display/thread.
+                // This path is currently called by the single window_focus service thread.
+                // While installed, this handler can still observe unrelated X11 errors from
+                // other threads; unexpected errors make this geometry query fail.
+                X_BAD_WINDOW_DETECTED.store(false, Ordering::SeqCst);
+                X_UNEXPECTED_ERROR_DETECTED.store(false, Ordering::SeqCst);
+                let prev_handler = XSetErrorHandler(Some(handle_x_error));
+
+                let loc_ret = libxdo_sys::xdo_get_window_location(
                     *xdo as *const _,
                     window,
                     &mut x as _,
                     &mut y as _,
                     std::ptr::null_mut(),
-                ) != 0
+                );
+                let size_ret = if loc_ret == XDO_SUCCESS {
+                    libxdo_sys::xdo_get_window_size(
+                        *xdo as *const _,
+                        window,
+                        &mut width,
+                        &mut height,
+                    )
+                } else {
+                    XDO_ERROR
+                };
+
+                // Do not call XSync(DISPLAY) here: DISPLAY is a separate
+                // XOpenDisplay() connection, while libxdo owns the Display*
+                // used by these geometry queries. These libxdo calls are
+                // synchronous XGetWindowAttributes-based queries, so the target
+                // BadWindow is expected to be delivered before the calls return.
+                XSetErrorHandler(prev_handler);
+                if X_BAD_WINDOW_DETECTED.load(Ordering::SeqCst)
+                    || X_UNEXPECTED_ERROR_DETECTED.load(Ordering::SeqCst)
+                    || loc_ret != XDO_SUCCESS
+                    || size_ret != XDO_SUCCESS
                 {
                     return;
                 }
-                if libxdo_sys::xdo_get_window_size(
-                    *xdo as *const _,
-                    window,
-                    &mut width,
-                    &mut height,
-                ) != 0
-                {
-                    return;
-                }
+
                 let center_x = x + (width / 2) as c_int;
                 let center_y = y + (height / 2) as c_int;
                 res = displays.iter().position(|d| {
@@ -1044,42 +1108,193 @@ pub fn get_pa_source_name(desc: &str) -> String {
 }
 
 pub fn get_pa_sources() -> Vec<(String, String)> {
-    use pulsectl::controllers::*;
-    let mut out = Vec::new();
-    match SourceController::create() {
-        Ok(mut handler) => {
-            if let Ok(devices) = handler.list_devices() {
-                for dev in devices.clone() {
-                    out.push((
-                        dev.name.unwrap_or("".to_owned()),
-                        dev.description.unwrap_or("".to_owned()),
-                    ));
-                }
-            }
-        }
+    match pulse_sources::list_sources() {
+        Ok(sources) => sources,
         Err(err) => {
             log::error!("Failed to get_pa_sources: {:?}", err);
+            Vec::new()
         }
     }
-    out
 }
 
 pub fn get_default_pa_source() -> Option<(String, String)> {
-    use pulsectl::controllers::*;
-    match SourceController::create() {
-        Ok(mut handler) => {
-            if let Ok(dev) = handler.get_default_device() {
-                return Some((
-                    dev.name.unwrap_or("".to_owned()),
-                    dev.description.unwrap_or("".to_owned()),
-                ));
-            }
-        }
+    match pulse_sources::default_source() {
+        Ok(source) => source,
         Err(err) => {
             log::error!("Failed to get_pa_source: {:?}", err);
+            None
         }
     }
-    None
+}
+
+mod pulse_sources {
+    use hbb_common::{anyhow::anyhow, ResultType};
+    use pulse::{
+        callbacks::ListResult,
+        context::{introspect, Context},
+        mainloop::standard::{IterateResult, Mainloop},
+        operation::{Operation, State},
+        proplist::Proplist,
+    };
+    use std::{cell::RefCell, ops::Deref, rc::Rc};
+
+    pub fn list_sources() -> ResultType<Vec<(String, String)>> {
+        let mut client = PulseSourceClient::connect("RustAdminSourceList")?;
+        client.list_sources()
+    }
+
+    pub fn default_source() -> ResultType<Option<(String, String)>> {
+        let mut client = PulseSourceClient::connect("RustAdminDefaultSource")?;
+        client.default_source()
+    }
+
+    struct PulseSourceClient {
+        mainloop: Rc<RefCell<Mainloop>>,
+        context: Rc<RefCell<Context>>,
+        introspect: introspect::Introspector,
+    }
+
+    impl PulseSourceClient {
+        fn connect(name: &str) -> ResultType<Self> {
+            let mut proplist = Proplist::new()
+                .ok_or_else(|| anyhow!("Failed to create PulseAudio property list"))?;
+            proplist
+                .set_str(pulse::proplist::properties::APPLICATION_NAME, name)
+                .map_err(|err| anyhow!("Failed to set PulseAudio application name: {:?}", err))?;
+
+            let mainloop =
+                Rc::new(RefCell::new(Mainloop::new().ok_or_else(|| {
+                    anyhow!("Failed to create PulseAudio mainloop")
+                })?));
+            let context = Rc::new(RefCell::new(
+                Context::new_with_proplist(mainloop.borrow().deref(), name, &proplist)
+                    .ok_or_else(|| anyhow!("Failed to create PulseAudio context"))?,
+            ));
+            context
+                .borrow_mut()
+                .connect(None, pulse::context::FlagSet::NOFLAGS, None)
+                .map_err(|err| anyhow!("Failed to connect PulseAudio context: {:?}", err))?;
+            let introspect = context.borrow_mut().introspect();
+
+            let mut client = Self {
+                mainloop,
+                context,
+                introspect,
+            };
+            client.wait_until_ready()?;
+            Ok(client)
+        }
+
+        fn wait_until_ready(&mut self) -> ResultType<()> {
+            loop {
+                self.iterate("connect")?;
+                match self.context.borrow().get_state() {
+                    pulse::context::State::Ready => return Ok(()),
+                    pulse::context::State::Failed | pulse::context::State::Terminated => {
+                        return Err(anyhow!("PulseAudio context failed or terminated"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn iterate(&mut self, action: &str) -> ResultType<()> {
+            match self.mainloop.borrow_mut().iterate(false) {
+                IterateResult::Err(err) => Err(anyhow!(
+                    "PulseAudio mainloop failed during {}: {:?}",
+                    action,
+                    err
+                )),
+                IterateResult::Success(_) => Ok(()),
+                IterateResult::Quit(_) => {
+                    Err(anyhow!("PulseAudio mainloop quit during {}", action))
+                }
+            }
+        }
+
+        fn wait_for_operation<G: ?Sized>(&mut self, op: Operation<G>) -> ResultType<()> {
+            loop {
+                self.iterate("operation")?;
+                match op.get_state() {
+                    State::Done => return Ok(()),
+                    State::Running => {}
+                    State::Cancelled => return Err(anyhow!("PulseAudio operation was cancelled")),
+                }
+            }
+        }
+
+        fn list_sources(&mut self) -> ResultType<Vec<(String, String)>> {
+            let sources = Rc::new(RefCell::new(Vec::new()));
+            let sources_ref = sources.clone();
+            let op = self.introspect.get_source_info_list(move |source_list| {
+                if let ListResult::Item(item) = source_list {
+                    sources_ref.borrow_mut().push(source_pair(item));
+                }
+            });
+            self.wait_for_operation(op)?;
+            let result = std::mem::take(&mut *sources.borrow_mut());
+            Ok(result)
+        }
+
+        fn default_source(&mut self) -> ResultType<Option<(String, String)>> {
+            let Some(default_name) = self.default_source_name()? else {
+                return Ok(None);
+            };
+            match self.source_by_name(&default_name)? {
+                Some(source) => Ok(Some(source)),
+                None => Ok(Some((default_name, String::new()))),
+            }
+        }
+
+        fn default_source_name(&mut self) -> ResultType<Option<String>> {
+            let source_name = Rc::new(RefCell::new(None));
+            let source_name_ref = source_name.clone();
+            let op = self.introspect.get_server_info(move |info| {
+                *source_name_ref.borrow_mut() = info
+                    .default_source_name
+                    .as_ref()
+                    .map(std::string::ToString::to_string);
+            });
+            self.wait_for_operation(op)?;
+            let result = source_name.borrow_mut().take();
+            Ok(result)
+        }
+
+        fn source_by_name(&mut self, name: &str) -> ResultType<Option<(String, String)>> {
+            let source = Rc::new(RefCell::new(None));
+            let source_ref = source.clone();
+            let op = self
+                .introspect
+                .get_source_info_by_name(name, move |source_info| {
+                    if let ListResult::Item(item) = source_info {
+                        *source_ref.borrow_mut() = Some(source_pair(item));
+                    }
+                });
+            self.wait_for_operation(op)?;
+            let result = source.borrow_mut().take();
+            Ok(result)
+        }
+    }
+
+    impl Drop for PulseSourceClient {
+        fn drop(&mut self) {
+            self.context.borrow_mut().disconnect();
+            self.mainloop.borrow_mut().quit(pulse::def::Retval(0));
+        }
+    }
+
+    fn source_pair(info: &introspect::SourceInfo<'_>) -> (String, String) {
+        (
+            info.name
+                .as_ref()
+                .map(std::string::ToString::to_string)
+                .unwrap_or_default(),
+            info.description
+                .as_ref()
+                .map(std::string::ToString::to_string)
+                .unwrap_or_default(),
+        )
+    }
 }
 
 pub fn lock_screen() {
@@ -1854,12 +2069,12 @@ mod desktop {
     }
 }
 
-pub struct WakeLock(Option<keepawake::AwakeHandle>);
+pub struct WakeLock(Option<keepawake::KeepAwake>);
 
 impl WakeLock {
     pub fn new(display: bool, idle: bool, sleep: bool) -> Self {
         WakeLock(
-            keepawake::Builder::new()
+            keepawake::Builder::default()
                 .display(display)
                 .idle(idle)
                 .sleep(sleep)
@@ -2025,16 +2240,132 @@ pub struct WallPaperRemover {
     old_path_dark: Option<String>, // ubuntu 22.04 light/dark theme have different uri
 }
 
+fn is_gnome_wallpaper_desktop(desktop: &str) -> bool {
+    desktop.contains("GNOME") || desktop == "Unity" || desktop == "Pantheon"
+}
+
+fn command_stdout(command: &str, args: &[&str]) -> ResultType<String> {
+    let output = Command::new(command).args(args).output()?;
+    if !output.status.success() {
+        bail!(
+            "{} {:?} failed with status {:?}",
+            command,
+            args,
+            output.status.code()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn gsettings_wallpaper_uri(key: &str) -> ResultType<String> {
+    let raw = command_stdout("gsettings", &["get", "org.gnome.desktop.background", key])?;
+    let mut uri = raw.trim();
+    if (uri.starts_with('\'') && uri.ends_with('\''))
+        || (uri.starts_with('"') && uri.ends_with('"'))
+    {
+        uri = &uri[1..uri.len().saturating_sub(1)];
+    }
+    Ok(uri.strip_prefix("file://").unwrap_or(uri).to_owned())
+}
+
+fn gvariant_string(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn set_gsettings_wallpaper_uri(key: &str, path: &str) -> ResultType<()> {
+    let uri = gvariant_string(&format!("file://{}", path));
+    let status = Command::new("gsettings")
+        .args(["set", "org.gnome.desktop.background", key, &uri])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "gsettings set {} failed with status {:?}",
+            key,
+            status.code()
+        )
+    }
+}
+
+fn xfce_wallpaper_properties(key: &str) -> ResultType<Vec<String>> {
+    let stdout = command_stdout("xfconf-query", &["--channel", "xfce4-desktop", "--list"])?;
+    let props = stdout
+        .lines()
+        .filter(|line| line.ends_with(key))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if props.is_empty() {
+        bail!("no XFCE wallpaper properties ending with {}", key);
+    }
+    Ok(props)
+}
+
+fn xfce_wallpaper_path() -> ResultType<String> {
+    let props = xfce_wallpaper_properties("last-image")?;
+    Ok(command_stdout(
+        "xfconf-query",
+        &["--channel", "xfce4-desktop", "--property", &props[0]],
+    )?
+    .trim()
+    .to_owned())
+}
+
+fn set_xfce_wallpaper_path(path: &str) -> ResultType<()> {
+    for prop in xfce_wallpaper_properties("last-image")? {
+        let status = Command::new("xfconf-query")
+            .args([
+                "--channel",
+                "xfce4-desktop",
+                "--property",
+                prop.as_str(),
+                "--set",
+                path,
+            ])
+            .status()?;
+        if !status.success() {
+            bail!(
+                "xfconf-query set {} failed with status {:?}",
+                prop,
+                status.code()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn wallpaper_path() -> ResultType<String> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if is_gnome_wallpaper_desktop(&desktop) {
+        return gsettings_wallpaper_uri("picture-uri");
+    }
+    if desktop.as_str() == "XFCE" {
+        return xfce_wallpaper_path();
+    }
+    bail!("unsupported desktop for wallpaper removal: {}", desktop)
+}
+
+fn set_wallpaper_path(path: &str) -> ResultType<()> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if is_gnome_wallpaper_desktop(&desktop) {
+        return set_gsettings_wallpaper_uri("picture-uri", path);
+    }
+    if desktop.as_str() == "XFCE" {
+        return set_xfce_wallpaper_path(path);
+    }
+    bail!("unsupported desktop for wallpaper removal: {}", desktop)
+}
+
 impl WallPaperRemover {
     pub fn new() -> ResultType<Self> {
         let start = std::time::Instant::now();
-        let old_path = wallpaper::get().map_err(|e| anyhow!(e.to_string()))?;
-        let old_path_dark = wallpaper::get_dark().ok();
+        let old_path = wallpaper_path()?;
+        let old_path_dark = gsettings_wallpaper_uri("picture-uri-dark").ok();
         if old_path.is_empty() && old_path_dark.clone().unwrap_or_default().is_empty() {
             bail!("already solid color");
         }
-        wallpaper::set_from_path("").map_err(|e| anyhow!(e.to_string()))?;
-        wallpaper::set_dark_from_path("").ok();
+        set_wallpaper_path("")?;
+        set_gsettings_wallpaper_uri("picture-uri-dark", "").ok();
         log::info!(
             "created wallpaper remover,  old_path: {:?}, old_path_dark: {:?}, elapsed: {:?}",
             old_path,
@@ -2049,8 +2380,8 @@ impl WallPaperRemover {
 
     pub fn support() -> bool {
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-        if wallpaper::gnome::is_compliant(&desktop) || desktop.as_str() == "XFCE" {
-            return wallpaper::get().is_ok();
+        if is_gnome_wallpaper_desktop(&desktop) || desktop.as_str() == "XFCE" {
+            return wallpaper_path().is_ok();
         }
         false
     }
@@ -2058,10 +2389,12 @@ impl WallPaperRemover {
 
 impl Drop for WallPaperRemover {
     fn drop(&mut self) {
-        allow_err!(wallpaper::set_from_path(&self.old_path).map_err(|e| anyhow!(e.to_string())));
+        allow_err!(set_wallpaper_path(&self.old_path));
         if let Some(old_path_dark) = &self.old_path_dark {
-            allow_err!(wallpaper::set_dark_from_path(old_path_dark.as_str())
-                .map_err(|e| anyhow!(e.to_string())));
+            allow_err!(set_gsettings_wallpaper_uri(
+                "picture-uri-dark",
+                old_path_dark.as_str()
+            ));
         }
     }
 }

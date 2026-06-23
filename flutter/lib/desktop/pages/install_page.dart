@@ -65,22 +65,16 @@ class _InstallPageBodyState extends State<_InstallPageBody>
   late final TextEditingController controller;
   final RxBool startmenu = true.obs;
   final RxBool desktopicon = true.obs;
-  final RxBool printer = true.obs;
+  final RxBool printer = false.obs;
   final RxBool showProgress = false.obs;
   final RxBool btnEnabled = true.obs;
-
-  // todo move to theme.
-  final buttonStyle = OutlinedButton.styleFrom(
-    textStyle: TextStyle(fontSize: 14, fontWeight: FontWeight.normal),
-    padding: EdgeInsets.symmetric(vertical: 15, horizontal: 12),
-  );
 
   _InstallPageBodyState() {
     controller = TextEditingController(text: bind.installInstallPath());
     final installOptions = jsonDecode(bind.installInstallOptions());
     startmenu.value = installOptions['STARTMENUSHORTCUTS'] != '0';
     desktopicon.value = installOptions['DESKTOPSHORTCUTS'] != '0';
-    printer.value = installOptions['PRINTER'] != '0';
+    printer.value = installOptions['PRINTER'] == '1';
   }
 
   @override
@@ -106,7 +100,7 @@ class _InstallPageBodyState extends State<_InstallPageBody>
   InkWell Option(RxBool option, {String label = ''}) {
     return InkWell(
       // todo mouseCursor: "SystemMouseCursors.forbidden" or no cursor on btnEnabled == false
-      borderRadius: BorderRadius.circular(6),
+      borderRadius: BorderRadius.circular(4.0),
       onTap: () => btnEnabled.value ? option.value = !option.value : null,
       child: Row(
         children: [
@@ -153,9 +147,9 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                   ),
                   Obx(
                     () => OutlinedButton.icon(
-                      icon: Icon(Icons.folder_outlined, size: 16),
+                      icon: MyTheme.desktopButtonIcon(
+                          Icon(Icons.folder_outlined, size: 16)),
                       onPressed: btnEnabled.value ? selectInstallPath : null,
-                      style: buttonStyle,
                       label: Text(translate('Change Path')),
                     ),
                   )
@@ -172,7 +166,7 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                     color: isDarkTheme
                         ? Color.fromARGB(135, 87, 87, 90)
                         : Colors.grey[100],
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(4.0),
                     border: Border.all(color: Colors.grey),
                   ),
                   child: Row(
@@ -205,43 +199,54 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                       )
                     ],
                   )).marginSymmetric(vertical: 2 * em),
-              Row(
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Expanded(
-                    // NOT use Offstage to wrap LinearProgressIndicator
+                  // Reserve progress row height so the button row does not jump.
+                  SizedBox(
+                    height: 16,
                     child: Obx(() => showProgress.value
-                        ? LinearProgressIndicator().marginOnly(right: 10)
-                        : Offstage()),
+                        ? const Align(
+                            alignment: Alignment.topCenter,
+                            child: LinearProgressIndicator(),
+                          )
+                        : const SizedBox.shrink()),
                   ),
-                  Obx(
-                    () => OutlinedButton.icon(
-                      icon: Icon(Icons.close_rounded, size: 16),
-                      label: Text(translate('Cancel')),
-                      onPressed:
-                          btnEnabled.value ? () => windowManager.close() : null,
-                      style: buttonStyle,
-                    ).marginOnly(right: 10),
-                  ),
-                  Obx(
-                    () => ElevatedButton.icon(
-                      icon: Icon(Icons.done_rounded, size: 16),
-                      label: Text(translate('Accept and Install')),
-                      onPressed: btnEnabled.value ? install : null,
-                      style: buttonStyle,
-                    ),
-                  ),
-                  Offstage(
-                    offstage: bind.installShowRunWithoutInstall(),
-                    child: Obx(
-                      () => OutlinedButton.icon(
-                        icon: Icon(Icons.screen_share_outlined, size: 16),
-                        label: Text(translate('Run without install')),
-                        onPressed: btnEnabled.value
-                            ? () => bind.installRunWithoutInstall()
-                            : null,
-                        style: buttonStyle,
-                      ).marginOnly(left: 10),
-                    ),
+                  Row(
+                    children: [
+                      Obx(
+                        () => ElevatedButton.icon(
+                          icon: MyTheme.desktopButtonIcon(
+                              Icon(Icons.done_rounded, size: 16)),
+                          label: Text(translate('Accept and Install')),
+                          onPressed: btnEnabled.value ? install : null,
+                        ),
+                      ),
+                      Offstage(
+                        offstage: bind.installShowRunWithoutInstall(),
+                        child: Obx(
+                          () => OutlinedButton.icon(
+                            icon: MyTheme.desktopButtonIcon(
+                                Icon(Icons.screen_share_outlined, size: 16)),
+                            label: Text(translate('Run without install')),
+                            onPressed: btnEnabled.value
+                                ? () => bind.installRunWithoutInstall()
+                                : null,
+                          ).marginOnly(left: 10),
+                        ),
+                      ),
+                      Spacer(),
+                      Obx(
+                        () => OutlinedButton.icon(
+                          icon: MyTheme.desktopButtonIcon(
+                              Icon(Icons.close_rounded, size: 16)),
+                          label: Text(translate('Cancel')),
+                          onPressed: btnEnabled.value
+                              ? () => windowManager.close()
+                              : null,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               )

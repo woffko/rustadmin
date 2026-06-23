@@ -58,7 +58,7 @@ pub enum GrabState {
 pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Output = ()>;
 
 // the executable name of the portable version
-pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
+pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTADMIN_APPNAME";
 
 pub const PLATFORM_WINDOWS: &str = "Windows";
 pub const PLATFORM_LINUX: &str = "Linux";
@@ -715,9 +715,11 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>, boo
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let (mut a, mut b) = get_rendezvous_server_(ms_timeout).await;
     #[cfg(windows)]
-    if let Ok(lic) = crate::platform::get_license_from_exe_name() {
-        if !lic.host.is_empty() {
-            a = lic.host;
+    if Config::allow_id_relay_server() {
+        if let Ok(lic) = crate::platform::get_license_from_exe_name() {
+            if !lic.host.is_empty() {
+                a = lic.host;
+            }
         }
     }
     let mut b: Vec<String> = b
@@ -882,7 +884,7 @@ pub fn hostname() -> String {
 
 #[inline]
 pub fn get_sysinfo() -> serde_json::Value {
-    use hbb_common::sysinfo::System;
+    use hbb_common::sysinfo::{CpuExt, System, SystemExt};
     let mut system = System::new();
     system.refresh_memory();
     system.refresh_cpu();
@@ -941,7 +943,11 @@ pub fn resolve_trusted_relay_server(
     rendezvous_server: &str,
     provided_by_rendezvous_server: &str,
 ) -> String {
-    let configured_relay_server = Config::get_option(keys::OPTION_RELAY_SERVER);
+    let configured_relay_server = if Config::allow_id_relay_server() {
+        Config::get_option(keys::OPTION_RELAY_SERVER)
+    } else {
+        String::new()
+    };
     if !configured_relay_server.is_empty() {
         return check_port(configured_relay_server, RELAY_PORT);
     }
@@ -1074,7 +1080,7 @@ pub fn get_full_name() -> String {
     format!(
         "{}.{}",
         hbb_common::config::ORG.read().unwrap(),
-        hbb_common::config::APP_NAME.read().unwrap(),
+        hbb_common::config::APP_NAME.read().unwrap().to_lowercase(),
     )
 }
 
@@ -1083,6 +1089,9 @@ pub fn is_setup(name: &str) -> bool {
 }
 
 pub fn get_custom_rendezvous_server(custom: String) -> String {
+    if !Config::allow_id_relay_server() {
+        return "".to_owned();
+    }
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
         if !lic.host.is_empty() {
@@ -1105,6 +1114,9 @@ pub fn get_custom_rendezvous_server(custom: String) -> String {
 #[inline]
 pub fn get_api_server(api: String, custom: String) -> String {
     if Config::no_register_device() {
+        return "".to_owned();
+    }
+    if !Config::allow_id_relay_server() {
         return "".to_owned();
     }
     let mut res = get_api_server_(api, custom);
@@ -1163,9 +1175,18 @@ const TRUST_PHRASE_WORDS: [&str; 64] = [
 const SECURE_SIGNED_ID_V2_MAGIC: &[u8; 8] = b"RDSECV2\0";
 const DIRECT_SIGNED_ID_V2_MAGIC: &[u8; 8] = b"RDDIRV2\0";
 const DIRECT_PUBLIC_KEY_V2_MAGIC: &[u8; 8] = b"RDPUBV2\0";
+const DIRECT_PUBLIC_KEY_V3_MAGIC: &[u8; 8] = b"RDPUBV3\0";
 const DIRECT_HANDSHAKE_ACK_OK: &[u8] = b"direct-ok";
 const DIRECT_HANDSHAKE_FLAG_PAIRING_REQUIRED: u8 = 0x01;
+const DIRECT_HANDSHAKE_FLAG_PAIRED_VIEWER_IDENTITY: u8 = 0x02;
+const DIRECT_PUBLIC_KEY_FLAG_PAIRING_PROOF: u8 = 0x01;
+const DIRECT_PUBLIC_KEY_FLAG_INITIATOR_ID: u8 = 0x02;
 const DIRECT_PAIRING_PROOF_LEN: usize = 32;
+pub const DIRECT_PAIRING_SCOPE: &str = "direct";
+pub const RENDEZVOUS_PAIRING_SCOPE: &str = "rendezvous";
+const PEER_OPTION_DIRECT_PAIRED_VIEWER_CONFIRMED: &str = "direct-paired-viewer-confirmed";
+const PEER_OPTION_RENDEZVOUS_PAIRED_VIEWER_CONFIRMED: &str = "rendezvous-paired-viewer-confirmed";
+const PAIRED_VIEWER_CONFIRMATION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectSignedId {
@@ -1174,6 +1195,7 @@ pub struct DirectSignedId {
     pub box_pk: [u8; 32],
     pub pairing_required: bool,
     pub pairing_salt: Option<[u8; argon2id13::SALTBYTES]>,
+    pub supports_paired_viewer_identity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1182,15 +1204,27 @@ pub struct SecureSignedId {
     pub box_pk: [u8; 32],
     pub pairing_required: bool,
     pub pairing_salt: Option<[u8; argon2id13::SALTBYTES]>,
+    pub supports_paired_viewer_identity: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectPublicKeyPayload {
+    pub pairing_proof: Option<[u8; DIRECT_PAIRING_PROOF_LEN]>,
+    pub initiator: Option<DirectSignedId>,
+    pub symmetric_value: Vec<u8>,
 }
 
 pub fn get_network_mode_info() -> NetworkModeInfo {
     let rendezvous_server = Config::get_rendezvous_server();
-    let relay_server = get_option(keys::OPTION_RELAY_SERVER);
+    let relay_server = if Config::allow_id_relay_server() {
+        get_option(keys::OPTION_RELAY_SERVER)
+    } else {
+        String::new()
+    };
     let api_server = get_effective_api_server();
     let trust_phrase = fingerprint_to_trust_phrase(&crate::ui_interface::get_fingerprint());
     let direct_endpoints = get_direct_access_endpoints();
-    let pairing_required = has_direct_access_pairing_passphrase();
+    let pairing_required = has_effective_direct_access_pairing_passphrase();
     let detail = if !rendezvous_server.is_empty() {
         rendezvous_server
     } else if !relay_server.is_empty() {
@@ -1251,6 +1285,19 @@ pub fn has_direct_access_pairing_passphrase() -> bool {
 #[inline]
 pub fn get_peer_pairing_passphrase() -> String {
     Config::get_option(keys::OPTION_PEER_PAIRING_PASSPHRASE)
+}
+
+pub fn get_effective_direct_access_pairing_passphrase() -> String {
+    let direct = get_direct_access_pairing_passphrase();
+    if !direct.is_empty() {
+        return direct;
+    }
+    get_peer_pairing_passphrase()
+}
+
+#[inline]
+pub fn has_effective_direct_access_pairing_passphrase() -> bool {
+    !get_effective_direct_access_pairing_passphrase().is_empty()
 }
 
 #[inline]
@@ -1366,11 +1413,23 @@ pub fn is_safe_rendezvous_peer_hint(addr: SocketAddr, is_local_hint: bool) -> bo
 }
 
 #[inline]
-fn format_direct_access_endpoint(ip: IpAddr, port: i32) -> String {
+pub fn format_direct_access_endpoint(ip: IpAddr, port: i32) -> String {
     match ip {
         IpAddr::V4(ip) => format!("{ip}:{port}"),
         IpAddr::V6(ip) => format!("[{ip}]:{port}"),
     }
+}
+
+pub fn direct_access_endpoint_for_peer_ip(endpoints: &[String], peer_ip: IpAddr) -> Option<String> {
+    let peer_ip = hbb_common::try_into_v4(SocketAddr::new(peer_ip, 0)).ip();
+    endpoints.iter().find_map(|endpoint| {
+        let addr = endpoint.parse::<SocketAddr>().ok()?;
+        let addr = hbb_common::try_into_v4(addr);
+        if addr.port() == 0 || addr.ip() != peer_ip {
+            return None;
+        }
+        Some(format_direct_access_endpoint(addr.ip(), addr.port() as i32))
+    })
 }
 
 pub fn get_direct_access_endpoints() -> Vec<String> {
@@ -1534,7 +1593,8 @@ fn tcp_proxy_log_target(url: &str) -> String {
 
 #[inline]
 fn get_tcp_proxy_addr() -> String {
-    check_port(Config::get_rendezvous_server(), RENDEZVOUS_PORT)
+    socket_client::check_port_non_empty(Config::get_rendezvous_server(), RENDEZVOUS_PORT)
+        .unwrap_or_default()
 }
 
 /// Send an HTTP request via the rendezvous server's TCP proxy using protobuf.
@@ -2257,6 +2317,19 @@ fn decode_pinned_peer_signing_key(value: &str) -> ResultType<Vec<u8>> {
         .map_err(|e| anyhow!("Handshake failed: invalid pinned peer signing key: {e}"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustedPeerSigningKeyStatus {
+    Trusted,
+    Missing,
+    Changed {
+        expected_fingerprint: String,
+        actual_fingerprint: String,
+    },
+    InvalidPinnedKey {
+        reason: String,
+    },
+}
+
 fn validate_pinned_peer_signing_key(pinned_key: Option<&String>, pk: &[u8]) -> ResultType<bool> {
     let Some(pinned_key) = pinned_key.filter(|v| !v.is_empty()) else {
         return Ok(true);
@@ -2270,6 +2343,47 @@ fn validate_pinned_peer_signing_key(pinned_key: Option<&String>, pk: &[u8]) -> R
         );
     }
     Ok(false)
+}
+
+fn pinned_peer_signing_key_status(
+    pinned_key: Option<&String>,
+    pk: &[u8],
+) -> TrustedPeerSigningKeyStatus {
+    let Some(pinned_key) = pinned_key.filter(|v| !v.is_empty()) else {
+        return TrustedPeerSigningKeyStatus::Missing;
+    };
+    let expected = match decode_pinned_peer_signing_key(pinned_key) {
+        Ok(expected) => expected,
+        Err(e) => {
+            return TrustedPeerSigningKeyStatus::InvalidPinnedKey {
+                reason: e.to_string(),
+            };
+        }
+    };
+    if expected == pk {
+        return TrustedPeerSigningKeyStatus::Trusted;
+    }
+    TrustedPeerSigningKeyStatus::Changed {
+        expected_fingerprint: pk_to_fingerprint(expected),
+        actual_fingerprint: pk_to_fingerprint(pk.to_vec()),
+    }
+}
+
+fn trusted_peer_signing_key_status_error(
+    status: TrustedPeerSigningKeyStatus,
+) -> Option<hbb_common::anyhow::Error> {
+    match status {
+        TrustedPeerSigningKeyStatus::Trusted | TrustedPeerSigningKeyStatus::Missing => None,
+        TrustedPeerSigningKeyStatus::Changed {
+            expected_fingerprint,
+            actual_fingerprint,
+        } => Some(anyhow!(
+            "Handshake failed: peer identity changed (expected {}, got {})",
+            expected_fingerprint,
+            actual_fingerprint
+        )),
+        TrustedPeerSigningKeyStatus::InvalidPinnedKey { reason } => Some(anyhow!("{reason}")),
+    }
 }
 
 fn validate_bootstrap_trusted_peer_signing_key(trusted_key: &str, pk: &[u8]) -> ResultType<()> {
@@ -2289,21 +2403,39 @@ fn validate_bootstrap_trusted_peer_signing_key(trusted_key: &str, pk: &[u8]) -> 
     Ok(())
 }
 
-pub fn needs_trusted_peer_signing_key(
+pub fn trusted_peer_signing_key_status(
     peer_id: &str,
     peer_config_id: &str,
     pk: &[u8],
-) -> ResultType<bool> {
+) -> ResultType<TrustedPeerSigningKeyStatus> {
     if pk.is_empty() {
         bail!("Handshake failed: empty peer signing key");
     }
     let bootstrap_key = Config::get_bootstrap_trusted_peer_key(peer_id);
     if !bootstrap_key.is_empty() {
         validate_bootstrap_trusted_peer_signing_key(&bootstrap_key, pk)?;
-        return Ok(false);
+        return Ok(TrustedPeerSigningKeyStatus::Trusted);
     }
     let config = PeerConfig::load(peer_config_id);
-    validate_pinned_peer_signing_key(config.options.get(PEER_OPTION_PINNED_SIGNING_KEY), pk)
+    Ok(pinned_peer_signing_key_status(
+        config.options.get(PEER_OPTION_PINNED_SIGNING_KEY),
+        pk,
+    ))
+}
+
+pub fn needs_trusted_peer_signing_key(
+    peer_id: &str,
+    peer_config_id: &str,
+    pk: &[u8],
+) -> ResultType<bool> {
+    match trusted_peer_signing_key_status(peer_id, peer_config_id, pk)? {
+        TrustedPeerSigningKeyStatus::Trusted => Ok(false),
+        TrustedPeerSigningKeyStatus::Missing => Ok(true),
+        status => match trusted_peer_signing_key_status_error(status) {
+            Some(err) => Err(err),
+            None => Ok(false),
+        },
+    }
 }
 
 pub fn pin_trusted_peer_signing_key(
@@ -2323,23 +2455,14 @@ pub fn pin_trusted_peer_signing_key(
 }
 
 pub fn has_trusted_peer_signing_key(peer_id: &str, pk: &[u8]) -> ResultType<bool> {
-    if pk.is_empty() {
-        bail!("Handshake failed: empty peer signing key");
+    match trusted_peer_signing_key_status(peer_id, peer_id, pk)? {
+        TrustedPeerSigningKeyStatus::Trusted => Ok(true),
+        TrustedPeerSigningKeyStatus::Missing => Ok(false),
+        status => match trusted_peer_signing_key_status_error(status) {
+            Some(err) => Err(err),
+            None => Ok(false),
+        },
     }
-    let bootstrap_key = Config::get_bootstrap_trusted_peer_key(peer_id);
-    if !bootstrap_key.is_empty() {
-        validate_bootstrap_trusted_peer_signing_key(&bootstrap_key, pk)?;
-        return Ok(true);
-    }
-    let config = PeerConfig::load(peer_id);
-    let Some(pinned_key) = config.options.get(PEER_OPTION_PINNED_SIGNING_KEY) else {
-        return Ok(false);
-    };
-    if pinned_key.is_empty() {
-        return Ok(false);
-    }
-    validate_pinned_peer_signing_key(Some(pinned_key), pk)?;
-    Ok(true)
 }
 
 pub fn needs_pinned_peer_signing_key(peer_config_id: &str, pk: &[u8]) -> ResultType<bool> {
@@ -2368,6 +2491,40 @@ pub fn pin_peer_signing_key(peer_config_id: &str, pk: &[u8]) -> ResultType<()> {
     Ok(())
 }
 
+pub fn trust_peer_signing_key_after_pairing(
+    peer_id: &str,
+    peer_config_id: &str,
+    pk: &[u8],
+) -> ResultType<()> {
+    if pk.is_empty() {
+        bail!("Handshake failed: empty peer signing key");
+    }
+    let bootstrap_key = Config::get_bootstrap_trusted_peer_key(peer_id);
+    if !bootstrap_key.is_empty() {
+        validate_bootstrap_trusted_peer_signing_key(&bootstrap_key, pk)?;
+        return Ok(());
+    }
+    let mut config = PeerConfig::load(peer_config_id);
+    let encoded = encode_pinned_peer_signing_key(pk);
+    let previous = config.options.get(PEER_OPTION_PINNED_SIGNING_KEY);
+    if previous.map(|value| value.as_str()) != Some(encoded.as_str()) {
+        let had_previous = previous.filter(|value| !value.is_empty()).is_some();
+        config
+            .options
+            .insert(PEER_OPTION_PINNED_SIGNING_KEY.to_owned(), encoded);
+        config.store(peer_config_id);
+        if had_previous {
+            log::warn!(
+                "Replaced pinned peer signing key for {} after successful pairing",
+                peer_config_id
+            );
+        } else {
+            log::info!("Pinned peer signing key for {}", peer_config_id);
+        }
+    }
+    Ok(())
+}
+
 pub fn clear_pinned_peer_signing_key(peer_config_id: &str) -> bool {
     let mut config = PeerConfig::load(peer_config_id);
     if config
@@ -2381,6 +2538,78 @@ pub fn clear_pinned_peer_signing_key(peer_config_id: &str) -> bool {
     } else {
         false
     }
+}
+
+fn paired_viewer_confirmed_option(scope: &str) -> Option<&'static str> {
+    match scope {
+        DIRECT_PAIRING_SCOPE => Some(PEER_OPTION_DIRECT_PAIRED_VIEWER_CONFIRMED),
+        RENDEZVOUS_PAIRING_SCOPE => Some(PEER_OPTION_RENDEZVOUS_PAIRED_VIEWER_CONFIRMED),
+        _ => None,
+    }
+}
+
+fn is_paired_viewer_confirmation_current(value: &str) -> bool {
+    if value == "Y" {
+        return true;
+    }
+    let Ok(confirmed_at) = value.parse::<i64>() else {
+        return false;
+    };
+    let now = hbb_common::get_time();
+    confirmed_at > 0
+        && (confirmed_at >= now
+            || now.saturating_sub(confirmed_at) <= PAIRED_VIEWER_CONFIRMATION_TTL_MS)
+}
+
+pub fn has_confirmed_paired_viewer(scope: &str, peer_config_id: &str) -> bool {
+    let Some(option) = paired_viewer_confirmed_option(scope) else {
+        return false;
+    };
+    let config = PeerConfig::load(peer_config_id);
+    let Some(value) = config.options.get(option) else {
+        return false;
+    };
+    if value == "Y" {
+        set_confirmed_paired_viewer(scope, peer_config_id, true);
+        return true;
+    }
+    is_paired_viewer_confirmation_current(value)
+}
+
+pub fn set_confirmed_paired_viewer(scope: &str, peer_config_id: &str, confirmed: bool) {
+    let Some(option) = paired_viewer_confirmed_option(scope) else {
+        return;
+    };
+    let mut config = PeerConfig::load(peer_config_id);
+    let changed = if confirmed {
+        let value = hbb_common::get_time().to_string();
+        config
+            .options
+            .insert(option.to_owned(), value.clone())
+            .as_deref()
+            != Some(value.as_str())
+    } else {
+        config.options.remove(option).is_some()
+    };
+    if changed {
+        config.store(peer_config_id);
+    }
+}
+
+pub fn has_confirmed_direct_paired_viewer(peer_config_id: &str) -> bool {
+    has_confirmed_paired_viewer(DIRECT_PAIRING_SCOPE, peer_config_id)
+}
+
+pub fn set_confirmed_direct_paired_viewer(peer_config_id: &str, confirmed: bool) {
+    set_confirmed_paired_viewer(DIRECT_PAIRING_SCOPE, peer_config_id, confirmed);
+}
+
+pub fn has_confirmed_rendezvous_paired_viewer(peer_config_id: &str) -> bool {
+    has_confirmed_paired_viewer(RENDEZVOUS_PAIRING_SCOPE, peer_config_id)
+}
+
+pub fn set_confirmed_rendezvous_paired_viewer(peer_config_id: &str, confirmed: bool) {
+    set_confirmed_paired_viewer(RENDEZVOUS_PAIRING_SCOPE, peer_config_id, confirmed);
 }
 
 pub fn ensure_pinned_peer_signing_key(peer_config_id: &str, pk: &[u8]) -> ResultType<()> {
@@ -2446,7 +2675,7 @@ pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
         log::warn!("Can not get other process's command line arguments on macos without root");
         same_uid = true;
     }
-    use hbb_common::sysinfo::System;
+    use hbb_common::sysinfo::{ProcessExt, System, SystemExt};
     let mut sys = System::new();
     sys.refresh_processes();
     let mut path = std::env::current_exe().unwrap_or_default();
@@ -2586,7 +2815,9 @@ pub fn create_secure_signed_id_with_pairing(
     let mut signed_payload =
         Vec::with_capacity(SECURE_SIGNED_ID_V2_MAGIC.len() + 2 + pairing_salt.len() + id_pk.len());
     signed_payload.extend_from_slice(SECURE_SIGNED_ID_V2_MAGIC);
-    signed_payload.push(DIRECT_HANDSHAKE_FLAG_PAIRING_REQUIRED);
+    signed_payload.push(
+        DIRECT_HANDSHAKE_FLAG_PAIRING_REQUIRED | DIRECT_HANDSHAKE_FLAG_PAIRED_VIEWER_IDENTITY,
+    );
     signed_payload.push(pairing_salt.len() as u8);
     signed_payload.extend_from_slice(&pairing_salt);
     signed_payload.extend_from_slice(&id_pk);
@@ -2606,6 +2837,8 @@ pub fn decode_secure_signed_id(signed: &[u8], key: &sign::PublicKey) -> ResultTy
             bail!("Handshake failed: truncated secure handshake metadata");
         }
         let pairing_required = flags & DIRECT_HANDSHAKE_FLAG_PAIRING_REQUIRED != 0;
+        let supports_paired_viewer_identity =
+            flags & DIRECT_HANDSHAKE_FLAG_PAIRED_VIEWER_IDENTITY != 0;
         let pairing_salt = if pairing_required {
             if salt_len != argon2id13::SALTBYTES {
                 bail!("Handshake failed: invalid secure pairing salt length");
@@ -2625,6 +2858,7 @@ pub fn decode_secure_signed_id(signed: &[u8], key: &sign::PublicKey) -> ResultTy
             box_pk: pk,
             pairing_required,
             pairing_salt,
+            supports_paired_viewer_identity,
         });
     }
     let res = IdPk::parse_from_bytes(&verified)?;
@@ -2636,6 +2870,7 @@ pub fn decode_secure_signed_id(signed: &[u8], key: &sign::PublicKey) -> ResultTy
         box_pk: pk,
         pairing_required: false,
         pairing_salt: None,
+        supports_paired_viewer_identity: false,
     })
 }
 
@@ -2675,7 +2910,9 @@ pub fn create_direct_signed_id_with_pairing(
     .write_to_bytes()
     .unwrap_or_default();
     let mut signed_payload = Vec::with_capacity(2 + pairing_salt.len() + id_pk.len());
-    signed_payload.push(DIRECT_HANDSHAKE_FLAG_PAIRING_REQUIRED);
+    signed_payload.push(
+        DIRECT_HANDSHAKE_FLAG_PAIRING_REQUIRED | DIRECT_HANDSHAKE_FLAG_PAIRED_VIEWER_IDENTITY,
+    );
     signed_payload.push(pairing_salt.len() as u8);
     signed_payload.extend_from_slice(&pairing_salt);
     signed_payload.extend_from_slice(&id_pk);
@@ -2715,6 +2952,8 @@ pub fn decode_direct_id_pk(payload: &[u8]) -> ResultType<DirectSignedId> {
             bail!("Handshake failed: truncated direct handshake metadata");
         }
         let pairing_required = flags & DIRECT_HANDSHAKE_FLAG_PAIRING_REQUIRED != 0;
+        let supports_paired_viewer_identity =
+            flags & DIRECT_HANDSHAKE_FLAG_PAIRED_VIEWER_IDENTITY != 0;
         let pairing_salt = if pairing_required {
             if salt_len != argon2id13::SALTBYTES {
                 bail!("Handshake failed: invalid direct pairing salt length");
@@ -2735,6 +2974,7 @@ pub fn decode_direct_id_pk(payload: &[u8]) -> ResultType<DirectSignedId> {
             box_pk: pk,
             pairing_required,
             pairing_salt,
+            supports_paired_viewer_identity,
         });
     }
     if payload.len() <= sign::PUBLICKEYBYTES {
@@ -2756,6 +2996,7 @@ pub fn decode_direct_id_pk(payload: &[u8]) -> ResultType<DirectSignedId> {
         box_pk: pk,
         pairing_required: false,
         pairing_salt: None,
+        supports_paired_viewer_identity: false,
     })
 }
 
@@ -2784,12 +3025,127 @@ pub fn wrap_direct_public_key_symmetric_value(
     out.into()
 }
 
-pub fn unwrap_direct_public_key_symmetric_value(
+pub fn create_direct_public_key_initiator_id(id: &str, box_pk: &[u8]) -> ResultType<Bytes> {
+    let Some(box_pk) = get_pk(box_pk) else {
+        bail!("Handshake failed: invalid local public key length");
+    };
+    let (sign_pk, sign_sk) = get_local_signing_keypair()?;
+    Ok(create_direct_signed_id(id, box_pk, &sign_pk, &sign_sk))
+}
+
+pub fn validate_direct_public_key_initiator(
+    initiator: &DirectSignedId,
+    asymmetric_value: &[u8],
+) -> ResultType<()> {
+    let Some(box_pk) = get_pk(asymmetric_value) else {
+        bail!("Handshake failed: invalid initiator public key length");
+    };
+    if initiator.box_pk != box_pk {
+        bail!("Handshake failed: initiator identity does not match public key");
+    }
+    Ok(())
+}
+
+pub fn wrap_direct_public_key_symmetric_value_with_identity(
+    sealed_key: &[u8],
+    pairing_proof: Option<[u8; DIRECT_PAIRING_PROOF_LEN]>,
+    initiator_signed_id: Option<&[u8]>,
+) -> ResultType<Bytes> {
+    let Some(initiator_signed_id) = initiator_signed_id else {
+        return Ok(wrap_direct_public_key_symmetric_value(
+            sealed_key,
+            pairing_proof,
+        ));
+    };
+    let initiator_len = u16::try_from(initiator_signed_id.len())
+        .map_err(|_| anyhow!("Handshake failed: initiator identity too large"))?;
+    let mut flags = DIRECT_PUBLIC_KEY_FLAG_INITIATOR_ID;
+    let proof_len = if pairing_proof.is_some() {
+        flags |= DIRECT_PUBLIC_KEY_FLAG_PAIRING_PROOF;
+        DIRECT_PAIRING_PROOF_LEN
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(
+        DIRECT_PUBLIC_KEY_V3_MAGIC.len()
+            + 1
+            + proof_len
+            + std::mem::size_of::<u16>()
+            + initiator_signed_id.len()
+            + sealed_key.len(),
+    );
+    out.extend_from_slice(DIRECT_PUBLIC_KEY_V3_MAGIC);
+    out.push(flags);
+    if let Some(pairing_proof) = pairing_proof {
+        out.extend_from_slice(&pairing_proof);
+    }
+    out.extend_from_slice(&initiator_len.to_be_bytes());
+    out.extend_from_slice(initiator_signed_id);
+    out.extend_from_slice(sealed_key);
+    Ok(out.into())
+}
+
+pub fn unwrap_direct_public_key_payload(
     payload: &[u8],
     pairing_required: bool,
-) -> ResultType<(Option<[u8; DIRECT_PAIRING_PROOF_LEN]>, Vec<u8>)> {
+) -> ResultType<DirectPublicKeyPayload> {
+    if payload.starts_with(DIRECT_PUBLIC_KEY_V3_MAGIC) {
+        let mut offset = DIRECT_PUBLIC_KEY_V3_MAGIC.len();
+        if payload.len() <= offset {
+            bail!("Handshake failed: missing direct public key flags");
+        }
+        let flags = payload[offset];
+        offset += 1;
+        if flags & !(DIRECT_PUBLIC_KEY_FLAG_PAIRING_PROOF | DIRECT_PUBLIC_KEY_FLAG_INITIATOR_ID)
+            != 0
+        {
+            bail!("Handshake failed: invalid direct public key flags");
+        }
+        let pairing_proof = if flags & DIRECT_PUBLIC_KEY_FLAG_PAIRING_PROOF != 0 {
+            if payload.len() < offset + DIRECT_PAIRING_PROOF_LEN {
+                bail!("Handshake failed: truncated direct pairing proof");
+            }
+            let mut proof = [0u8; DIRECT_PAIRING_PROOF_LEN];
+            proof.copy_from_slice(&payload[offset..offset + DIRECT_PAIRING_PROOF_LEN]);
+            offset += DIRECT_PAIRING_PROOF_LEN;
+            Some(proof)
+        } else {
+            None
+        };
+        let initiator = if flags & DIRECT_PUBLIC_KEY_FLAG_INITIATOR_ID != 0 {
+            if payload.len() < offset + std::mem::size_of::<u16>() {
+                bail!("Handshake failed: missing direct initiator identity length");
+            }
+            let initiator_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+            offset += std::mem::size_of::<u16>();
+            if initiator_len == 0 || payload.len() < offset + initiator_len {
+                bail!("Handshake failed: truncated direct initiator identity");
+            }
+            let initiator = decode_direct_id_pk(&payload[offset..offset + initiator_len])
+                .map_err(|e| anyhow!("Handshake failed: invalid direct initiator identity: {e}"))?;
+            offset += initiator_len;
+            Some(initiator)
+        } else {
+            None
+        };
+        if pairing_required && pairing_proof.is_none() && initiator.is_none() {
+            bail!("Handshake failed: missing direct pairing proof");
+        }
+        if payload.len() <= offset {
+            bail!("Handshake failed: missing encrypted direct session key");
+        }
+        return Ok(DirectPublicKeyPayload {
+            pairing_proof,
+            initiator,
+            symmetric_value: payload[offset..].to_vec(),
+        });
+    }
     if !pairing_required {
-        return Ok((None, payload.to_vec()));
+        return Ok(DirectPublicKeyPayload {
+            pairing_proof: None,
+            initiator: None,
+            symmetric_value: payload.to_vec(),
+        });
     }
     let header_len = DIRECT_PUBLIC_KEY_V2_MAGIC.len() + DIRECT_PAIRING_PROOF_LEN;
     if payload.len() <= header_len || !payload.starts_with(DIRECT_PUBLIC_KEY_V2_MAGIC) {
@@ -2800,7 +3156,19 @@ pub fn unwrap_direct_public_key_symmetric_value(
         &payload[DIRECT_PUBLIC_KEY_V2_MAGIC.len()
             ..DIRECT_PUBLIC_KEY_V2_MAGIC.len() + DIRECT_PAIRING_PROOF_LEN],
     );
-    Ok((Some(proof), payload[header_len..].to_vec()))
+    Ok(DirectPublicKeyPayload {
+        pairing_proof: Some(proof),
+        initiator: None,
+        symmetric_value: payload[header_len..].to_vec(),
+    })
+}
+
+pub fn unwrap_direct_public_key_symmetric_value(
+    payload: &[u8],
+    pairing_required: bool,
+) -> ResultType<(Option<[u8; DIRECT_PAIRING_PROOF_LEN]>, Vec<u8>)> {
+    let payload = unwrap_direct_public_key_payload(payload, pairing_required)?;
+    Ok((payload.pairing_proof, payload.symmetric_value))
 }
 
 pub fn create_direct_pairing_salt() -> [u8; argon2id13::SALTBYTES] {
@@ -3915,20 +4283,32 @@ mod tests {
 
     #[test]
     fn test_get_tcp_proxy_addr_normalizes_bare_ipv6_host() {
-        struct RestoreCustomRendezvousServer(String);
+        struct RestoreServerOptions {
+            custom_rendezvous_server: String,
+            allow_id_relay_server: String,
+        }
 
-        impl Drop for RestoreCustomRendezvousServer {
+        impl Drop for RestoreServerOptions {
             fn drop(&mut self) {
                 Config::set_option(
                     keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
-                    self.0.clone(),
+                    self.custom_rendezvous_server.clone(),
+                );
+                Config::set_option(
+                    keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+                    self.allow_id_relay_server.clone(),
                 );
             }
         }
 
-        let _restore = RestoreCustomRendezvousServer(Config::get_option(
-            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
-        ));
+        let _restore = RestoreServerOptions {
+            custom_rendezvous_server: Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER),
+            allow_id_relay_server: Config::get_option(keys::OPTION_ALLOW_ID_RELAY_SERVER),
+        };
+        Config::set_option(
+            keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+            "Y".to_string(),
+        );
         Config::set_option(
             keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
             "1:2".to_string(),
@@ -3938,16 +4318,73 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_trusted_relay_server_prefers_explicit_override() {
-        struct RestoreRelayServer(String);
+    fn test_get_tcp_proxy_addr_stays_empty_without_rendezvous_server() {
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
 
-        impl Drop for RestoreRelayServer {
+        struct RestoreServerOptions {
+            custom_rendezvous_server: String,
+            allow_id_relay_server: String,
+        }
+
+        impl Drop for RestoreServerOptions {
             fn drop(&mut self) {
-                Config::set_option(keys::OPTION_RELAY_SERVER.to_string(), self.0.clone());
+                Config::set_option(
+                    keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
+                    self.custom_rendezvous_server.clone(),
+                );
+                Config::set_option(
+                    keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+                    self.allow_id_relay_server.clone(),
+                );
             }
         }
 
-        let _restore = RestoreRelayServer(Config::get_option(keys::OPTION_RELAY_SERVER));
+        let _restore = RestoreServerOptions {
+            custom_rendezvous_server: Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER),
+            allow_id_relay_server: Config::get_option(keys::OPTION_ALLOW_ID_RELAY_SERVER),
+        };
+        Config::set_option(
+            keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+            "N".to_string(),
+        );
+        Config::set_option(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
+            "".to_string(),
+        );
+
+        assert_eq!(get_tcp_proxy_addr(), "");
+    }
+
+    #[test]
+    fn test_resolve_trusted_relay_server_prefers_explicit_override() {
+        // Mutates process-wide Config state. Run the full client library suite
+        // with `-- --test-threads=1` to avoid races with other config tests.
+        struct RestoreRelayOptions {
+            relay_server: String,
+            allow_id_relay_server: String,
+        }
+
+        impl Drop for RestoreRelayOptions {
+            fn drop(&mut self) {
+                Config::set_option(
+                    keys::OPTION_RELAY_SERVER.to_string(),
+                    self.relay_server.clone(),
+                );
+                Config::set_option(
+                    keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+                    self.allow_id_relay_server.clone(),
+                );
+            }
+        }
+
+        let _restore = RestoreRelayOptions {
+            relay_server: Config::get_option(keys::OPTION_RELAY_SERVER),
+            allow_id_relay_server: Config::get_option(keys::OPTION_ALLOW_ID_RELAY_SERVER),
+        };
+        Config::set_option(
+            keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+            "Y".to_string(),
+        );
         Config::set_option(
             keys::OPTION_RELAY_SERVER.to_string(),
             "relay.override.example".to_string(),
@@ -3961,6 +4398,8 @@ mod tests {
 
     #[test]
     fn test_resolve_trusted_relay_server_ignores_server_supplied_override() {
+        // Mutates process-wide Config state. Run the full client library suite
+        // with `-- --test-threads=1` to avoid races with other config tests.
         struct RestoreRelayServer(String);
 
         impl Drop for RestoreRelayServer {
@@ -3975,6 +4414,86 @@ mod tests {
         assert_eq!(
             resolve_trusted_relay_server("hbbs.example.com:21116", "attacker.example.com:29999"),
             "hbbs.example.com:21117"
+        );
+    }
+
+    #[test]
+    fn test_network_mode_ignores_saved_servers_until_enabled() {
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+
+        struct RestoreNetworkOptions {
+            allow_id_relay_server: String,
+            custom_rendezvous_server: String,
+            relay_server: String,
+            api_server: String,
+            direct_server: String,
+        }
+
+        impl Drop for RestoreNetworkOptions {
+            fn drop(&mut self) {
+                Config::set_option(
+                    keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+                    self.allow_id_relay_server.clone(),
+                );
+                Config::set_option(
+                    keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
+                    self.custom_rendezvous_server.clone(),
+                );
+                Config::set_option(
+                    keys::OPTION_RELAY_SERVER.to_string(),
+                    self.relay_server.clone(),
+                );
+                Config::set_option(keys::OPTION_API_SERVER.to_string(), self.api_server.clone());
+                Config::set_option(
+                    keys::OPTION_DIRECT_SERVER.to_string(),
+                    self.direct_server.clone(),
+                );
+            }
+        }
+
+        let _restore = RestoreNetworkOptions {
+            allow_id_relay_server: Config::get_option(keys::OPTION_ALLOW_ID_RELAY_SERVER),
+            custom_rendezvous_server: Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER),
+            relay_server: Config::get_option(keys::OPTION_RELAY_SERVER),
+            api_server: Config::get_option(keys::OPTION_API_SERVER),
+            direct_server: Config::get_option(keys::OPTION_DIRECT_SERVER),
+        };
+
+        Config::set_option(
+            keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+            "N".to_string(),
+        );
+        Config::set_option(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
+            "127.0.0.1".to_string(),
+        );
+        Config::set_option(
+            keys::OPTION_RELAY_SERVER.to_string(),
+            "127.0.0.1:21117".to_string(),
+        );
+        Config::set_option(
+            keys::OPTION_API_SERVER.to_string(),
+            "http://127.0.0.1:21114".to_string(),
+        );
+        Config::set_option(keys::OPTION_DIRECT_SERVER.to_string(), "N".to_string());
+
+        let disabled = get_network_mode_info();
+        assert_eq!(disabled.mode, "not_configured");
+        assert!(disabled.detail.is_empty());
+        assert!(!using_public_server());
+        assert!(get_effective_api_server().is_empty());
+
+        Config::set_option(
+            keys::OPTION_ALLOW_ID_RELAY_SERVER.to_string(),
+            "Y".to_string(),
+        );
+
+        let enabled = get_network_mode_info();
+        assert_eq!(enabled.mode, "private_server");
+        assert_eq!(enabled.detail, format!("127.0.0.1:{RENDEZVOUS_PORT}"));
+        assert_eq!(
+            get_effective_api_server(),
+            format!("http://127.0.0.1:{}", RENDEZVOUS_PORT - 2)
         );
     }
 
@@ -4170,6 +4689,51 @@ mod tests {
     }
 
     #[test]
+    fn test_trusted_peer_signing_key_status_reports_repairable_pin_errors() {
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+        let peer_id = format!("trusted-peer-{}", Uuid::new_v4());
+        let trusted_pk = [7u8; 32];
+        let changed_pk = [8u8; 32];
+        PeerConfig::remove(&peer_id);
+
+        assert_eq!(
+            trusted_peer_signing_key_status(&peer_id, &peer_id, &trusted_pk).unwrap(),
+            TrustedPeerSigningKeyStatus::Missing
+        );
+
+        pin_trusted_peer_signing_key(&peer_id, &peer_id, &trusted_pk).unwrap();
+        assert_eq!(
+            trusted_peer_signing_key_status(&peer_id, &peer_id, &trusted_pk).unwrap(),
+            TrustedPeerSigningKeyStatus::Trusted
+        );
+        match trusted_peer_signing_key_status(&peer_id, &peer_id, &changed_pk).unwrap() {
+            TrustedPeerSigningKeyStatus::Changed {
+                expected_fingerprint,
+                actual_fingerprint,
+            } => {
+                assert_eq!(expected_fingerprint, pk_to_fingerprint(trusted_pk.to_vec()));
+                assert_eq!(actual_fingerprint, pk_to_fingerprint(changed_pk.to_vec()));
+            }
+            status => panic!("unexpected status: {status:?}"),
+        }
+
+        let mut config = PeerConfig::load(&peer_id);
+        config.options.insert(
+            PEER_OPTION_PINNED_SIGNING_KEY.to_owned(),
+            "not-base64".to_owned(),
+        );
+        config.store(&peer_id);
+        match trusted_peer_signing_key_status(&peer_id, &peer_id, &changed_pk).unwrap() {
+            TrustedPeerSigningKeyStatus::InvalidPinnedKey { reason } => {
+                assert!(reason.contains("invalid pinned peer signing key"));
+            }
+            status => panic!("unexpected status: {status:?}"),
+        }
+
+        PeerConfig::remove(&peer_id);
+    }
+
+    #[test]
     fn test_validate_bootstrap_trusted_peer_signing_key() {
         let pk = vec![1u8, 2, 3, 4];
         let encoded = encode_pinned_peer_signing_key(&pk);
@@ -4192,6 +4756,7 @@ mod tests {
         assert_eq!(decoded.box_pk, box_pk.0);
         assert!(!decoded.pairing_required);
         assert!(decoded.pairing_salt.is_none());
+        assert!(!decoded.supports_paired_viewer_identity);
     }
 
     #[test]
@@ -4207,6 +4772,35 @@ mod tests {
         assert_eq!(decoded.box_pk, box_pk.0);
         assert!(decoded.pairing_required);
         assert_eq!(decoded.pairing_salt, Some(salt));
+        assert!(decoded.supports_paired_viewer_identity);
+    }
+
+    #[test]
+    fn test_decode_direct_signed_id_without_paired_viewer_capability() {
+        let (sign_pk, sign_sk) = sign::gen_keypair();
+        let (box_pk, _) = box_::gen_keypair();
+        let salt = create_direct_pairing_salt();
+        let id_pk = IdPk {
+            id: "peer-id".to_owned(),
+            pk: Bytes::from(box_pk.0.to_vec()),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap_or_default();
+        let mut signed_payload = Vec::with_capacity(2 + salt.len() + id_pk.len());
+        signed_payload.push(DIRECT_HANDSHAKE_FLAG_PAIRING_REQUIRED);
+        signed_payload.push(salt.len() as u8);
+        signed_payload.extend_from_slice(&salt);
+        signed_payload.extend_from_slice(&id_pk);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(DIRECT_SIGNED_ID_V2_MAGIC);
+        payload.extend_from_slice(&sign_pk.0);
+        payload.extend_from_slice(&sign::sign(&signed_payload, &sign_sk));
+
+        let decoded = decode_direct_id_pk(&payload).unwrap();
+        assert!(decoded.pairing_required);
+        assert_eq!(decoded.pairing_salt, Some(salt));
+        assert!(!decoded.supports_paired_viewer_identity);
     }
 
     #[test]
@@ -4220,6 +4814,43 @@ mod tests {
         assert_eq!(decoded.box_pk, box_pk.0);
         assert!(decoded.pairing_required);
         assert_eq!(decoded.pairing_salt, Some(salt));
+        assert!(decoded.supports_paired_viewer_identity);
+    }
+
+    #[test]
+    fn test_confirmed_paired_viewer_state_expires_by_scope() {
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+        let peer_config_id = format!("paired-viewer-{}", Uuid::new_v4());
+        let expired_at = hbb_common::get_time() - PAIRED_VIEWER_CONFIRMATION_TTL_MS - 1;
+
+        let mut config = PeerConfig::load(&peer_config_id);
+        config.options.insert(
+            PEER_OPTION_RENDEZVOUS_PAIRED_VIEWER_CONFIRMED.to_owned(),
+            expired_at.to_string(),
+        );
+        config.store(&peer_config_id);
+        assert!(!has_confirmed_rendezvous_paired_viewer(&peer_config_id));
+
+        let mut config = PeerConfig::load(&peer_config_id);
+        config.options.insert(
+            PEER_OPTION_DIRECT_PAIRED_VIEWER_CONFIRMED.to_owned(),
+            "Y".to_owned(),
+        );
+        config.store(&peer_config_id);
+        assert!(has_confirmed_direct_paired_viewer(&peer_config_id));
+        let migrated = PeerConfig::load(&peer_config_id)
+            .options
+            .get(PEER_OPTION_DIRECT_PAIRED_VIEWER_CONFIRMED)
+            .cloned()
+            .unwrap_or_default();
+        assert_ne!(migrated, "Y");
+
+        set_confirmed_rendezvous_paired_viewer(&peer_config_id, true);
+        assert!(has_confirmed_rendezvous_paired_viewer(&peer_config_id));
+        set_confirmed_rendezvous_paired_viewer(&peer_config_id, false);
+        assert!(!has_confirmed_rendezvous_paired_viewer(&peer_config_id));
+
+        PeerConfig::remove(&peer_config_id);
     }
 
     #[test]
@@ -4260,6 +4891,30 @@ mod tests {
             unwrap_direct_public_key_symmetric_value(&wrapped, true).unwrap();
         assert_eq!(decoded_proof, Some(proof));
         assert_eq!(decoded_key, sealed_key);
+    }
+
+    #[test]
+    fn test_wrap_direct_public_key_symmetric_value_with_identity_roundtrip() {
+        let proof = [7u8; DIRECT_PAIRING_PROOF_LEN];
+        let sealed_key = vec![9u8, 8, 7, 6];
+        let (sign_pk, sign_sk) = sign::gen_keypair();
+        let box_pk = [3u8; box_::PUBLICKEYBYTES];
+        let initiator = create_direct_signed_id("viewer-id", box_pk, &sign_pk.0, &sign_sk);
+        let wrapped = wrap_direct_public_key_symmetric_value_with_identity(
+            &sealed_key,
+            Some(proof),
+            Some(&initiator),
+        )
+        .unwrap();
+        let decoded = unwrap_direct_public_key_payload(&wrapped, true).unwrap();
+        assert_eq!(decoded.pairing_proof, Some(proof));
+        assert_eq!(decoded.symmetric_value, sealed_key);
+
+        let initiator = decoded.initiator.unwrap();
+        assert_eq!(initiator.id, "viewer-id");
+        assert_eq!(initiator.sign_pk, sign_pk.0);
+        assert_eq!(initiator.box_pk, box_pk);
+        validate_direct_public_key_initiator(&initiator, &box_pk).unwrap();
     }
 
     #[test]
@@ -4405,6 +5060,50 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_direct_pairing_passphrase_falls_back_to_peer_pairing() {
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+        let saved_direct = Config::get_option(keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE);
+        let saved_peer = Config::get_option(keys::OPTION_PEER_PAIRING_PASSPHRASE);
+
+        Config::set_option(
+            keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned(),
+            "direct-secret".to_owned(),
+        );
+        Config::set_option(
+            keys::OPTION_PEER_PAIRING_PASSPHRASE.to_owned(),
+            "peer-secret".to_owned(),
+        );
+        assert_eq!(
+            get_effective_direct_access_pairing_passphrase(),
+            "direct-secret"
+        );
+        assert!(has_effective_direct_access_pairing_passphrase());
+
+        Config::set_option(
+            keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned(),
+            "".to_owned(),
+        );
+        assert_eq!(
+            get_effective_direct_access_pairing_passphrase(),
+            "peer-secret"
+        );
+        assert!(has_effective_direct_access_pairing_passphrase());
+
+        Config::set_option(
+            keys::OPTION_PEER_PAIRING_PASSPHRASE.to_owned(),
+            "".to_owned(),
+        );
+        assert_eq!(get_effective_direct_access_pairing_passphrase(), "");
+        assert!(!has_effective_direct_access_pairing_passphrase());
+
+        Config::set_option(
+            keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned(),
+            saved_direct,
+        );
+        Config::set_option(keys::OPTION_PEER_PAIRING_PASSPHRASE.to_owned(), saved_peer);
+    }
+
+    #[test]
     fn test_trusted_peer_signing_key_flow_is_fail_closed() {
         let _guard = TEST_CONFIG_LOCK.lock().unwrap();
         let peer_id = format!("trusted-peer-{}", Uuid::new_v4());
@@ -4462,6 +5161,34 @@ mod tests {
         assert_eq!(
             format_direct_access_endpoint(IpAddr::V6("fd00::5".parse().unwrap()), 21118),
             "[fd00::5]:21118"
+        );
+    }
+
+    #[test]
+    fn test_direct_access_endpoint_for_peer_ip_prefers_observed_peer_ip() {
+        let endpoints = vec![
+            "10.0.0.5:21118".to_owned(),
+            "192.168.10.5:21118".to_owned(),
+            "[fd00::5]:21118".to_owned(),
+        ];
+
+        assert_eq!(
+            direct_access_endpoint_for_peer_ip(
+                &endpoints,
+                "192.168.10.5".parse::<IpAddr>().unwrap(),
+            ),
+            Some("192.168.10.5:21118".to_owned())
+        );
+        assert_eq!(
+            direct_access_endpoint_for_peer_ip(&endpoints, "fd00::5".parse::<IpAddr>().unwrap()),
+            Some("[fd00::5]:21118".to_owned())
+        );
+        assert_eq!(
+            direct_access_endpoint_for_peer_ip(
+                &endpoints,
+                "192.168.10.6".parse::<IpAddr>().unwrap(),
+            ),
+            None
         );
     }
 

@@ -102,6 +102,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
           switchUuid: params['switch_uuid'],
           forceRelay: params['forceRelay'],
           isSharedPassword: params['isSharedPassword'],
+          pendingCachedPeerData: params['pending_cached_peer_data'],
         ),
       ));
       _update_remote_count();
@@ -475,6 +476,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
           switchUuid: switchUuid,
           forceRelay: args['forceRelay'],
           isSharedPassword: args['isSharedPassword'],
+          pendingCachedPeerData: args['pending_cached_peer_data'],
         ),
       ));
     } else if (call.method == kWindowDisableGrabKeyboard) {
@@ -486,6 +488,10 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
     } else if (call.method == kWindowEventActiveSession) {
       final jumpOk = tabController.jumpToByKey(call.arguments);
       if (jumpOk) {
+        final page = tabController.widget(call.arguments);
+        if (page is RemotePage) {
+          page.reconnectIfStaleOnActivation();
+        }
         windowOnTop(windowId());
       }
       return jumpOk;
@@ -596,7 +602,7 @@ class _RelativeMouseModeHint extends StatelessWidget {
         margin: const EdgeInsets.only(right: 8),
         decoration: BoxDecoration(
           color: Colors.orange.withOpacity(0.2),
-          borderRadius: BorderRadius.circular(4),
+          borderRadius: BorderRadius.circular(4.0),
           border: Border.all(color: Colors.orange.withOpacity(0.5)),
         ),
         child: Row(

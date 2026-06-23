@@ -294,6 +294,38 @@ class MyTheme {
   // TextButton
   // Value is used to calculate "dialog.actionsPadding"
   static const double mobileTextButtonPaddingLR = 20;
+  static const double desktopButtonTargetHeight = 34.0;
+  static const double desktopButtonContentOffsetY = -2.5;
+  static const double desktopButtonIconOffsetY = 1.0;
+  // VisualDensity.compact subtracts 8 px from button constraints on desktop.
+  static const double desktopButtonMinimumHeight =
+      desktopButtonTargetHeight + 8.0;
+  static const TextStyle desktopButtonTextStyle = TextStyle(
+    fontSize: 16.0,
+    height: 1.0,
+    leadingDistribution: TextLeadingDistribution.even,
+  );
+  static const TextStyle desktopButtonTextStyleBold = TextStyle(
+    fontSize: 16.0,
+    fontWeight: FontWeight.bold,
+    height: 1.0,
+    leadingDistribution: TextLeadingDistribution.even,
+  );
+
+  static Widget desktopButtonForegroundBuilder(
+      BuildContext context, Set<WidgetState> states, Widget? child) {
+    return Transform.translate(
+      offset: const Offset(0, desktopButtonContentOffsetY),
+      child: child,
+    );
+  }
+
+  static Widget desktopButtonIcon(Widget icon) {
+    return Transform.translate(
+      offset: const Offset(0, desktopButtonIconOffsetY),
+      child: icon,
+    );
+  }
 
   // TextButton on mobile needs a fixed padding, otherwise small buttons
   // like "OK" has a larger left/right padding.
@@ -301,7 +333,7 @@ class MyTheme {
     style: TextButton.styleFrom(
       padding: EdgeInsets.symmetric(horizontal: mobileTextButtonPaddingLR),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8.0),
+        borderRadius: BorderRadius.circular(4.0),
       ),
     ),
   );
@@ -380,10 +412,10 @@ class MyTheme {
     appBarTheme: AppBarTheme(
       shadowColor: Colors.transparent,
     ),
-    dialogTheme: DialogThemeData(
+    dialogTheme: DialogTheme(
       elevation: 15,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(18.0),
+        borderRadius: BorderRadius.circular(4.0),
         side: BorderSide(
           width: 1,
           color: grayBg,
@@ -397,7 +429,7 @@ class MyTheme {
             filled: true,
             isDense: true,
             border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(4.0),
             ),
           )
         : null,
@@ -411,7 +443,7 @@ class MyTheme {
     cardColor: grayBg,
     hintColor: Color(0xFFAAAAAA),
     visualDensity: VisualDensity.adaptivePlatformDensity,
-    tabBarTheme: const TabBarThemeData(
+    tabBarTheme: const TabBarTheme(
       labelColor: Colors.black87,
     ),
     tooltipTheme: tooltipTheme(),
@@ -421,9 +453,12 @@ class MyTheme {
     textButtonTheme: (isDesktop || isWebDesktop)
         ? TextButtonThemeData(
             style: TextButton.styleFrom(
+              textStyle: desktopButtonTextStyle,
+              minimumSize: const Size(64, desktopButtonMinimumHeight),
+              foregroundBuilder: desktopButtonForegroundBuilder,
               splashFactory: NoSplash.splashFactory,
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(18.0),
+                borderRadius: BorderRadius.circular(4.0),
               ),
             ),
           )
@@ -431,8 +466,11 @@ class MyTheme {
     elevatedButtonTheme: ElevatedButtonThemeData(
       style: ElevatedButton.styleFrom(
         backgroundColor: MyTheme.accent,
+        textStyle: desktopButtonTextStyle,
+        minimumSize: const Size(64, desktopButtonMinimumHeight),
+        foregroundBuilder: desktopButtonForegroundBuilder,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8.0),
+          borderRadius: BorderRadius.circular(4.0),
         ),
       ),
     ),
@@ -440,8 +478,11 @@ class MyTheme {
       style: OutlinedButton.styleFrom(
         backgroundColor: grayBg,
         foregroundColor: Colors.black87,
+        textStyle: desktopButtonTextStyle,
+        minimumSize: const Size(64, desktopButtonMinimumHeight),
+        foregroundBuilder: desktopButtonForegroundBuilder,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8.0),
+          borderRadius: BorderRadius.circular(4.0),
         ),
       ),
     ),
@@ -461,7 +502,7 @@ class MyTheme {
               color: (isDesktop || isWebDesktop)
                   ? Color(0xFFECECEC)
                   : Colors.transparent),
-          borderRadius: BorderRadius.all(Radius.circular(8.0)),
+          borderRadius: BorderRadius.all(Radius.circular(4.0)),
         )),
   ).copyWith(
     extensions: <ThemeExtension<dynamic>>[
@@ -478,10 +519,10 @@ class MyTheme {
     appBarTheme: AppBarTheme(
       shadowColor: Colors.transparent,
     ),
-    dialogTheme: DialogThemeData(
+    dialogTheme: DialogTheme(
       elevation: 15,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(18.0),
+        borderRadius: BorderRadius.circular(4.0),
         side: BorderSide(
           width: 1,
           color: Color(0xFF24252B),
@@ -495,7 +536,7 @@ class MyTheme {
             filled: true,
             isDense: true,
             border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(4.0),
             ),
           )
         : null,
@@ -512,7 +553,7 @@ class MyTheme {
     ),
     cardColor: Color(0xFF24252B),
     visualDensity: VisualDensity.adaptivePlatformDensity,
-    tabBarTheme: const TabBarThemeData(
+    tabBarTheme: const TabBarTheme(
       labelColor: Colors.white70,
     ),
     tooltipTheme: tooltipTheme(),
@@ -522,11 +563,14 @@ class MyTheme {
     textButtonTheme: (isDesktop || isWebDesktop)
         ? TextButtonThemeData(
             style: TextButton.styleFrom(
+              textStyle: desktopButtonTextStyleBold,
+              minimumSize: const Size(64, desktopButtonMinimumHeight),
+              foregroundBuilder: desktopButtonForegroundBuilder,
               splashFactory: NoSplash.splashFactory,
               disabledForegroundColor: Colors.white70,
               foregroundColor: Colors.white70,
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(18.0),
+                borderRadius: BorderRadius.circular(4.0),
               ),
             ),
           )
@@ -537,8 +581,11 @@ class MyTheme {
         foregroundColor: Colors.white,
         disabledForegroundColor: Colors.white70,
         disabledBackgroundColor: Colors.white10,
+        textStyle: desktopButtonTextStyleBold,
+        minimumSize: const Size(64, desktopButtonMinimumHeight),
+        foregroundBuilder: desktopButtonForegroundBuilder,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8.0),
+          borderRadius: BorderRadius.circular(4.0),
         ),
       ),
     ),
@@ -548,8 +595,11 @@ class MyTheme {
         side: BorderSide(color: Colors.white12, width: 0.5),
         disabledForegroundColor: Colors.white70,
         foregroundColor: Colors.white70,
+        textStyle: desktopButtonTextStyleBold,
+        minimumSize: const Size(64, desktopButtonMinimumHeight),
+        foregroundBuilder: desktopButtonForegroundBuilder,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8.0),
+          borderRadius: BorderRadius.circular(4.0),
         ),
       ),
     ),
@@ -568,7 +618,7 @@ class MyTheme {
     popupMenuTheme: PopupMenuThemeData(
         shape: RoundedRectangleBorder(
       side: BorderSide(color: Colors.white24),
-      borderRadius: BorderRadius.all(Radius.circular(8.0)),
+      borderRadius: BorderRadius.all(Radius.circular(4.0)),
     )),
   ).copyWith(
     extensions: <ThemeExtension<dynamic>>[
@@ -638,7 +688,9 @@ extension ParseToString on ThemeMode {
 }
 
 final ButtonStyle flatButtonStyle = TextButton.styleFrom(
-  minimumSize: Size(0, 36),
+  textStyle: MyTheme.desktopButtonTextStyle,
+  minimumSize: const Size(0, MyTheme.desktopButtonMinimumHeight),
+  foregroundBuilder: MyTheme.desktopButtonForegroundBuilder,
   padding: EdgeInsets.symmetric(horizontal: 16.0, vertical: 10.0),
   shape: const RoundedRectangleBorder(
     borderRadius: BorderRadius.all(Radius.circular(2.0)),
@@ -714,6 +766,9 @@ closeConnection({String? id}) {
       Navigator.popUntil(globalKey.currentContext!, ModalRoute.withName("/"));
       stateGlobal.isInMainPage = true;
     } else {
+      if (PreAuthRemoteDesktopManager.instance.closeIfPending(id: id)) {
+        return;
+      }
       final controller = Get.find<DesktopTabController>();
       controller.closeBy(id);
     }
@@ -741,7 +796,133 @@ Future<void> windowOnTop(int? id) async {
   }
 }
 
-typedef DialogBuilder = CustomAlertDialog Function(
+class PreAuthRemoteDesktopManager {
+  PreAuthRemoteDesktopManager._();
+
+  static final instance = PreAuthRemoteDesktopManager._();
+
+  FFI? _ffi;
+  String? _peerId;
+  bool _openingRemoteWindow = false;
+  bool _handedOff = false;
+
+  bool closeIfPending({String? id}) {
+    if (_ffi == null) {
+      return false;
+    }
+    if (id != null && id != _peerId) {
+      return false;
+    }
+    unawaited(closePending());
+    return true;
+  }
+
+  Future<void> closePending() async {
+    final ffi = _ffi;
+    if (ffi == null) {
+      return;
+    }
+    final closeSession = !_handedOff;
+    _ffi = null;
+    _peerId = null;
+    _openingRemoteWindow = false;
+    _handedOff = false;
+    ffi.onAuthenticated = null;
+    ffi.dialogManager.dismissAll();
+    await ffi.close(closeSession: closeSession, saveCanvasConfig: false);
+  }
+
+  Future<void> start(
+    String id, {
+    String? password,
+    bool? isSharedPassword,
+    String? switchUuid,
+    bool? forceRelay,
+  }) async {
+    if (await rustDeskWinManager.activateRemoteDesktop(id)) {
+      await closePending();
+      return;
+    }
+    await closePending();
+
+    final ffi = FFI(null);
+    _ffi = ffi;
+    _peerId = id;
+    _openingRemoteWindow = false;
+    _handedOff = false;
+    ffi.onAuthenticated = (authenticatedFfi, peerId) async {
+      await _openRemoteWindow(
+        authenticatedFfi,
+        peerId,
+        password: password,
+        isSharedPassword: isSharedPassword,
+        switchUuid: switchUuid,
+        forceRelay: forceRelay,
+      );
+    };
+
+    await windowOnTop(null);
+    ffi.dialogManager.showLoading(
+      translate('Connecting...'),
+      onCancel: () => closeIfPending(id: id),
+    );
+    ffi.start(
+      id,
+      password: password,
+      isSharedPassword: isSharedPassword,
+      switchUuid: switchUuid,
+      forceRelay: forceRelay,
+    );
+  }
+
+  Future<void> _openRemoteWindow(
+    FFI ffi,
+    String peerId, {
+    String? password,
+    bool? isSharedPassword,
+    String? switchUuid,
+    bool? forceRelay,
+  }) async {
+    if (!identical(_ffi, ffi) || _openingRemoteWindow || _handedOff) {
+      return;
+    }
+
+    _openingRemoteWindow = true;
+    final sessionId = ffi.sessionId.toString();
+    final cachedPeerData = ffi.ffiModel.cachedPeerData.toString();
+    try {
+      await rustDeskWinManager.newRemoteDesktop(
+        peerId,
+        password: password,
+        isSharedPassword: isSharedPassword,
+        switchUuid: switchUuid,
+        forceRelay: forceRelay,
+        sessionId: sessionId,
+        pendingCachedPeerData: cachedPeerData,
+      );
+      if (!identical(_ffi, ffi)) {
+        return;
+      }
+      _handedOff = true;
+      _ffi = null;
+      _peerId = null;
+      _openingRemoteWindow = false;
+      ffi.onAuthenticated = null;
+      ffi.dialogManager.dismissAll();
+      await ffi.close(closeSession: false, saveCanvasConfig: false);
+      _handedOff = false;
+    } catch (e) {
+      _openingRemoteWindow = false;
+      debugPrint('Failed to open authenticated remote window: $e');
+      if (identical(_ffi, ffi)) {
+        await closePending();
+      }
+      showToast(translate('Failed'));
+    }
+  }
+}
+
+typedef DialogBuilder = Widget Function(
     StateSetter setState, void Function([dynamic]) close, BuildContext context);
 
 class Dialog<T> {
@@ -811,6 +992,10 @@ class OverlayDialogManager {
     _dialogs[tag]?.complete(null);
     _dialogs.remove(tag);
     BackButtonInterceptor.removeByName(tag);
+  }
+
+  bool hasDialog(String tag) {
+    return _dialogs.containsKey(tag);
   }
 
   Future<T?> show<T>(DialogBuilder builder,
@@ -967,6 +1152,8 @@ class OverlayDialogManager {
   bool existing(String tag) {
     return _dialogs.keys.contains(tag);
   }
+
+  bool get hasOpenDialogs => _dialogs.isNotEmpty;
 }
 
 makeMobileActionsOverlayEntry(VoidCallback? onHide, {FFI? ffi}) {
@@ -1023,7 +1210,7 @@ void showToast(String text,
               decoration: BoxDecoration(
                 color: MyTheme.color(context).toastBg,
                 borderRadius: const BorderRadius.all(
-                  Radius.circular(20),
+                  Radius.circular(4.0),
                 ),
               ),
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 5),
@@ -1678,6 +1865,66 @@ bool isLanDiscoveryModeFixed() {
       isOptionFixed(kOptionEnableLanDiscovery);
 }
 
+String normalizeClipboardDirectionPolicy(String value) {
+  switch (value.trim().toLowerCase()) {
+    case '':
+    case 'n':
+    case kClipboardDirectionBoth:
+    case 'bidirectional':
+    case 'all':
+      return kClipboardDirectionBoth;
+    case kClipboardDirectionLocalToRemote:
+    case 'local_to_remote':
+    case 'send':
+    case 'send-only':
+    case 'outbound':
+      return kClipboardDirectionLocalToRemote;
+    case 'y':
+    case 'yes':
+    case 'true':
+    case '1':
+    case kClipboardDirectionRemoteToLocal:
+    case 'remote_to_local':
+    case 'receive':
+    case 'receive-only':
+    case 'inbound':
+      return kClipboardDirectionRemoteToLocal;
+    case kClipboardDirectionOff:
+    case 'none':
+    case 'disabled':
+      return kClipboardDirectionOff;
+    default:
+      return kClipboardDirectionOff;
+  }
+}
+
+String clipboardDirectionPolicyLabel(String policy) {
+  switch (normalizeClipboardDirectionPolicy(policy)) {
+    case kClipboardDirectionLocalToRemote:
+      return 'Send clipboard to peer only';
+    case kClipboardDirectionRemoteToLocal:
+      return 'Receive clipboard from peer only';
+    case kClipboardDirectionOff:
+      return 'Disabled';
+    default:
+      return 'Bidirectional';
+  }
+}
+
+List<String> clipboardDirectionMenuKeys() {
+  return [
+    kClipboardDirectionOff,
+    kClipboardDirectionRemoteToLocal,
+    kClipboardDirectionLocalToRemote,
+    kClipboardDirectionBoth,
+  ];
+}
+
+String sessionClipboardDirectionToggleValue(String policy) {
+  return '$kSessionToggleClipboardDirectionPrefix'
+      '${normalizeClipboardDirectionPolicy(policy)}';
+}
+
 Future<void> ensureInitialClientDefaults() async {
   if (!isOptionFixed(kOptionDirectServer) &&
       (await bind.mainGetOption(key: kOptionDirectServer)).isEmpty) {
@@ -2078,15 +2325,22 @@ Future<bool> restoreWindowPosition(WindowType type,
     }
     isRemotePeerPos = pos != null;
   }
-  pos ??= bind.getLocalFlutterOption(k: windowFramePrefix + type.name);
+  final restorePos =
+      pos ?? bind.getLocalFlutterOption(k: windowFramePrefix + type.name);
 
-  var lpos = LastWindowPosition.loadFromString(pos);
+  var lpos = LastWindowPosition.loadFromString(restorePos);
   if (lpos == null) {
     debugPrint("No window position saved, trying to center the window.");
     switch (type) {
       case WindowType.Main:
         // Center the main window only if no position is saved (on first run).
         if (isWindows || isLinux) {
+          if (isWindows) {
+            // Window restore on Windows stores physical pixels.
+            final size = await _adjustRestoreMainWindowSize(null, null);
+            await windowManager.setSize(size,
+                ignoreDevicePixelRatio: _ignoreDevicePixelRatio);
+          }
           await windowManager.center();
         }
         // For MacOS, the window is already centered by default.
@@ -2132,6 +2386,8 @@ Future<bool> restoreWindowPosition(WindowType type,
 
   switch (type) {
     case WindowType.Main:
+      final restoreMaximized = lpos.isMaximized == true &&
+          !(bind.isIncomingOnly() || bind.isOutgoingOnly());
       restorePos() async {
         if (offsetLeftTop == null) {
           await windowManager.center();
@@ -2140,13 +2396,13 @@ Future<bool> restoreWindowPosition(WindowType type,
               ignoreDevicePixelRatio: _ignoreDevicePixelRatio);
         }
       }
-      if (lpos.isMaximized == true) {
+      if (restoreMaximized) {
         await restorePos();
-        if (!(bind.isIncomingOnly() || bind.isOutgoingOnly())) {
-          await windowManager.maximize();
-        }
+        await windowManager.maximize();
       } else {
-        final storeSize = !bind.isIncomingOnly() || bind.isOutgoingOnly();
+        final storeSize = !bind.isIncomingOnly() ||
+            bind.isOutgoingOnly() ||
+            lpos.isMaximized == true;
         if (isWindows) {
           if (storeSize) {
             // We need to set the window size first to avoid the incorrect size in some special cases.
@@ -2372,7 +2628,7 @@ bool handleUriLink({List<String>? cmdArgs, Uri? uri, String? uriString}) {
     switch (type) {
       case UriLinkType.remoteDesktop:
         Future.delayed(Duration.zero, () {
-          rustDeskWinManager.newRemoteDesktop(id!,
+          PreAuthRemoteDesktopManager.instance.start(id!,
               password: password,
               switchUuid: switchUuid,
               forceRelay: forceRelay);
@@ -2443,7 +2699,7 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
               'Y';
       if (!allowDeepLinkServerSettings) {
         debugPrint(
-            "Ignore rustdesk://config because $kOptionAllowDeepLinkServerSettings is not enabled.");
+            "Ignore rustadmin://config because $kOptionAllowDeepLinkServerSettings is not enabled.");
         Timer(Duration(seconds: 1), () {
           showToast(translate('Failed'));
         });
@@ -2462,7 +2718,7 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
           bind.mainGetBuildinOption(key: kOptionAllowDeepLinkPassword) == 'Y';
       if (!allowDeepLinkPassword) {
         debugPrint(
-            "Ignore rustdesk://password because $kOptionAllowDeepLinkPassword is not enabled.");
+            "Ignore rustadmin://password because $kOptionAllowDeepLinkPassword is not enabled.");
         Timer(Duration(seconds: 1), () {
           showToast(translate('Failed'));
         });
@@ -2485,9 +2741,9 @@ List<String>? urlLinkToCmdArgs(Uri uri) {
   } else if (uri.authority.length > 2 &&
       (uri.path.length <= 1 ||
           (uri.path == '/r' || uri.path.startsWith('/r@')))) {
-    // rustdesk://<connect-id>
-    // rustdesk://<connect-id>/r
-    // rustdesk://<connect-id>/r@<server>
+    // rustadmin://<connect-id>
+    // rustadmin://<connect-id>/r
+    // rustadmin://<connect-id>/r@<server>
     command = '--connect';
     id = uri.authority;
     if (uri.path.length > 1) {
@@ -2581,7 +2837,7 @@ connectMainDesktop(String id,
         connToken: connToken,
         forceRelay: forceRelay);
   } else {
-    await rustDeskWinManager.newRemoteDesktop(id,
+    await PreAuthRemoteDesktopManager.instance.start(id,
         password: password,
         isSharedPassword: isSharedPassword,
         forceRelay: forceRelay);
@@ -2935,7 +3191,7 @@ Future<void> onActiveWindowChanged() async {
     } catch (err) {
       debugPrintStack(label: "$err");
     } finally {
-      debugPrint("Start closing RustDesk...");
+      debugPrint("Start closing RustAdmin...");
       await windowManager.setPreventClose(false);
       await windowManager.close();
       if (isMacOS) {
@@ -3015,9 +3271,15 @@ class ServerConfig {
   late String relayServer;
   late String apiServer;
   late String key;
+  bool? useIdRelayServer;
 
-  ServerConfig(
-      {String? idServer, String? relayServer, String? apiServer, String? key}) {
+  ServerConfig({
+    String? idServer,
+    String? relayServer,
+    String? apiServer,
+    String? key,
+    this.useIdRelayServer,
+  }) {
     this.idServer = idServer?.trim() ?? '';
     this.relayServer = relayServer?.trim() ?? '';
     this.apiServer = apiServer?.trim() ?? '';
@@ -3041,6 +3303,7 @@ class ServerConfig {
     relayServer = json['relay'] ?? '';
     apiServer = json['api'] ?? '';
     key = json['key'] ?? '';
+    useIdRelayServer = null;
   }
 
   /// encode to shared string
@@ -3062,7 +3325,11 @@ class ServerConfig {
       : idServer = options['custom-rendezvous-server'] ?? "",
         relayServer = options['relay-server'] ?? "",
         apiServer = options['api-server'] ?? "",
-        key = options['key'] ?? "";
+        key = options['key'] ?? "",
+        useIdRelayServer = option2bool(
+          kOptionAllowIdRelayServer,
+          options[kOptionAllowIdRelayServer] ?? "",
+        );
 }
 
 Widget dialogButton(String text,
@@ -3072,6 +3339,7 @@ Widget dialogButton(String text,
     TextStyle? style,
     ButtonStyle? buttonStyle}) {
   if (isDesktop || isWebDesktop) {
+    final desktopIcon = icon == null ? null : MyTheme.desktopButtonIcon(icon);
     if (isOutline) {
       return icon == null
           ? OutlinedButton(
@@ -3079,7 +3347,7 @@ Widget dialogButton(String text,
               child: Text(translate(text), style: style),
             )
           : OutlinedButton.icon(
-              icon: icon,
+              icon: desktopIcon!,
               onPressed: onPressed,
               label: Text(translate(text), style: style),
             );
@@ -3091,7 +3359,7 @@ Widget dialogButton(String text,
               child: Text(translate(text), style: style),
             )
           : ElevatedButton.icon(
-              icon: icon,
+              icon: desktopIcon!,
               style: ElevatedButton.styleFrom(elevation: 0).merge(buttonStyle),
               onPressed: onPressed,
               label: Text(translate(text), style: style),
@@ -3222,6 +3490,14 @@ Future<bool> canBeBlocked() async {
   if (isWeb) {
     // Web can only act as a controller, never as a controlled side,
     // so it should never be blocked by a remote session.
+    return false;
+  }
+  final shouldBlockBySessionPolicy = await bind.mainGetCommon(
+      key: "should-block-rustadmin-gui-for-active-sessions");
+  if (shouldBlockBySessionPolicy == "true") {
+    return true;
+  }
+  if (shouldBlockBySessionPolicy == "false") {
     return false;
   }
   // First check control permission
@@ -3704,6 +3980,11 @@ Future<bool> setServerConfig(
     }
   }
   final oldApiServer = await bind.mainGetApiServer();
+  final useIdRelayServer = config.useIdRelayServer;
+
+  if (useIdRelayServer == false) {
+    await mainSetBoolOption(kOptionAllowIdRelayServer, false);
+  }
 
   // should set one by one
   await bind.mainSetOption(
@@ -3711,6 +3992,9 @@ Future<bool> setServerConfig(
   await bind.mainSetOption(key: 'relay-server', value: config.relayServer);
   await bind.mainSetOption(key: 'api-server', value: config.apiServer);
   await bind.mainSetOption(key: 'key', value: config.key);
+  if (useIdRelayServer == true) {
+    await mainSetBoolOption(kOptionAllowIdRelayServer, true);
+  }
   final newApiServer = await bind.mainGetApiServer();
   if (oldApiServer.isNotEmpty &&
       oldApiServer != newApiServer &&
@@ -3762,7 +4046,7 @@ class ComboBox extends StatelessWidget {
               : MyTheme.border,
         ),
         borderRadius:
-            BorderRadius.circular(8), //border raiuds of dropdown button
+            BorderRadius.circular(4.0), //border raiuds of dropdown button
       ),
       height: 42, // should be the height of a TextField
       child: Obx(() => DropdownButton<String>(
@@ -3816,7 +4100,7 @@ Widget loadPowered(BuildContext context) {
     cursor: SystemMouseCursors.click,
     child: GestureDetector(
       onTap: () {
-        launchUrl(Uri.parse('https://rustdesk.com'));
+        launchUrl(Uri.parse('https://github.com/RustAdministrator/rustadmin'));
       },
       child: Opacity(
           opacity: 0.5,
@@ -3855,14 +4139,11 @@ Widget loadLogo() {
 }
 
 Widget loadIcon(double size) {
-  return Image.asset('assets/icon.png',
-      width: size,
-      height: size,
-      errorBuilder: (ctx, error, stackTrace) => SvgPicture.asset(
-            'assets/icon.svg',
-            width: size,
-            height: size,
-          ));
+  return SvgPicture.asset(
+    'assets/icon.svg',
+    width: size,
+    height: size,
+  );
 }
 
 var imcomingOnlyHomeSize = Size(280, 300);
@@ -4026,7 +4307,7 @@ get defaultOptionAccessMode => isCustomClient ? 'custom' : '';
 get defaultOptionApproveMode => isCustomClient ? 'password-click' : '';
 
 bool whitelistNotEmpty() {
-  // https://rustdesk.com/docs/en/self-host/client-configuration/advanced-settings/#whitelist
+  // https://github.com/RustAdministrator/rustadmin/docs/en/self-host/client-configuration/advanced-settings/#whitelist
   final v = bind.mainGetOptionSync(key: kOptionWhitelist);
   return v != '' && v != ',';
 }
@@ -4309,8 +4590,7 @@ Widget? buildAvatarWidget({
       width: size,
       height: size,
       fit: BoxFit.cover,
-      errorBuilder: (_, __, ___) =>
-          fallback ?? SizedBox.shrink(),
+      errorBuilder: (_, __, ___) => fallback ?? SizedBox.shrink(),
     ),
   );
 }

@@ -9,7 +9,6 @@ import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:settings_ui/settings_ui.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:url_launcher/url_launcher_string.dart';
 
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
@@ -34,8 +33,6 @@ class SettingsPage extends StatefulWidget implements PageShape {
   @override
   State<SettingsPage> createState() => _SettingsState();
 }
-
-const url = 'https://rustdesk.com/';
 
 enum KeepScreenOn {
   never,
@@ -79,10 +76,12 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _onlyWhiteList = false;
   var _enableDirectIPAccess = false;
   var _directAccessPairingPassphraseSet = false;
+  var _rememberPairedViewers = true;
   var _peerPairingPassphraseSet = false;
   var _enableRecordSession = false;
   var _enableHardwareCodec = false;
   var _allowWebSocket = false;
+  var _allowIdRelayServer = false;
   var _autoRecordIncomingSession = false;
   var _autoRecordOutgoingSession = false;
   var _allowAutoDisconnect = false;
@@ -118,6 +117,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     _directAccessPairingPassphraseSet = bind
         .mainGetOptionSync(key: kOptionDirectAccessPairingPassphrase)
         .isNotEmpty;
+    _rememberPairedViewers =
+        mainGetBoolOptionSync(kOptionRememberPairedViewers);
     _peerPairingPassphraseSet =
         bind.mainGetOptionSync(key: kOptionPeerPairingPassphrase).isNotEmpty;
     _enableRecordSession = option2bool(kOptionEnableRecordSession,
@@ -125,6 +126,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     _enableHardwareCodec = option2bool(kOptionEnableHwcodec,
         bind.mainGetOptionSync(key: kOptionEnableHwcodec));
     _allowWebSocket = mainGetBoolOptionSync(kOptionAllowWebSocket);
+    _allowIdRelayServer = mainGetBoolOptionSync(kOptionAllowIdRelayServer);
     _allowInsecureTlsFallback =
         mainGetBoolOptionSync(kOptionAllowInsecureTLSFallback);
     _allowUnverifiedPeerTrust =
@@ -376,8 +378,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         title: 'LAN discovery',
         list: [
           _RadioEntry('Off', kLanDiscoveryModeOff),
-          _RadioEntry(
-              'Trusted Peers Only', kLanDiscoveryModeTrustedPeersOnly),
+          _RadioEntry('Trusted Peers Only', kLanDiscoveryModeTrustedPeersOnly),
           _RadioEntry('Standard', kLanDiscoveryModeStandard),
         ],
         getter: () => _lanDiscoveryMode,
@@ -453,7 +454,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                     Offstage(
                         offstage: !_enableDirectIPAccess,
                         child: Text(
-                          '${translate("Local Address")}: $_localIP${_directAccessPort.isEmpty ? "" : ":$_directAccessPort"}${_directAccessPairingPassphraseSet ? "\nPairing passphrase: Required" : ""}',
+                          '${translate("Local Address")}: $_localIP${_directAccessPort.isEmpty ? "" : ":$_directAccessPort"}${_directAccessPairingPassphraseSet ? "\nLocal pairing passphrase: Required" : ""}',
                           style: Theme.of(context).textTheme.bodySmall,
                         )),
                   ])),
@@ -509,8 +510,30 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 setState(() {});
               },
       ),
+      if (_enableDirectIPAccess)
+        SettingsTile.switchTile(
+          title: Text(translate('Remember paired viewers')),
+          initialValue: _rememberPairedViewers,
+          onToggle: isOptionFixed(kOptionRememberPairedViewers)
+              ? null
+              : (v) async {
+                  mainSetBoolOption(kOptionRememberPairedViewers, v);
+                  setState(() {
+                    _rememberPairedViewers = v;
+                  });
+                },
+        ),
+      if (_enableDirectIPAccess)
+        SettingsTile(
+            title: Text(translate('Manage paired viewers')),
+            trailing: Icon(Icons.arrow_forward_ios),
+            onPressed: (context) {
+              Navigator.push(context, MaterialPageRoute(builder: (context) {
+                return const _ManagePairedViewers();
+              }));
+            }),
       SettingsTile(
-        title: Text(translate("Peer pairing passphrase")),
+        title: Text(translate("Rendezvous pairing passphrase")),
         value: Padding(
           padding: EdgeInsets.symmetric(vertical: 8),
           child: Text(
@@ -788,9 +811,29 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 onPressed: (context) {
                   showServerSettings(gFFI.dialogManager, (callback) async {
                     _isUsingPublicServer = await bind.mainIsUsingPublicServer();
+                    _allowIdRelayServer =
+                        await mainGetBoolOption(kOptionAllowIdRelayServer);
                     setState(callback);
                   });
                 }),
+          if (!disabledSettings && !_hideNetwork && !_hideServer)
+            SettingsTile.switchTile(
+              title: Text(translate('Use ID/Relay Server')),
+              initialValue: _allowIdRelayServer,
+              onToggle: isOptionFixed(kOptionAllowIdRelayServer)
+                  ? null
+                  : (v) async {
+                      await mainSetBoolOption(kOptionAllowIdRelayServer, v);
+                      final newValue =
+                          await mainGetBoolOption(kOptionAllowIdRelayServer);
+                      final usingPublicServer =
+                          await bind.mainIsUsingPublicServer();
+                      setState(() {
+                        _allowIdRelayServer = newValue;
+                        _isUsingPublicServer = usingPublicServer;
+                      });
+                    },
+            ),
           if (!_hideNetwork && !_hideProxy)
             SettingsTile(
                 title: Text(translate('Socks5/Http(s) Proxy')),
@@ -1016,18 +1059,39 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           title: Text(translate("About")),
           tiles: [
             SettingsTile(
+                title: Text('${translate("Version")}: $version'),
+                leading: Icon(Icons.info)),
+            SettingsTile(
+                title: Text('Attribution'),
+                description:
+                    Text('$kRustAdminForkSummary\n${rustAdminLegalNotice()}'),
+                leading: Icon(Icons.article_outlined)),
+            SettingsTile(
                 onPressed: (context) async {
-                  await launchUrl(Uri.parse(url));
+                  await launchUrl(Uri.parse(kRustAdminSourceUrl));
                 },
-                title: Text(translate("Version: ") + version),
+                title: Text('Source code'),
                 value: Padding(
                   padding: EdgeInsets.symmetric(vertical: 8),
-                  child: Text('rustdesk.com',
+                  child: Text('github.com/RustAdministrator/rustadmin',
                       style: TextStyle(
                         decoration: TextDecoration.underline,
                       )),
                 ),
-                leading: Icon(Icons.info)),
+                leading: Icon(Icons.code)),
+            SettingsTile(
+                onPressed: (context) async {
+                  await launchUrl(Uri.parse(kRustDeskUpstreamUrl));
+                },
+                title: Text('Upstream project'),
+                value: Padding(
+                  padding: EdgeInsets.symmetric(vertical: 8),
+                  child: Text('github.com/rustdesk/rustdesk',
+                      style: TextStyle(
+                        decoration: TextDecoration.underline,
+                      )),
+                ),
+                leading: Icon(Icons.source)),
             SettingsTile(
                 title: Text(translate("Build Date")),
                 value: Padding(
@@ -1043,13 +1107,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                     padding: EdgeInsets.symmetric(vertical: 8),
                     child: Text(_fingerprint),
                   ),
-                  leading: Icon(Icons.fingerprint)),
-            SettingsTile(
-              title: Text(translate("Privacy Statement")),
-              onPressed: (context) =>
-                  launchUrlString('https://rustdesk.com/privacy.html'),
-              leading: Icon(Icons.privacy_tip),
-            )
+                  leading: Icon(Icons.fingerprint))
           ],
         ),
       ],
@@ -1154,23 +1212,54 @@ void showThemeSettings(OverlayDialogManager dialogManager) async {
 
 void showAbout(OverlayDialogManager dialogManager) {
   dialogManager.show((setState, close, context) {
+    final appName = bind.mainGetAppNameSync();
     return CustomAlertDialog(
-      title: Text(translate('About RustDesk')),
-      content: Wrap(direction: Axis.vertical, spacing: 12, children: [
-        Text('Version: $version'),
-        InkWell(
-            onTap: () async {
-              const url = 'https://rustdesk.com/';
-              await launchUrl(Uri.parse(url));
-            },
-            child: Padding(
-              padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('rustdesk.com',
-                  style: TextStyle(
-                    decoration: TextDecoration.underline,
-                  )),
-            )),
-      ]),
+      title: Text('${translate('About')} $appName'),
+      content: FutureBuilder<String>(
+        future: bind.mainGetVersion(),
+        initialData: version,
+        builder: (context, snapshot) {
+          final appVersion =
+              (snapshot.data != null && snapshot.data!.isNotEmpty)
+                  ? snapshot.data!
+                  : version;
+          return SingleChildScrollView(
+            child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Version: $appVersion'),
+                  Padding(
+                    padding: EdgeInsets.symmetric(vertical: 12),
+                    child: Text(kRustAdminForkSummary),
+                  ),
+                  Text(rustAdminLegalNotice()),
+                  InkWell(
+                      onTap: () async {
+                        await launchUrl(Uri.parse(kRustAdminSourceUrl));
+                      },
+                      child: Padding(
+                        padding: EdgeInsets.only(top: 12, bottom: 8),
+                        child: Text('Source code',
+                            style: TextStyle(
+                              decoration: TextDecoration.underline,
+                            )),
+                      )),
+                  InkWell(
+                      onTap: () async {
+                        await launchUrl(Uri.parse(kRustDeskUpstreamUrl));
+                      },
+                      child: Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8),
+                        child: Text('Upstream project',
+                            style: TextStyle(
+                              decoration: TextDecoration.underline,
+                            )),
+                      )),
+                ]),
+          );
+        },
+      ),
       actions: [],
     );
   }, clickMaskDismiss: true, backDismiss: true);
@@ -1347,6 +1436,51 @@ class __ManageTrustedDevicesState extends State<_ManageTrustedDevices> {
             final devices = snapshot.data as List<TrustedDevice>;
             trustedDevices = devices.obs;
             return trustedDevicesTable(trustedDevices, selectedDevices);
+          }),
+    );
+  }
+}
+
+class _ManagePairedViewers extends StatefulWidget {
+  const _ManagePairedViewers();
+
+  @override
+  State<_ManagePairedViewers> createState() => __ManagePairedViewersState();
+}
+
+class __ManagePairedViewersState extends State<_ManagePairedViewers> {
+  RxList<PairedViewer> pairedViewers = RxList.empty(growable: true);
+  RxList<Uint8List> selectedViewers = RxList.empty();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(translate('Manage paired viewers')),
+        centerTitle: true,
+        actions: [
+          Obx(() => IconButton(
+              icon: Icon(Icons.delete, color: Colors.white),
+              onPressed: selectedViewers.isEmpty
+                  ? null
+                  : () {
+                      confrimDeletePairedViewersDialog(
+                          pairedViewers, selectedViewers);
+                    }))
+        ],
+      ),
+      body: FutureBuilder(
+          future: PairedViewer.get(),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              return Center(child: CircularProgressIndicator());
+            }
+            if (snapshot.hasError) {
+              return Center(child: Text('Error: ${snapshot.error}'));
+            }
+            final viewers = snapshot.data as List<PairedViewer>;
+            pairedViewers = viewers.obs;
+            return pairedViewersTable(pairedViewers, selectedViewers);
           }),
     );
   }

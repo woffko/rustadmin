@@ -134,7 +134,23 @@ pub trait TraitCapturer {
     #[cfg(windows)]
     fn is_gdi(&self) -> bool;
     #[cfg(windows)]
+    fn is_mag(&self) -> bool {
+        false
+    }
+    #[cfg(windows)]
+    fn is_wgc(&self) -> bool {
+        false
+    }
+    #[cfg(windows)]
     fn set_gdi(&mut self) -> bool;
+    #[cfg(windows)]
+    fn cancel_gdi(&mut self) -> bool {
+        false
+    }
+    #[cfg(windows)]
+    fn gdi_fallback_reason(&self) -> String {
+        String::new()
+    }
 
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice;
@@ -300,6 +316,63 @@ pub enum CodecFormat {
     H264,
     H265,
     Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct VideoDecodePerf {
+    pub codec_path: &'static str,
+    pub render_path: &'static str,
+    pub codec_format: CodecFormat,
+    pub width: usize,
+    pub height: usize,
+    pub input_bytes: usize,
+    pub output_buffer_bytes: usize,
+    pub media_format_width: Option<i32>,
+    pub media_format_height: Option<i32>,
+    pub media_format_stride: Option<i32>,
+    pub media_format_slice_height: Option<i32>,
+    pub media_format_color_format: Option<i32>,
+    pub crop_left: Option<i32>,
+    pub crop_top: Option<i32>,
+    pub crop_right: Option<i32>,
+    pub crop_bottom: Option<i32>,
+    pub rgba_bytes: usize,
+    pub rgba_reallocated: bool,
+    pub mediacodec_input_queue: Option<std::time::Duration>,
+    pub mediacodec_output_dequeue: Option<std::time::Duration>,
+    pub yuv_to_rgba: Option<std::time::Duration>,
+    pub decoder_total: Option<std::time::Duration>,
+    pub handle_frame_total: Option<std::time::Duration>,
+}
+
+impl Default for VideoDecodePerf {
+    fn default() -> Self {
+        Self {
+            codec_path: "unknown",
+            render_path: "unknown",
+            codec_format: CodecFormat::Unknown,
+            width: 0,
+            height: 0,
+            input_bytes: 0,
+            output_buffer_bytes: 0,
+            media_format_width: None,
+            media_format_height: None,
+            media_format_stride: None,
+            media_format_slice_height: None,
+            media_format_color_format: None,
+            crop_left: None,
+            crop_top: None,
+            crop_right: None,
+            crop_bottom: None,
+            rgba_bytes: 0,
+            rgba_reallocated: false,
+            mediacodec_input_queue: None,
+            mediacodec_output_dequeue: None,
+            yuv_to_rgba: None,
+            decoder_total: None,
+            handle_frame_total: None,
+        }
+    }
 }
 
 impl From<&VideoFrame> for CodecFormat {

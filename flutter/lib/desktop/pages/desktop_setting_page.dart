@@ -36,6 +36,7 @@ const double _kContentHMargin = 15;
 const double _kContentHSubMargin = _kContentHMargin + 33;
 const double _kCheckBoxLeftMargin = 10;
 const double _kRadioLeftMargin = 10;
+const double _kSettingRowMinHeight = 48;
 const double _kListViewBottomMargin = 15;
 const double _kTitleFontSize = 20;
 const double _kContentFontSize = 15;
@@ -438,7 +439,7 @@ class _GeneralState extends State<_General> {
 
   Widget theme() {
     final current = MyTheme.getThemeModePreference().toShortString();
-    onChanged(String value) async {
+    Future<void> onChanged(String value) async {
       await MyTheme.changeDarkMode(MyTheme.themeModeFromString(value));
       setState(() {});
     }
@@ -603,6 +604,14 @@ class _GeneralState extends State<_General> {
           }
           await mainSetLocalBoolOption(key, value);
         },
+      ));
+    }
+    if (!isWeb) {
+      children.add(_OptionCheckBox(
+        context,
+        'Clipboard debug diagnostics',
+        kOptionAllowClipboardDebug,
+        isServer: false,
       ));
     }
     return _Card(title: 'Other', children: children);
@@ -874,7 +883,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         setState(() {});
       }
 
-      onChanged(bool? checked) async {
+      Future<void> onChanged(bool? checked) async {
         if (checked == false) {
           CommonConfirmDialog(
               gFFI.dialogManager, translate('cancel-2fa-confirm-tip'), () {
@@ -1050,6 +1059,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                   enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(context, 'Enable clipboard', kOptionEnableClipboard,
                 enabled: enabled, fakeValue: fakeValue),
+            clipboardDirectionPolicy(context, enabled, fakeValue),
             _OptionCheckBox(
                 context, 'Enable file transfer', kOptionEnableFileTransfer,
                 enabled: enabled, fakeValue: fakeValue),
@@ -1081,6 +1091,43 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     }
 
     return tmpWrapper();
+  }
+
+  Widget clipboardDirectionPolicy(
+      BuildContext context, bool enabled, bool? fakeValue) {
+    final keys = <String>[
+      kClipboardDirectionBoth,
+      kClipboardDirectionLocalToRemote,
+      kClipboardDirectionRemoteToLocal,
+      kClipboardDirectionOff,
+    ];
+    final values =
+        keys.map(clipboardDirectionPolicyLabel).map(translate).toList();
+    final currentPolicy = normalizeClipboardDirectionPolicy(
+      bind.mainGetOptionSync(key: kOptionClipboardDirection),
+    );
+    final clipboardEnabled =
+        fakeValue ?? mainGetBoolOptionSync(kOptionEnableClipboard);
+    final isEnabled = enabled &&
+        fakeValue == null &&
+        clipboardEnabled &&
+        !isOptionFixed(kOptionClipboardDirection);
+
+    return _SubLabeledWidget(
+      context,
+      'Clipboard direction',
+      ComboBox(
+        enabled: isEnabled,
+        keys: keys,
+        values: values,
+        initialKey: currentPolicy,
+        onChanged: (key) async {
+          await bind.mainSetOption(key: kOptionClipboardDirection, value: key);
+          setState(() {});
+        },
+      ),
+      enabled: isEnabled,
+    );
   }
 
   Widget password(BuildContext context) {
@@ -1316,7 +1363,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
   }
 
   shareRdp(BuildContext context, bool enabled) {
-    onChanged(bool b) async {
+    Future<void> onChanged(bool b) async {
       await bind.mainSetShareRdp(enable: b);
       setState(() {});
     }
@@ -1348,7 +1395,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     final isOptFixed = isOptionFixed(kOptionPeerPairingPassphrase);
     return _SubLabeledWidget(
       context,
-      'Peer pairing passphrase',
+      'Rendezvous pairing passphrase',
       Row(
         children: [
           Expanded(
@@ -1386,6 +1433,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         ],
       ),
       enabled: enabled && !locked && !isOptFixed,
+      leftMargin: _kCheckBoxLeftMargin,
+      minHeight: _kSettingRowMinHeight,
     );
   }
 
@@ -1409,11 +1458,16 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
               bind.mainGetOptionSync(key: kOptionDirectAccessPairingPassphrase);
           final isPairingOptFixed =
               isOptionFixed(kOptionDirectAccessPairingPassphrase);
-          return Offstage(
-            offstage: !enabled,
-            child: Column(
-              children: [
-                _SubLabeledWidget(
+          final isRememberPairedViewersFixed =
+              isOptionFixed(kOptionRememberPairedViewers);
+          final showPairingPassphrase =
+              enabled || pairingPassphrase.isNotEmpty || isPairingOptFixed;
+          final canEditPairingPassphrase = !locked && !isPairingOptFixed;
+          return Column(
+            children: [
+              Offstage(
+                offstage: !enabled,
+                child: _SubLabeledWidget(
                   context,
                   'Port',
                   Row(children: [
@@ -1453,9 +1507,11 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                   ]),
                   enabled: enabled && !locked && !isOptFixed,
                 ),
+              ),
+              if (showPairingPassphrase)
                 _SubLabeledWidget(
                   context,
-                  'Pairing passphrase',
+                  'Local pairing passphrase',
                   Row(
                     children: [
                       Expanded(
@@ -1466,13 +1522,13 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                           style: TextStyle(
                             color: disabledTextColor(
                               context,
-                              enabled && !locked && !isPairingOptFixed,
+                              canEditPairingPassphrase,
                             ),
                           ),
                         ),
                       ),
                       ElevatedButton(
-                        onPressed: enabled && !locked && !isPairingOptFixed
+                        onPressed: canEditPairingPassphrase
                             ? () async {
                                 await changeDirectAccessPairingPassphrase(
                                     pairingPassphrase);
@@ -1483,9 +1539,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                             pairingPassphrase.isEmpty ? 'Set' : 'Change')),
                       ).marginOnly(right: 8),
                       OutlinedButton(
-                        onPressed: enabled &&
-                                !locked &&
-                                !isPairingOptFixed &&
+                        onPressed: canEditPairingPassphrase &&
                                 pairingPassphrase.isNotEmpty
                             ? () async {
                                 await bind.mainSetOption(
@@ -1498,10 +1552,59 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                       ),
                     ],
                   ),
-                  enabled: enabled && !locked && !isPairingOptFixed,
+                  enabled: canEditPairingPassphrase,
+                  leftMargin: _kCheckBoxLeftMargin,
+                  minHeight: _kSettingRowMinHeight,
                 ),
-              ],
-            ),
+              Offstage(
+                offstage: !enabled,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Flexible(
+                      child: Tooltip(
+                        waitDuration: const Duration(milliseconds: 300),
+                        message: translate(
+                            'Remember successful local pairings so this device can reconnect without entering the pairing passphrase again.'),
+                        child: _OptionCheckBox(
+                          context,
+                          'Remember paired viewers',
+                          kOptionRememberPairedViewers,
+                          enabled: enabled &&
+                              !locked &&
+                              !isRememberPairedViewersFixed,
+                          update: (_) => setState(() {}),
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 220,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          ElevatedButton(
+                            onPressed: enabled && !locked
+                                ? () {
+                                    managePairedViewersDialog();
+                                  }
+                                : null,
+                            child: Text(translate('Manage paired viewers')),
+                          ).marginOnly(bottom: 8),
+                          OutlinedButton(
+                            onPressed: enabled && !locked
+                                ? () {
+                                    manageKnownHostsDialog();
+                                  }
+                                : null,
+                            child: Text(translate('Manage known hosts')),
+                          ),
+                        ],
+                      ),
+                    )
+                  ],
+                ),
+              ),
+            ],
           );
         }
 
@@ -1519,7 +1622,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         hasWhitelist.value = whitelistNotEmpty();
       }
 
-      onChanged(bool? checked) async {
+      Future<void> onChanged(bool? checked) async {
         changeWhiteList(callback: update);
       }
 
@@ -1669,7 +1772,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       unlockPin.value = bind.mainGetUnlockPin();
     }
 
-    onChanged(bool? checked) async {
+    Future<void> onChanged(bool? checked) async {
       changeUnlockPinDialog(unlockPin.value, update);
     }
 
@@ -1788,7 +1891,7 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
         onTap: onTap,
         trailing: trailing,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(4.0),
         ),
         contentPadding: EdgeInsets.symmetric(horizontal: 16),
         minLeadingWidth: 0,
@@ -1830,6 +1933,13 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
                   title: 'ID/Relay Server',
                   onTap: () => showServerSettings(gFFI.dialogManager, setState),
                 ),
+              if (!hideServer) divider,
+              if (!hideServer)
+                switchWidget(
+                    Icons.cloud_sync_outlined,
+                    'Use ID/Relay Server',
+                    'When off, saved ID, relay and API servers are kept but RustAdmin will not connect to them.',
+                    kOptionAllowIdRelayServer),
               if (!hideProxy && !hideServer) divider,
               if (!hideProxy)
                 listTile(
@@ -1945,7 +2055,7 @@ class _DisplayState extends State<_Display> {
 
   Widget viewStyle(BuildContext context) {
     final isOptFixed = isOptionFixed(kOptionViewStyle);
-    onChanged(String value) async {
+    Future<void> onChanged(String value) async {
       await bind.mainSetUserDefaultOption(key: kOptionViewStyle, value: value);
       setState(() {});
     }
@@ -1967,7 +2077,7 @@ class _DisplayState extends State<_Display> {
 
   Widget scrollStyle(BuildContext context) {
     final isOptFixed = isOptionFixed(kOptionScrollStyle);
-    onChanged(String value) async {
+    Future<void> onChanged(String value) async {
       await bind.mainSetUserDefaultOption(
           key: kOptionScrollStyle, value: value);
       setState(() {});
@@ -2032,6 +2142,24 @@ class _DisplayState extends State<_Display> {
       min: kMinRemoteToolbarHideDelayMs,
       max: kMaxRemoteToolbarHideDelayMs,
     );
+    final pinnedOpacityPercent = _toolbarOptionValue(
+      kOptionRemoteToolbarPinnedOpacityPercent,
+      defaultValue: kDefaultRemoteToolbarPinnedOpacityPercent,
+      min: kMinRemoteToolbarPinnedOpacityPercent,
+      max: kMaxRemoteToolbarPinnedOpacityPercent,
+    );
+    final pinnedDimDelayMs = _toolbarOptionValue(
+      kOptionRemoteToolbarPinnedDimDelayMs,
+      defaultValue: kDefaultRemoteToolbarPinnedDimDelayMs,
+      min: kMinRemoteToolbarPinnedDimDelayMs,
+      max: kMaxRemoteToolbarPinnedDimDelayMs,
+    );
+    final pinnedDimDurationMs = _toolbarOptionValue(
+      kOptionRemoteToolbarPinnedDimDurationMs,
+      defaultValue: kDefaultRemoteToolbarPinnedDimDurationMs,
+      min: kMinRemoteToolbarPinnedDimDurationMs,
+      max: kMaxRemoteToolbarPinnedDimDurationMs,
+    );
 
     return _Card(title: 'Toolbar auto-hide', children: [
       _IntegerSettingSlider(
@@ -2062,11 +2190,53 @@ class _DisplayState extends State<_Display> {
           max: kMaxRemoteToolbarHideDelayMs,
         ),
       ),
+      _IntegerSettingSlider(
+        label: 'Pinned toolbar opacity',
+        value: pinnedOpacityPercent,
+        min: kMinRemoteToolbarPinnedOpacityPercent,
+        max: kMaxRemoteToolbarPinnedOpacityPercent,
+        unit: '%',
+        enabled: !isOptionFixed(kOptionRemoteToolbarPinnedOpacityPercent),
+        onChanged: (value) => _setToolbarOptionValue(
+          kOptionRemoteToolbarPinnedOpacityPercent,
+          value,
+          min: kMinRemoteToolbarPinnedOpacityPercent,
+          max: kMaxRemoteToolbarPinnedOpacityPercent,
+        ),
+      ),
+      _IntegerSettingSlider(
+        label: 'Pinned toolbar dim delay',
+        value: pinnedDimDelayMs,
+        min: kMinRemoteToolbarPinnedDimDelayMs,
+        max: kMaxRemoteToolbarPinnedDimDelayMs,
+        unit: 'ms',
+        enabled: !isOptionFixed(kOptionRemoteToolbarPinnedDimDelayMs),
+        onChanged: (value) => _setToolbarOptionValue(
+          kOptionRemoteToolbarPinnedDimDelayMs,
+          value,
+          min: kMinRemoteToolbarPinnedDimDelayMs,
+          max: kMaxRemoteToolbarPinnedDimDelayMs,
+        ),
+      ),
+      _IntegerSettingSlider(
+        label: 'Pinned toolbar dim duration',
+        value: pinnedDimDurationMs,
+        min: kMinRemoteToolbarPinnedDimDurationMs,
+        max: kMaxRemoteToolbarPinnedDimDurationMs,
+        unit: 'ms',
+        enabled: !isOptionFixed(kOptionRemoteToolbarPinnedDimDurationMs),
+        onChanged: (value) => _setToolbarOptionValue(
+          kOptionRemoteToolbarPinnedDimDurationMs,
+          value,
+          min: kMinRemoteToolbarPinnedDimDurationMs,
+          max: kMaxRemoteToolbarPinnedDimDurationMs,
+        ),
+      ),
     ]);
   }
 
   Widget imageQuality(BuildContext context) {
-    onChanged(String value) async {
+    Future<void> onChanged(String value) async {
       await bind.mainSetUserDefaultOption(
           key: kOptionImageQuality, value: value);
       setState(() {});
@@ -2123,7 +2293,7 @@ class _DisplayState extends State<_Display> {
   }
 
   Widget codec(BuildContext context) {
-    onChanged(String value) async {
+    Future<void> onChanged(String value) async {
       await bind.mainSetUserDefaultOption(
           key: kOptionCodecPreference, value: value);
       setState(() {});
@@ -2193,7 +2363,7 @@ class _DisplayState extends State<_Display> {
     }
 
     final key = 'privacy-mode-impl-key';
-    onChanged(String value) async {
+    Future<void> onChanged(String value) async {
       await bind.mainSetOption(key: key, value: value);
       setState(() {});
     }
@@ -2218,7 +2388,7 @@ class _DisplayState extends State<_Display> {
   Widget otherRow(String label, String key) {
     final value = bind.mainGetUserDefaultOption(key: key) == 'Y';
     final isOptFixed = isOptionFixed(key);
-    onChanged(bool b) async {
+    Future<void> onChanged(bool b) async {
       await bind.mainSetUserDefaultOption(
           key: key,
           value: b
@@ -2287,7 +2457,7 @@ class _AccountState extends State<_Account> {
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: Theme.of(context).colorScheme.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(10),
+              borderRadius: BorderRadius.circular(4.0),
             ),
             child: Builder(builder: (context) {
               final avatarWidget = _buildUserAvatar();
@@ -2369,7 +2539,7 @@ class _CheckboxState extends State<_Checkbox> {
 
   @override
   Widget build(BuildContext context) {
-    onChanged(bool b) async {
+    Future<void> onChanged(bool b) async {
       await widget.setValue(b);
       setState(() {
         value = widget.getValue();
@@ -2611,11 +2781,12 @@ class _AboutState extends State<_About> {
       final version = data['version'].toString();
       final buildDate = data['buildDate'].toString();
       final fingerprint = data['fingerprint'].toString();
+      final appName = bind.mainGetAppNameSync();
       const linkStyle = TextStyle(decoration: TextDecoration.underline);
       final scrollController = ScrollController();
       return SingleChildScrollView(
         controller: scrollController,
-        child: _Card(title: translate('About RustDesk'), children: [
+        child: _Card(title: '${translate('About')} $appName', children: [
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -2632,20 +2803,22 @@ class _AboutState extends State<_About> {
                 SelectionArea(
                     child: Text('${translate('Fingerprint')}: $fingerprint')
                         .marginSymmetric(vertical: 4.0)),
+              const SelectionArea(child: Text(kRustAdminForkSummary))
+                  .marginSymmetric(vertical: 4.0),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://rustdesk.com/privacy.html');
+                    launchUrlString(kRustAdminSourceUrl);
                   },
                   child: Text(
-                    translate('Privacy Statement'),
+                    'Source code',
                     style: linkStyle,
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://rustdesk.com');
+                    launchUrlString(kRustDeskUpstreamUrl);
                   },
                   child: Text(
-                    translate('Website'),
+                    'Upstream project',
                     style: linkStyle,
                   ).marginSymmetric(vertical: 4.0)),
               Container(
@@ -2660,7 +2833,7 @@ class _AboutState extends State<_About> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Copyright © ${DateTime.now().toString().substring(0, 4)} Purslane Ltd.\n$license',
+                            rustAdminLegalNotice(runtimeLicense: license),
                             style: const TextStyle(color: Colors.white),
                           ),
                           Text(
@@ -2782,7 +2955,7 @@ Widget _OptionCheckBox(
   final isOptFixed = isOptionFixed(key);
   if (reverse) value = !value;
   var ref = value.obs;
-  onChanged(option) async {
+  Future<void> onChanged(dynamic option) async {
     if (option != null) {
       if (reverse) option = !option;
       final setter =
@@ -2883,7 +3056,7 @@ Widget _Radio<T>(BuildContext context,
     {required T value,
     required T groupValue,
     required String label,
-    required Function(T value)? onChanged,
+    required FutureOr<void> Function(T value)? onChanged,
     bool autoNewLine = true}) {
   final onChange2 = onChanged != null
       ? (T? value) {
@@ -3188,7 +3361,7 @@ class _IntegerSettingSliderState extends State<_IntegerSettingSlider> {
                   data: SliderTheme.of(context).copyWith(
                     activeTrackColor: colorScheme.primary,
                     thumbColor: colorScheme.primary,
-                    overlayColor: colorScheme.primary.withValues(alpha: 0.1),
+                    overlayColor: colorScheme.primary.withOpacity(0.1),
                     showValueIndicator: ShowValueIndicator.never,
                   ),
                   child: Slider(
@@ -3238,19 +3411,24 @@ Widget _SubButton(String label, Function() onPressed, [bool enabled = true]) {
 
 // ignore: non_constant_identifier_names
 Widget _SubLabeledWidget(BuildContext context, String label, Widget child,
-    {bool enabled = true}) {
-  return Row(
-    children: [
-      Text(
-        '${translate(label)}: ',
-        style: TextStyle(color: disabledTextColor(context, enabled)),
-      ),
-      const SizedBox(
-        width: 10,
-      ),
-      Flexible(child: child),
-    ],
-  ).marginOnly(left: _kContentHSubMargin);
+    {bool enabled = true,
+    double leftMargin = _kContentHSubMargin,
+    double? minHeight}) {
+  return ConstrainedBox(
+    constraints: BoxConstraints(minHeight: minHeight ?? 0),
+    child: Row(
+      children: [
+        Text(
+          '${translate(label)}: ',
+          style: TextStyle(color: disabledTextColor(context, enabled)),
+        ),
+        const SizedBox(
+          width: 10,
+        ),
+        Flexible(child: child),
+      ],
+    ),
+  ).marginOnly(left: leftMargin);
 }
 
 Widget _lock(
@@ -3279,6 +3457,11 @@ Widget _lock(
                             Text(translate(label)).marginOnly(left: 5),
                           ]).marginSymmetric(vertical: 2)),
                   onPressed: () async {
+                    if (await canBeBlocked()) {
+                      showToast(translate(
+                          'Settings are locked during support sessions'));
+                      return;
+                    }
                     final unlockPin = bind.mainGetUnlockPin();
                     if (unlockPin.isEmpty || isUnlockPinDisabled()) {
                       bool checked = await callMainCheckSuperUserPermission();

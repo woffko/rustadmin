@@ -50,7 +50,10 @@ class EventToUI_Texture implements EventToUI {
   bool get field1 => f1;
 }
 
-class RustdeskImpl {
+typedef Rustadmin = RustadminImpl;
+typedef RustdeskImpl = RustadminImpl;
+
+class RustadminImpl {
   Future<void> stopGlobalEventStream({required String appType, dynamic hint}) {
     throw UnimplementedError("stopGlobalEventStream");
   }
@@ -208,6 +211,11 @@ class RustdeskImpl {
           'toggle_privacy_mode',
           jsonEncode({'impl_key': implKey, 'on': on})
         ]));
+  }
+
+  Future<void> sessionRequestPermission(
+      {required UuidValue sessionId, required String name, dynamic hint}) {
+    throw UnimplementedError("sessionRequestPermission");
   }
 
   Future<String?> sessionGetFlutterOption(
@@ -1400,6 +1408,16 @@ class RustdeskImpl {
       required bool enabled,
       dynamic hint}) {
     throw UnimplementedError("cmSwitchPermission");
+  }
+
+  Future<void> cmRespondPermissionRequest(
+      {required int connId,
+      required String requestId,
+      required String name,
+      required bool enabled,
+      required bool approved,
+      dynamic hint}) {
+    throw UnimplementedError("cmRespondPermissionRequest");
   }
 
   bool cmCanElevate({dynamic hint}) {

@@ -32,6 +32,9 @@ pub const FPS: u32 = 30;
 pub const MIN_FPS: u32 = 1;
 pub const MAX_FPS: u32 = 120;
 pub const INIT_FPS: u32 = 15;
+const STARTUP_SAFE_WINDOW: Duration = Duration::from_secs(8);
+const STARTUP_SAFE_FPS: u32 = 5;
+const STARTUP_SAFE_RATIO: f32 = 0.25;
 
 // Bitrate ratio constants for different quality levels
 const BR_MAX: f32 = 40.0; // 2000 * 2 / 100
@@ -90,6 +93,7 @@ impl UserDelay {
 struct UserData {
     auto_adjust_fps: Option<u32>, // reserve for compatibility
     custom_fps: Option<u32>,
+    fixed_fps: Option<u32>,
     quality: Option<(i64, Quality)>, // (time, quality)
     delay: UserDelay,
     record: bool,
@@ -160,7 +164,14 @@ impl VideoQoS {
         if self.ratio < BR_MIN_HIGH_RESOLUTION || self.ratio > BR_MAX {
             self.ratio = BR_BALANCED;
         }
+        if self.startup_safe_mode() {
+            return self.ratio.min(STARTUP_SAFE_RATIO);
+        }
         self.ratio
+    }
+
+    pub fn startup_safe_mode(&self) -> bool {
+        self.locked_fps().is_none() && self.new_user_instant.elapsed() < STARTUP_SAFE_WINDOW
     }
 
     // Check if any user is in recording mode
@@ -199,11 +210,44 @@ impl VideoQoS {
 
     pub fn user_custom_fps(&mut self, id: i32, fps: u32) {
         if fps < MIN_FPS || fps > MAX_FPS {
+            log::warn!("custom_fps adaptive ignored: user_id={id}, invalid_fps={fps}");
             return;
         }
         if let Some(user) = self.users.get_mut(&id) {
             user.custom_fps = Some(fps);
+            user.fixed_fps = None;
+        } else {
+            log::warn!("custom_fps adaptive ignored: unknown_user_id={id}, fps={fps}");
+            return;
         }
+        let previous_fps = self.fps;
+        self.adjust_fps();
+        log::info!(
+            "custom_fps adaptive applied: user_id={id}, fps={fps}, previous_active_fps={}, active_fps={}",
+            previous_fps,
+            self.fps
+        );
+    }
+
+    pub fn user_fixed_fps(&mut self, id: i32, fps: u32) {
+        if fps < MIN_FPS || fps > MAX_FPS {
+            log::warn!("custom_fps fixed ignored: user_id={id}, invalid_fps={fps}");
+            return;
+        }
+        if let Some(user) = self.users.get_mut(&id) {
+            user.custom_fps = Some(fps);
+            user.fixed_fps = Some(fps);
+        } else {
+            log::warn!("custom_fps fixed ignored: unknown_user_id={id}, fps={fps}");
+            return;
+        }
+        let previous_fps = self.fps;
+        self.adjust_fps();
+        log::info!(
+            "custom_fps fixed applied: user_id={id}, fps={fps}, previous_active_fps={}, active_fps={}",
+            previous_fps,
+            self.fps
+        );
     }
 
     pub fn user_auto_adjust_fps(&mut self, id: i32, fps: u32) {
@@ -378,7 +422,20 @@ impl VideoQoS {
     }
 
     #[inline]
+    fn locked_fps(&self) -> Option<u32> {
+        self.users
+            .iter()
+            .filter_map(|(_, u)| u.fixed_fps)
+            .min()
+            .map(|fps| fps.clamp(MIN_FPS, MAX_FPS))
+    }
+
+    #[inline]
     fn highest_fps(&self) -> u32 {
+        if let Some(fps) = self.locked_fps() {
+            return fps;
+        }
+
         let user_fps = |u: &UserData| {
             let mut fps = u.custom_fps.unwrap_or(FPS);
             if let Some(auto_adjust_fps) = u.auto_adjust_fps {
@@ -509,6 +566,11 @@ impl VideoQoS {
 
     // Adjust fps based on network delay and user response time
     fn adjust_fps(&mut self) {
+        if let Some(fps) = self.locked_fps() {
+            self.fps = fps;
+            return;
+        }
+
         let highest_fps = self.highest_fps();
         // Get minimum fps from all users
         let mut fps = self
@@ -524,15 +586,47 @@ impl VideoQoS {
             }
         }
 
-        // For new connections (within 1 second), cap fps to INIT_FPS to ensure stability
-        if self.new_user_instant.elapsed().as_secs() < 1 {
-            if fps > INIT_FPS {
-                fps = INIT_FPS;
-            }
+        if self.startup_safe_mode() && fps > STARTUP_SAFE_FPS {
+            fps = STARTUP_SAFE_FPS;
         }
 
         // Ensure fps stays within valid range
         self.fps = fps.clamp(MIN_FPS, highest_fps);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_safe_mode_caps_default_quality_ratio() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+
+        assert!(qos.startup_safe_mode());
+        assert_eq!(qos.ratio(), STARTUP_SAFE_RATIO);
+    }
+
+    #[test]
+    fn startup_safe_mode_expires() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+        qos.new_user_instant = Instant::now() - STARTUP_SAFE_WINDOW - Duration::from_secs(1);
+
+        assert!(!qos.startup_safe_mode());
+        assert_eq!(qos.ratio(), BR_BALANCED);
+    }
+
+    #[test]
+    fn startup_safe_mode_respects_fixed_fps() {
+        let mut qos = VideoQoS::default();
+        qos.on_connection_open(1);
+        qos.user_fixed_fps(1, 30);
+
+        assert!(!qos.startup_safe_mode());
+        assert_eq!(qos.ratio(), BR_BALANCED);
+        assert_eq!(qos.fps(), 30);
     }
 }
 
