@@ -6,7 +6,9 @@ Date: 2026-06-23
 
 - Done: Android client APK built as `RustAdmin_Android_Release_2.0.2.006.apk`.
 - Done: Android client ZIP built as `RustAdmin_Android_Release_2.0.2.006.zip`.
-- Done: Windows client archive built as `RustAdmin_Release_2.0.2.006.zip`.
+- Done: Windows client archive built as `RustAdmin_Release_2.0.2.007.zip`.
+- Done: Windows service `--server` launch permission experiment was reverted to the privileged `winlogon.exe` launch path.
+- Done: Current `hbb_common` `PreferCodec::AV1Vulkan` is handled as ordinary AV1 until a separate AV1 Vulkan encoder path exists.
 - Blocked: macOS client build requires a macOS/Xcode Flutter toolchain; current environment is WSL2/Linux and `flutter build` has no `macos` subcommand here.
 - Done: During first-contact host-client trust, if `allow unverified peer trust` is disabled, the Flutter trust prompt now offers to enable it before approving and saving the peer key.
 - Done: Local rendezvous-direct sessions now use TCP-only connection candidates; UDP/KCP candidates are skipped for LAN MTU compatibility, including VPN paths such as WireGuard.

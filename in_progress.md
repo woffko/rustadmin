@@ -4,10 +4,15 @@ Date: 2026-06-23
 
 ## Current Status
 
-Latest client/code pass is revision `006`.
+Latest client/code pass is revision `007`.
 
 What changed in this pass:
 
+- Windows service `--server` launch permission experiment was reverted. The server process now uses the previous privileged `winlogon.exe` launch path again instead of trying an interactive user token under Windows Administrator Protection.
+- `libs/scrap/src/common/codec.rs` now treats `PreferCodec::AV1Vulkan` from current `hbb_common` as ordinary AV1 until a separate AV1 Vulkan encoder path exists, fixing the Windows build against the current shared proto.
+- `rustadmin_revision.txt` was bumped to `007`.
+- Windows release archive built successfully on VM `192.168.189.137`: `RustAdmin_Release_2.0.2.007.zip`, size `41,214,152` bytes, sha256 `61e1ba4a05d8fffd6bc897c7455594d412a34fec5916de079160e1363de0abc2`.
+- Windows archive was copied back to WSL as `RustAdmin_Release_2.0.2.007.zip` and verified with `unzip -t`; no compressed data errors.
 - Android/mobile Quality Monitor `Debug mode` checkbox now uses theme border/check colors, so the unchecked box is visible on dark backgrounds.
 - Quality Monitor host version now uses peer `full_version` when the host advertises it, with fallback to the old plain version for older hosts.
 - Mobile About now reads `bind.mainGetVersion()`, so Android shows the Rust full version with revision instead of only the package version.
@@ -159,7 +164,7 @@ Latest rebuild after capture backend menu test:
 - `libs/scrap/src/dxgi/wgc.rs`, `libs/scrap/src/common/dxgi.rs`, `src/server/video_service.rs`: added a Windows Graphics Capture backend and changed fallback order to `DXGI -> WGC -> WinMag -> GDI`; host diagnostics now report `HostBackend WGC`.
 - `src/server/video_service.rs`, `src/server/connection.rs`: low-latency smoothing test caps server-side video frame wait to one frame interval / 50 ms max and drops stale queued video frames after 200 ms to reduce visible catch-up stutter.
 - `src/client.rs`, `src/server/connection.rs`, `src/server/video_service.rs`, Flutter toolbar/options pages: added runtime `Capture` backend selection with `Auto`, `DXGI`, `WGC`, `WinMag`, and `GDI`.
-- `src/platform/windows.rs`: when Windows Administrator Protection (`TypeOfAdminApprovalMode=2`) is enabled and the target session is an interactive user session, the service now first launches `--server` from the interactive user token for DXGI compatibility. If that launch fails, it falls back to the previous privileged `winlogon.exe` token path.
+- `src/platform/windows.rs`: the Windows Administrator Protection interactive user-token launch experiment was reverted; service-launched `--server` now uses the previous privileged `winlogon.exe` launch path.
 - `libs/scrap/src/common/mod.rs`, `libs/scrap/src/common/dxgi.rs`: `TraitCapturer` now exposes `cancel_gdi()` so the video service can return from the temporary GDI snapshot path to DXGI, and `is_mag()` so host diagnostics can report the Magnification API backend distinctly.
 - `rustadmin_revision.txt`: bumped to `004`.
 - `../hbb_common/rustadmin_revision.txt`: bumped to `002`.
