@@ -4,10 +4,14 @@ Date: 2026-06-23
 
 ## Current Status
 
-Latest client/code pass is revision `012`.
+Latest client/code pass is revision `013`.
 
 What changed in this pass:
 
+- Android packaging follow-up: revision `012` was missing `lib/arm64-v8a/libc++_shared.so`, so Android failed at startup with `UnsatisfiedLinkError` while loading `librustdesk.so`. Revision `013` stages the NDK C++ shared runtime next to `librustdesk.so` in `flutter/ndk_arm64.sh`.
+- `rustadmin_revision.txt` was bumped to `013`.
+- Android release APK built successfully: `RustAdmin_Android_Release_2.0.2.013.apk`, size `25,564,561` bytes, sha256 `2c6760d82eb0f8b0b7ceeaf7163d1c695febe7ce6166d36680d434caa596ac3a`.
+- Android release ZIP built successfully: `RustAdmin_Android_Release_2.0.2.013.zip`, size `24,990,480` bytes, sha256 `affa8f15373328db952dfdcf79a304967236fbea5dc1ce5a0cd025f1a8a55f9d`.
 - Follow-up from Android connection testing: the waiting-for-first-image timer calls `sessionInputOsPassword(..., value: '')` to activate the remote OS. The old empty activation path sent a right-click pair, which could open the host desktop context menu or steal focus during ordinary connects. Revision `012` keeps the wake-up mouse movement but sends no click unless an actual OS password is provided.
 - `rustadmin_revision.txt` was bumped to `012`.
 - Android release APK built successfully: `RustAdmin_Android_Release_2.0.2.012.apk`, size `25,259,326` bytes, sha256 `78d2bb3870b1d39464ddc6ff4f9bcaad793e7b1ad238125aff12be86a5659bcb`.
@@ -50,11 +54,11 @@ Recent verification:
 
 - `dart analyze lib/consts.dart lib/common/widgets/toolbar.dart lib/models/model.dart lib/mobile/pages/remote_page.dart lib/mobile/pages/settings_page.dart`: passed with info/deprecation warnings only.
 - Android Rust library built for `aarch64-linux-android` with `flutter,hwcodec,mediacodec`, then copied and stripped into `flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so`.
-- Android APK verified with `apksigner verify --verbose`; `aapt dump badging` reports `versionName='2.0.2'`, `versionCode='2202'`, native code `arm64-v8a`.
+- Android revision `013` APK verified with `apksigner verify --verbose`; `aapt dump badging` reports `versionName='2.0.2'`, `versionCode='2202'`, native code `arm64-v8a`, and `unzip -l` shows both `lib/arm64-v8a/librustdesk.so` and `lib/arm64-v8a/libc++_shared.so`.
 - Windows revision `011` archive copied back from the VM and verified with `unzip -t`; no compressed data errors.
 - `cargo check --lib --no-default-features`: blocked by the same missing `gstreamer-1.0` pkg-config dependency.
 
-Latest Windows test build is `RustAdmin_Release_2.0.2.011.zip`; latest Android test build is `RustAdmin_Android_Release_2.0.2.012.apk`.
+Latest Windows test build is `RustAdmin_Release_2.0.2.011.zip`; latest Android test build is `RustAdmin_Android_Release_2.0.2.013.apk`.
 
 Earlier capture-backend menu test details:
 

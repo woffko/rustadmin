@@ -6,6 +6,9 @@ Date: 2026-06-23
 
 - Done: Android client APK built as `RustAdmin_Android_Release_2.0.2.006.apk`.
 - Done: Android client ZIP built as `RustAdmin_Android_Release_2.0.2.006.zip`.
+- Done: Android client APK built as `RustAdmin_Android_Release_2.0.2.013.apk`.
+- Done: Android client ZIP built as `RustAdmin_Android_Release_2.0.2.013.zip`.
+- Done: Android revision `013` includes `libc++_shared.so` in the APK so `librustdesk.so` can load on startup.
 - Done: Android client APK built as `RustAdmin_Android_Release_2.0.2.012.apk`.
 - Done: Android client ZIP built as `RustAdmin_Android_Release_2.0.2.012.zip`.
 - Done: Android/Flutter client revision `012` stops sending a right click during empty OS activation while waiting for the first image.
