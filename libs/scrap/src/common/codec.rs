@@ -98,7 +98,7 @@ impl UsableCodecs {
             PreferCodec::Auto => true,
             PreferCodec::VP8 => self.vp8,
             PreferCodec::VP9 => true,
-            PreferCodec::AV1 => self.av1,
+            PreferCodec::AV1 | PreferCodec::AV1Vulkan => self.av1,
             PreferCodec::H264 => self.h264,
             PreferCodec::H265 => self.h265,
         }
@@ -108,6 +108,7 @@ impl UsableCodecs {
 fn explicit_codec_preference_order() -> &'static [PreferCodec] {
     &[
         PreferCodec::AV1,
+        PreferCodec::AV1Vulkan,
         PreferCodec::VP9,
         PreferCodec::VP8,
         PreferCodec::H265,
@@ -141,7 +142,7 @@ fn codec_for_preference(preference: PreferCodec, auto_codec: CodecFormat) -> Cod
     match preference {
         PreferCodec::VP8 => CodecFormat::VP8,
         PreferCodec::VP9 => CodecFormat::VP9,
-        PreferCodec::AV1 => CodecFormat::AV1,
+        PreferCodec::AV1 | PreferCodec::AV1Vulkan => CodecFormat::AV1,
         PreferCodec::H264 => CodecFormat::H264,
         PreferCodec::H265 => CodecFormat::H265,
         PreferCodec::Auto => auto_codec,
