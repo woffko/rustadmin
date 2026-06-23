@@ -4,10 +4,14 @@ Date: 2026-06-23
 
 ## Current Status
 
-Latest client/code pass is revision `016`.
+Latest client/code pass is revision `017`.
 
 What changed in this pass:
 
+- Android adaptive launcher icon background now uses `#242424`, matching the logo PNG background. This removes the visible white rounded frame and makes the inset foreground canvas blend into the adaptive icon background, so there are no visible sharp inner corners.
+- `rustadmin_revision.txt` was bumped to `017`.
+- Android release APK built successfully: `RustAdmin_Android_Release_2.0.2.017.apk`, size `26,495,864` bytes, sha256 `4b30e06329f329d941c9dfbf5b4c4aa817ce17139dc2457c382839b0f5f7c69b`.
+- Android release ZIP built successfully: `RustAdmin_Android_Release_2.0.2.017.zip`, size `25,914,722` bytes, sha256 `24a8e175d827e671429ad48562ce0924dd54622b9c07dc658febdbb584d800ab`.
 - Android adaptive launcher icons now use an `18dp` inset wrapper around `ic_launcher_foreground`, keeping the existing artwork inside the Android adaptive-icon safe area so launcher masks do not crop the orange/logo edges.
 - `rustadmin_revision.txt` was bumped to `016`.
 - Android release APK built successfully: `RustAdmin_Android_Release_2.0.2.016.apk`, size `26,495,862` bytes, sha256 `337bb864c73c6b657556fcf36d8f36ab8ebbcc78145ff591aba38815b7354db7`.
@@ -69,11 +73,11 @@ Recent verification:
 
 - `dart analyze lib/consts.dart lib/common/widgets/toolbar.dart lib/models/model.dart lib/mobile/pages/remote_page.dart lib/mobile/pages/settings_page.dart`: passed with info/deprecation warnings only.
 - Android Rust library built for `aarch64-linux-android` with `flutter,hwcodec,mediacodec`, then copied and stripped into `flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so`.
-- Android revision `016` APK verified with `apksigner verify --verbose`; `aapt dump badging` reports `versionName='2.0.2'`, `versionCode='2202'`, native code `arm64-v8a`, and `unzip -l` shows `lib/arm64-v8a/librustdesk.so` and `lib/arm64-v8a/libc++_shared.so`. `aapt dump resources` shows `drawable/ic_launcher_foreground_safe`, and `librustdesk.so` contains `2.0.2 rev 016`.
+- Android revision `017` APK verified with `apksigner verify --verbose`; `aapt dump badging` reports `versionName='2.0.2'`, `versionCode='2202'`, native code `arm64-v8a`, and `unzip -l` shows `lib/arm64-v8a/librustdesk.so` and `lib/arm64-v8a/libc++_shared.so`. `aapt dump resources` shows `color/ic_launcher_background` as `0xff242424` and `drawable/ic_launcher_foreground_safe`; `librustdesk.so` contains `2.0.2 rev 017`.
 - Windows revision `015` archive copied back from the VM and verified with `unzip -t`; no compressed data errors. `librustdesk.dll` contains `2.0.2 rev 015`, `connection_type`, and the TCP-only local connection diagnostic string.
 - `cargo check --lib --no-default-features`: blocked by the same missing `gstreamer-1.0` pkg-config dependency.
 
-Latest Windows test build is `RustAdmin_Release_2.0.2.015.zip`; latest Android test build is `RustAdmin_Android_Release_2.0.2.016.apk`.
+Latest Windows test build is `RustAdmin_Release_2.0.2.015.zip`; latest Android test build is `RustAdmin_Android_Release_2.0.2.017.apk`.
 
 Earlier capture-backend menu test details:
 

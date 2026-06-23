@@ -4,6 +4,9 @@ Date: 2026-06-23
 
 ## Status
 
+- Done: Android client APK built as `RustAdmin_Android_Release_2.0.2.017.apk`.
+- Done: Android client ZIP built as `RustAdmin_Android_Release_2.0.2.017.zip`.
+- Done: Android revision `017` changes the adaptive launcher icon background to the logo background color `#242424`, removing the visible white rounded frame and hiding the sharp foreground-canvas corners.
 - Done: Android client APK built as `RustAdmin_Android_Release_2.0.2.016.apk`.
 - Done: Android client ZIP built as `RustAdmin_Android_Release_2.0.2.016.zip`.
 - Done: Android revision `016` wraps the adaptive launcher icon foreground in an `18dp` safe-area inset so Android launcher masks do not crop the RustAdmin logo edges.
