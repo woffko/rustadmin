@@ -4048,8 +4048,10 @@ pub fn send_pointer_device_event(
 fn activate_os(interface: &impl Interface, send_left_click: bool) {
     let left_down = MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_DOWN;
     let left_up = MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_UP;
-    send_mouse(left_up, 0, 0, false, false, false, false, interface);
-    std::thread::sleep(Duration::from_millis(50));
+    if send_left_click {
+        send_mouse(left_up, 0, 0, false, false, false, false, interface);
+        std::thread::sleep(Duration::from_millis(50));
+    }
     send_mouse(0, 0, 0, false, false, false, false, interface);
     std::thread::sleep(Duration::from_millis(50));
     send_mouse(0, 3, 3, false, false, false, false, interface);

@@ -4,10 +4,14 @@ Date: 2026-06-23
 
 ## Current Status
 
-Latest client/code pass is revision `013`.
+Latest client/code pass is revision `014`.
 
 What changed in this pass:
 
+- Follow-up from Android connection testing: revision `014` removes the remaining left-button release event from empty OS activation. Empty activation now sends only no-button wake/move events, so ordinary connects should not deliver either a right click or a left click to an unlocked host desktop.
+- `rustadmin_revision.txt` was bumped to `014`.
+- Android release APK built successfully: `RustAdmin_Android_Release_2.0.2.014.apk`, size `25,564,856` bytes, sha256 `4d3eabb7d156a69031fed4f4a25f8e273b50667a81f096e159a668c2e1a64138`.
+- Android release ZIP built successfully: `RustAdmin_Android_Release_2.0.2.014.zip`, size `24,993,354` bytes, sha256 `83e0ab7965b97a244981b86c4bd5fa7820079544095e920cc0b6cbbfc289be0e`.
 - Android packaging follow-up: revision `012` was missing `lib/arm64-v8a/libc++_shared.so`, so Android failed at startup with `UnsatisfiedLinkError` while loading `librustdesk.so`. Revision `013` stages the NDK C++ shared runtime next to `librustdesk.so` in `flutter/ndk_arm64.sh`.
 - `rustadmin_revision.txt` was bumped to `013`.
 - Android release APK built successfully: `RustAdmin_Android_Release_2.0.2.013.apk`, size `25,564,561` bytes, sha256 `2c6760d82eb0f8b0b7ceeaf7163d1c695febe7ce6166d36680d434caa596ac3a`.
@@ -58,7 +62,7 @@ Recent verification:
 - Windows revision `011` archive copied back from the VM and verified with `unzip -t`; no compressed data errors.
 - `cargo check --lib --no-default-features`: blocked by the same missing `gstreamer-1.0` pkg-config dependency.
 
-Latest Windows test build is `RustAdmin_Release_2.0.2.011.zip`; latest Android test build is `RustAdmin_Android_Release_2.0.2.013.apk`.
+Latest Windows test build is `RustAdmin_Release_2.0.2.011.zip`; latest Android test build is `RustAdmin_Android_Release_2.0.2.014.apk`.
 
 Earlier capture-backend menu test details:
 
