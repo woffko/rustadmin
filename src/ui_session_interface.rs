@@ -433,7 +433,7 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().is_privacy_mode_supported()
     }
 
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn is_text_clipboard_required(&self) -> bool {
         *self.server_clipboard_enabled.read().unwrap()
             && *self.server_keyboard_enabled.read().unwrap()
@@ -443,6 +443,16 @@ impl<T: InvokeUiSession> Session<T> {
                 .read()
                 .unwrap()
                 .is_local_to_remote_clipboard_allowed()
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn is_text_clipboard_required(&self) -> bool {
+        *self.server_clipboard_enabled.read().unwrap()
+            && *self.server_keyboard_enabled.read().unwrap()
+            && !self.lc.read().unwrap().disable_clipboard.v
+            && crate::clipboard::is_local_to_remote_clipboard_allowed(
+                crate::clipboard::ClipboardSide::Client,
+            )
     }
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -532,7 +542,6 @@ impl<T: InvokeUiSession> Session<T> {
     pub fn set_capture_backend(&self, value: String) {
         let msg = self.lc.write().unwrap().set_capture_backend(value, true);
         self.send(Data::Message(msg));
-        self.send(Data::Message(LoginConfigHandler::refresh()));
     }
 
     pub fn get_remember(&self) -> bool {
@@ -558,7 +567,7 @@ impl<T: InvokeUiSession> Session<T> {
         true
     }
 
-    pub fn alternative_codecs(&self) -> (bool, bool, bool, bool) {
+    pub fn alternative_codecs(&self) -> (bool, bool, bool, bool, bool, bool, bool) {
         let luid = self.lc.read().unwrap().adapter_luid;
         let mark_unsupported = self.lc.read().unwrap().mark_unsupported.clone();
         let decoder = scrap::codec::Decoder::supported_decodings(
@@ -569,14 +578,20 @@ impl<T: InvokeUiSession> Session<T> {
         );
         let mut vp8 = decoder.ability_vp8 > 0;
         let mut av1 = decoder.ability_av1 > 0;
+        let mut av1_hw = decoder.ability_av1 > 0;
         let mut h264 = decoder.ability_h264 > 0;
         let mut h265 = decoder.ability_h265 > 0;
+        let mut h264_hq = decoder.ability_h264 > 0;
+        let mut h265_hq = decoder.ability_h265 > 0;
         let enc = &self.lc.read().unwrap().supported_encoding;
         vp8 = vp8 && enc.vp8;
         av1 = av1 && enc.av1;
+        av1_hw = av1_hw && enc.av1_hw;
         h264 = h264 && enc.h264;
         h265 = h265 && enc.h265;
-        (vp8, av1, h264, h265)
+        h264_hq = h264_hq && enc.h264_hq;
+        h265_hq = h265_hq && enc.h265_hq;
+        (vp8, av1, av1_hw, h264, h265, h264_hq, h265_hq)
     }
 
     pub fn update_supported_decodings(&self) {
@@ -1871,7 +1886,6 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                 "fingerprint": fingerprint,
                 "trust_phrase": trust_phrase,
                 "direct": direct,
-                "allow_unverified_peer_trust": crate::common::allow_unverified_peer_trust(),
             })
             .to_string();
             self.ui_handler.msgbox(
@@ -2056,19 +2070,34 @@ impl<T: InvokeUiSession> Interface for Session<T> {
 
     async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {
         if !t.from_client {
+            let has_video_delivery_status = !t.video_delivery_phase.is_empty();
             self.update_quality_status(QualityStatus {
                 delay: Some(t.last_delay as _),
                 target_bitrate: Some(t.target_bitrate as _),
-                host_video_fps: (!t.host_video_fps.is_empty()).then_some(t.host_video_fps.clone()),
-                host_video_codec: (!t.host_video_codec.is_empty())
-                    .then_some(t.host_video_codec.clone()),
-                host_video_qos: (!t.host_video_qos.is_empty()).then_some(t.host_video_qos.clone()),
-                host_video_wait: (!t.host_video_wait.is_empty())
-                    .then_some(t.host_video_wait.clone()),
-                host_video_backend: (!t.host_video_backend.is_empty())
-                    .then_some(t.host_video_backend.clone()),
-                host_video_fallback: (!t.host_video_fallback.is_empty())
-                    .then_some(t.host_video_fallback.clone()),
+                capture_backend: if t.capture_backend.is_empty() {
+                    None
+                } else {
+                    Some(t.capture_backend.clone())
+                },
+                capture_frame: if t.capture_frame.is_empty() {
+                    None
+                } else {
+                    Some(t.capture_frame.clone())
+                },
+                encoder_backend: if t.encoder_backend.is_empty() {
+                    None
+                } else {
+                    Some(t.encoder_backend.clone())
+                },
+                encoder_input: if t.encoder_input.is_empty() {
+                    None
+                } else {
+                    Some(t.encoder_input.clone())
+                },
+                video_delivery_phase: has_video_delivery_status
+                    .then(|| t.video_delivery_phase.clone()),
+                video_recovery_count: has_video_delivery_status.then_some(t.video_recovery_count),
+                video_stall_ms: has_video_delivery_status.then_some(t.video_stall_ms),
                 ..Default::default()
             });
             handle_test_delay(t, peer).await;

@@ -151,75 +151,40 @@ customImageQualityWidget(
                         ))
                   ],
                 )),
-            Obx(() {
-              onChanged(String? value) {
-                if (value == null || setFpsMode == null) return;
-                fpsModeValue.value = value;
-                setFpsMode(value);
-              }
-
-              if (isMobile) {
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+            Obx(() => Row(
                   children: [
-                    Padding(
-                      padding: const EdgeInsets.only(left: 16, top: 4),
-                      child: Text(
-                        translate('FPS mode'),
-                        style: const TextStyle(fontSize: 15),
+                    Expanded(
+                        flex: 1,
+                        child: Text(
+                          translate('FPS mode'),
+                          style: const TextStyle(fontSize: 15),
+                        )),
+                    Expanded(
+                      flex: 3,
+                      child: DropdownButton<String>(
+                        value: fpsModeValue.value,
+                        isExpanded: true,
+                        onChanged: setFpsMode == null
+                            ? null
+                            : (String? value) {
+                                if (value == null) return;
+                                fpsModeValue.value = value;
+                                setFpsMode(value);
+                              },
+                        items: [
+                          DropdownMenuItem(
+                            value: kCustomFpsModeAdaptive,
+                            child: Text(translate('Adaptive FPS cap')),
+                          ),
+                          DropdownMenuItem(
+                            value: kCustomFpsModeFixed,
+                            child: Text(translate('Fixed FPS')),
+                          ),
+                        ],
                       ),
                     ),
-                    RadioListTile<String>(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      visualDensity: VisualDensity.compact,
-                      title: Text(translate('Adaptive FPS cap')),
-                      value: kCustomFpsModeAdaptive,
-                      groupValue: fpsModeValue.value,
-                      onChanged: setFpsMode == null ? null : onChanged,
-                    ),
-                    RadioListTile<String>(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      visualDensity: VisualDensity.compact,
-                      title: Text(translate('Fixed FPS')),
-                      value: kCustomFpsModeFixed,
-                      groupValue: fpsModeValue.value,
-                      onChanged: setFpsMode == null ? null : onChanged,
-                    ),
                   ],
-                );
-              }
-
-              return Row(
-                children: [
-                  Expanded(
-                      flex: 1,
-                      child: Text(
-                        translate('FPS mode'),
-                        style: const TextStyle(fontSize: 15),
-                      )),
-                  Expanded(
-                    flex: 3,
-                    child: DropdownButton<String>(
-                      value: fpsModeValue.value,
-                      isExpanded: true,
-                      onChanged: setFpsMode == null ? null : onChanged,
-                      items: [
-                        DropdownMenuItem(
-                          value: kCustomFpsModeAdaptive,
-                          child: Text(translate('Adaptive FPS cap')),
-                        ),
-                        DropdownMenuItem(
-                          value: kCustomFpsModeFixed,
-                          child: Text(translate('Fixed FPS')),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              );
-            }),
+                )),
           ],
         ),
     ],

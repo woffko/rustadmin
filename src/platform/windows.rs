@@ -62,7 +62,7 @@ use winapi::{
             PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
             TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
         },
-        winreg::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
+        winreg::HKEY_CURRENT_USER,
         winspool::{
             EnumPrintersW, GetDefaultPrinterW, PRINTER_ENUM_CONNECTIONS, PRINTER_ENUM_LOCAL,
             PRINTER_INFO_1W,
@@ -99,7 +99,8 @@ use winreg::{enums::*, RegKey};
 mod acl;
 pub(crate) use acl::current_process_user_sid_string;
 pub use acl::{
-    set_path_permission, set_path_permission_for_portable_service_shmem_dir,
+    grant_user_capture_helper_shmem_file_access, set_path_permission,
+    set_path_permission_for_portable_service_shmem_dir,
     set_path_permission_for_portable_service_shmem_file,
     validate_path_for_portable_service_shmem_dir,
 };
@@ -574,6 +575,7 @@ extern "C" {
     ) -> BOOL;
     fn selectInputDesktop() -> BOOL;
     fn inputDesktopSelected() -> BOOL;
+    fn inputDesktopAccessMask() -> DWORD;
     fn is_windows_server() -> BOOL;
     fn is_windows_10_or_greater() -> BOOL;
     fn handleMask(
@@ -794,9 +796,9 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             Err(err) => {
                                 if !server_launch_mode_switch_deferred_logged {
                                     log::warn!(
-                                            "Failed to query controlled session count before Windows server launch mode switch: {}; deferring relaunch",
-                                            err
-                                        );
+                                        "Failed to query controlled session count before Windows server launch mode switch: {}; relaunch deferred",
+                                        err
+                                    );
                                     server_launch_mode_switch_deferred_logged = true;
                                 }
                                 usize::MAX
@@ -926,6 +928,10 @@ async fn launch_server(
 
 pub fn launch_privileged_process(session_id: DWORD, cmd: &str) -> ResultType<HANDLE> {
     launch_process_in_session(session_id, cmd, ServerLaunchMode::Privileged)
+}
+
+pub fn launch_user_process_in_session(session_id: DWORD, cmd: &str) -> ResultType<HANDLE> {
+    launch_process_in_session(session_id, cmd, ServerLaunchMode::InteractiveUser)
 }
 
 fn launch_process_in_session(
@@ -1189,7 +1195,10 @@ pub fn try_change_desktop() -> bool {
                     *s = Instant::now();
                 }
             } else {
-                log::info!("Desktop switched");
+                log::info!(
+                    "Desktop switched: input_access_mask=0x{:08x}",
+                    inputDesktopAccessMask()
+                );
             }
             return res;
         }
@@ -2522,6 +2531,29 @@ pub fn get_user_token(session_id: u32, as_user: bool) -> HANDLE {
     }
 }
 
+pub(crate) fn get_current_session_user_sid_string() -> ResultType<String> {
+    let Some(session_id) = get_current_process_session_id() else {
+        bail!("Failed to get current process session id");
+    };
+    get_session_user_sid_string(session_id)
+}
+
+fn get_session_user_sid_string(session_id: u32) -> ResultType<String> {
+    let token = get_user_token(session_id, true);
+    if token.is_null() {
+        bail!(
+            "Failed to get interactive user token for session {}",
+            session_id
+        );
+    }
+    let subject = format!("session {} interactive user", session_id);
+    let result = acl::token_user_sid_string(WinHANDLE(token as _), subject.as_str());
+    unsafe {
+        CloseHandle(token);
+    }
+    result
+}
+
 pub fn run_background(exe: &str, arg: &str) -> ResultType<bool> {
     let wexe = wide_string(exe);
     let warg;
@@ -2622,6 +2654,7 @@ pub fn elevate_or_run_as_system(is_setup: bool, is_elevate: bool, is_run_as_syst
         // with inconsistent shared-memory contract.
         std::process::exit(1);
     }
+    let is_portable_service_bootstrap = shmem_name_from_args.is_some();
     if let Some(shmem_name) = shmem_name_from_args {
         let shmem_arg = crate::portable_service::portable_service_shmem_arg(&shmem_name);
         arg_elevate.push(' ');
@@ -2638,6 +2671,19 @@ pub fn elevate_or_run_as_system(is_setup: bool, is_elevate: bool, is_run_as_syst
         match is_elevated(None) {
             Ok(elevated) => {
                 if elevated {
+                    if is_elevate && is_portable_service_bootstrap {
+                        log::info!("run portable service as SYSTEM from elevated bootstrap");
+                        if run_as_system(arg_run_as_system.as_str()).is_ok() {
+                            std::process::exit(0);
+                        }
+                        log::error!(
+                            "Failed to run portable service as SYSTEM from elevated bootstrap, fallback to elevated user, error {}",
+                            io::Error::last_os_error()
+                        );
+                        log::info!("run elevated portable service fallback");
+                        crate::portable_service::server::run_portable_service();
+                        return;
+                    }
                     if !is_run_as_system {
                         if run_as_system(arg_run_as_system.as_str()).is_ok() {
                             std::process::exit(0);
@@ -4745,6 +4791,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_input_desktop_access_mask_matches_service_switch_contract() {
+        let mask = unsafe { inputDesktopAccessMask() };
+        let required = DESKTOP_CREATEMENU
+            | DESKTOP_CREATEWINDOW
+            | DESKTOP_ENUMERATE
+            | DESKTOP_HOOKCONTROL
+            | DESKTOP_WRITEOBJECTS
+            | DESKTOP_READOBJECTS
+            | DESKTOP_SWITCHDESKTOP
+            | winapi::um::winnt::GENERIC_WRITE;
+
+        assert_eq!(
+            mask & required,
+            required,
+            "input desktop switching must keep service-grade access rights"
+        );
     }
 
     #[test]

@@ -4,14 +4,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use clipboard_master::CallbackResult;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "ios")))]
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, Host, StreamConfig,
 };
 use crossbeam_queue::ArrayQueue;
 use magnum_opus::{Channels::*, Decoder as AudioDecoder};
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "ios")))]
 use ringbuf::{ring_buffer::RbBase, Rb};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::{
     check_port,
-    common::input::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP},
+    common::input::{MOUSE_BUTTON_LEFT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP},
     create_symmetric_key_msg, decode_direct_id_pk, decode_id_pk, decode_secure_signed_id,
     get_rs_pk, is_direct_handshake_ack_ok, is_keyboard_mode_supported,
     kcp_stream::KcpStream,
@@ -85,7 +85,7 @@ pub use helper::*;
 use scrap::{
     codec::Decoder,
     record::{Recorder, RecorderContext},
-    CodecFormat, ImageFormat, ImageRgb, ImageTexture, VideoDecodePerf,
+    CodecFormat, ImageFormat, ImageRgb, ImageTexture,
 };
 
 #[cfg(not(target_os = "ios"))]
@@ -106,6 +106,7 @@ pub mod screenshot;
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
 pub const VIDEO_QUEUE_SIZE: usize = 120;
+const VIDEO_FEEDBACK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const MAX_DECODE_FAIL_COUNTER: usize = 3;
 
 #[cfg(target_os = "linux")]
@@ -137,7 +138,7 @@ pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 pub const CLIPBOARD_DIRECTION_TOGGLE_PREFIX: &str = "clipboard-direction:";
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "ios")))]
 pub const AUDIO_BUFFER_MS: usize = 3000;
 
 #[cfg(feature = "flutter")]
@@ -199,7 +200,7 @@ struct ClipboardState {
     running: bool,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "ios")))]
 lazy_static::lazy_static! {
     static ref AUDIO_HOST: Host = cpal::default_host();
 }
@@ -970,6 +971,11 @@ impl Client {
                                 "Handshake failed: trusted peer key changed or is invalid; rendezvous pairing passphrase is required to repair trust"
                             );
                         }
+                        if !crate::common::allow_unverified_peer_trust() {
+                            bail!(
+                                "Handshake failed: first secure contact requires a trusted peer key or rendezvous pairing passphrase. Enable 'Allow unverified peer trust' to allow legacy first-contact trust"
+                            );
+                        }
                         interface
                             .confirm_peer_trust(
                                 peer,
@@ -979,11 +985,6 @@ impl Client {
                                 false,
                             )
                             .await?;
-                        if !crate::common::allow_unverified_peer_trust() {
-                            bail!(
-                                "Handshake failed: first secure contact requires a trusted peer key or rendezvous pairing passphrase. Enable 'Allow unverified peer trust' to allow legacy first-contact trust"
-                            );
-                        }
                         crate::common::pin_trusted_peer_signing_key(peer_id, peer_config_id, &pk)?;
                         pending_trust = None;
                     }
@@ -1135,6 +1136,11 @@ impl Client {
                                 "Handshake failed: trusted peer key changed or is invalid; local or rendezvous pairing passphrase is required to repair trust"
                             );
                         }
+                        if !crate::common::allow_unverified_peer_trust() {
+                            bail!(
+                                "Handshake failed: first direct secure contact requires a trusted peer key or local/rendezvous pairing passphrase. Enable 'Allow unverified peer trust' to allow legacy first-contact trust"
+                            );
+                        }
                         interface
                             .confirm_peer_trust(
                                 peer,
@@ -1144,11 +1150,6 @@ impl Client {
                                 true,
                             )
                             .await?;
-                        if !crate::common::allow_unverified_peer_trust() {
-                            bail!(
-                                "Handshake failed: first direct secure contact requires a trusted peer key or local/rendezvous pairing passphrase. Enable 'Allow unverified peer trust' to allow legacy first-contact trust"
-                            );
-                        }
                         crate::common::pin_trusted_peer_signing_key(
                             &peer_id,
                             peer_config_id,
@@ -1686,26 +1687,26 @@ pub struct AudioHandler {
     audio_decoder: Option<(AudioDecoder, Vec<f32>)>,
     #[cfg(target_os = "linux")]
     simple: Option<psimple::Simple>,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "ios")))]
     audio_buffer: AudioBuffer,
     sample_rate: (u32, u32),
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "ios")))]
     audio_stream: Option<Box<dyn StreamTrait>>,
     channels: u16,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "ios")))]
     device_channel: u16,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "ios")))]
     ready: Arc<std::sync::Mutex<bool>>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "ios")))]
 struct AudioBuffer(
     pub Arc<std::sync::Mutex<ringbuf::HeapRb<f32>>>,
     usize,
     [usize; 30],
 );
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "ios")))]
 impl Default for AudioBuffer {
     fn default() -> Self {
         Self(
@@ -1718,7 +1719,7 @@ impl Default for AudioBuffer {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "ios")))]
 impl AudioBuffer {
     pub fn resize(&mut self, sample_rate: usize, channels: usize) {
         let capacity = sample_rate * channels * AUDIO_BUFFER_MS / 1000;
@@ -1851,7 +1852,7 @@ impl AudioHandler {
     }
 
     /// Start the audio playback.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "ios")))]
     fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
         let device = AUDIO_HOST
             .default_output_device()
@@ -1901,6 +1902,11 @@ impl AudioHandler {
         Ok(())
     }
 
+    #[cfg(target_os = "ios")]
+    fn start_audio(&mut self, _format0: AudioFormat) -> ResultType<()> {
+        Ok(())
+    }
+
     /// Handle audio format and create an audio decoder.
     pub fn handle_format(&mut self, f: AudioFormat) {
         match AudioDecoder::new(f.sample_rate, if f.channels > 1 { Stereo } else { Mono }) {
@@ -1919,7 +1925,7 @@ impl AudioHandler {
     /// Handle audio frame and play it.
     #[inline]
     pub fn handle_frame(&mut self, frame: AudioFrame) {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "ios")))]
         if self.audio_stream.is_none() || !self.ready.lock().unwrap().clone() {
             return;
         }
@@ -1932,7 +1938,7 @@ impl AudioHandler {
             if let Ok(n) = d.decode_float(&frame.data, buffer, false) {
                 let channels = self.channels;
                 let n = n * (channels as usize);
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "ios")))]
                 {
                     let sample_rate0 = self.sample_rate.0;
                     let sample_rate = self.sample_rate.1;
@@ -1967,7 +1973,7 @@ impl AudioHandler {
     }
 
     /// Build audio output stream for current device.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "ios")))]
     fn build_output_stream<T: cpal::Sample + cpal::SizedSample + cpal::FromSample<f32>>(
         &mut self,
         config: &StreamConfig,
@@ -2052,7 +2058,6 @@ pub struct VideoHandler {
     _display: usize, // useful for debug
     fail_counter: usize,
     first_frame: bool,
-    pub decode_perf: VideoDecodePerf,
 }
 
 impl VideoHandler {
@@ -2085,8 +2090,11 @@ impl VideoHandler {
             _display,
             fail_counter: 0,
             first_frame: true,
-            decode_perf: Default::default(),
         }
+    }
+
+    pub fn decoder_backend(&self) -> &'static str {
+        self.decoder.backend()
     }
 
     /// Handle a new video frame.
@@ -2098,43 +2106,30 @@ impl VideoHandler {
         chroma: &mut Option<Chroma>,
     ) -> ResultType<bool> {
         let format = CodecFormat::from(&vf);
+        let stream_id = vf.stream_id;
+        let frame_id = vf.frame_id;
+        let capture_time_ms = vf.capture_time_ms;
         if format != self.decoder.format() {
             self.reset(Some(format));
         }
         match &vf.union {
             Some(frame) => {
-                let handle_frame_start = std::time::Instant::now();
-                self.decode_perf = VideoDecodePerf::default();
-                self.decode_perf.codec_format = format;
                 let res = self.decoder.handle_video_frame(
                     frame,
                     &mut self.rgb,
                     &mut self.texture,
                     pixelbuffer,
                     chroma,
-                    &mut self.decode_perf,
                 );
-                self.decode_perf.handle_frame_total = Some(handle_frame_start.elapsed());
-                if res.as_ref().map(|x| *x).unwrap_or(false) {
-                    if *pixelbuffer {
-                        self.decode_perf.width = self.rgb.w;
-                        self.decode_perf.height = self.rgb.h;
-                        self.decode_perf.rgba_bytes = self.rgb.raw.len();
-                        if self.decode_perf.render_path == "unknown" {
-                            self.decode_perf.render_path = "rgba_soft_render";
-                        }
-                    } else {
-                        self.decode_perf.width = self.texture.w;
-                        self.decode_perf.height = self.texture.h;
-                        self.decode_perf.render_path = "texture_render";
-                    }
+                if res.as_ref().is_ok_and(|x| *x) {
                     if self.first_frame {
                         log::info!(
-                            "diag first video frame decoded: display={}, format={:?}, codec_path={}, render_path={}, pixelbuffer={}, chroma={:?}, rgb={}x{}, texture={}x{}, decoder_valid={}",
+                            "diag first video frame decoded: display={}, stream_id={}, frame_id={}, capture_ms={}, format={:?}, pixelbuffer={}, chroma={:?}, rgb={}x{}, texture={}x{}, decoder_valid={}",
                             self._display,
+                            stream_id,
+                            frame_id,
+                            capture_time_ms,
                             self.decoder.format(),
-                            self.decode_perf.codec_path,
-                            self.decode_perf.render_path,
                             *pixelbuffer,
                             chroma,
                             self.rgb.w,
@@ -2197,7 +2192,6 @@ impl VideoHandler {
         self.decoder = Decoder::new(format, luid);
         self.fail_counter = 0;
         self.first_frame = true;
-        self.decode_perf = Default::default();
     }
 
     /// Start or stop screen record.
@@ -2633,26 +2627,35 @@ impl LoginConfigHandler {
         let mut option = OptionMessage::default();
         let mut config = self.load_config();
         if let Some(direction) = name.strip_prefix(CLIPBOARD_DIRECTION_TOGGLE_PREFIX) {
-            let direction =
-                crate::clipboard::clipboard_direction_policy_from_option_value(direction);
-            config.options.insert(
-                keys::OPTION_ONE_WAY_CLIPBOARD_REDIRECTION.to_owned(),
-                direction.as_option_value().to_owned(),
-            );
-            let disable_clipboard =
-                !direction.allows_local_to_remote() && !direction.allows_remote_to_local();
-            let disable_changed = config.disable_clipboard.v != disable_clipboard;
-            config.disable_clipboard.v = disable_clipboard;
-            if disable_changed {
-                option.disable_clipboard = (if disable_clipboard {
-                    BoolOption::Yes
-                } else {
-                    BoolOption::No
-                })
-                .into();
-            } else {
+            #[cfg(target_os = "ios")]
+            {
+                let _ = direction;
                 self.save_config(config);
                 return None;
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                let direction =
+                    crate::clipboard::clipboard_direction_policy_from_option_value(direction);
+                config.options.insert(
+                    keys::OPTION_ONE_WAY_CLIPBOARD_REDIRECTION.to_owned(),
+                    direction.as_option_value().to_owned(),
+                );
+                let disable_clipboard =
+                    !direction.allows_local_to_remote() && !direction.allows_remote_to_local();
+                let disable_changed = config.disable_clipboard.v != disable_clipboard;
+                config.disable_clipboard.v = disable_clipboard;
+                if disable_changed {
+                    option.disable_clipboard = (if disable_clipboard {
+                        BoolOption::Yes
+                    } else {
+                        BoolOption::No
+                    })
+                    .into();
+                } else {
+                    self.save_config(config);
+                    return None;
+                }
             }
         } else if name == "show-remote-cursor" {
             config.show_remote_cursor.v = !config.show_remote_cursor.v;
@@ -2899,7 +2902,7 @@ impl LoginConfigHandler {
         }
         let supported_decoding = self.get_supported_decoding();
         log::info!(
-            "diag viewer supported_decoding on login: id={}, texture_render={}, adapter_luid={:?}, mark_unsupported={:?}, h264={}, h265={}, vp9={}, av1={}, prefer={:?}",
+            "diag viewer supported_decoding on login: id={}, texture_render={}, adapter_luid={:?}, mark_unsupported={:?}, h264={}, h265={}, vp9={}, av1={}, video_feedback={}, prefer={:?}",
             self.id,
             use_texture_render(),
             self.adapter_luid,
@@ -2908,6 +2911,7 @@ impl LoginConfigHandler {
             supported_decoding.ability_h265,
             supported_decoding.ability_vp9,
             supported_decoding.ability_av1,
+            supported_decoding.video_feedback,
             supported_decoding.prefer.enum_value_or(PreferCodec::Auto)
         );
         msg.supported_decoding = MessageField::some(supported_decoding);
@@ -2916,12 +2920,14 @@ impl LoginConfigHandler {
 
     pub fn get_supported_decoding(&self) -> SupportedDecoding {
         get_hwcodec_config();
-        Decoder::supported_decodings(
+        let mut decoding = Decoder::supported_decodings(
             Some(&self.id),
             use_texture_render(),
             self.adapter_luid,
             &self.mark_unsupported,
-        )
+        );
+        decoding.video_feedback = true;
+        decoding
     }
 
     /// Parse the image quality option.
@@ -3156,13 +3162,6 @@ impl LoginConfigHandler {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub(crate) fn is_local_to_remote_clipboard_allowed(&self) -> bool {
         self.clipboard_direction_policy().allows_local_to_remote()
-    }
-
-    #[cfg(target_os = "android")]
-    pub(crate) fn is_local_to_remote_clipboard_allowed(&self) -> bool {
-        crate::clipboard::is_local_to_remote_clipboard_allowed(
-            crate::clipboard::ClipboardSide::Client,
-        )
     }
 
     #[inline]
@@ -3446,14 +3445,15 @@ impl LoginConfigHandler {
     }
 
     pub fn update_supported_decodings(&self) -> Message {
-        let decoding = scrap::codec::Decoder::supported_decodings(
+        let mut decoding = scrap::codec::Decoder::supported_decodings(
             Some(&self.id),
             use_texture_render(),
             self.adapter_luid,
             &self.mark_unsupported,
         );
+        decoding.video_feedback = true;
         log::info!(
-            "diag viewer supported_decoding update: id={}, texture_render={}, adapter_luid={:?}, mark_unsupported={:?}, h264={}, h265={}, vp9={}, av1={}, prefer={:?}",
+            "diag viewer supported_decoding update: id={}, texture_render={}, adapter_luid={:?}, mark_unsupported={:?}, h264={}, h265={}, vp9={}, av1={}, video_feedback={}, prefer={:?}",
             self.id,
             use_texture_render(),
             self.adapter_luid,
@@ -3462,6 +3462,7 @@ impl LoginConfigHandler {
             decoding.ability_h265,
             decoding.ability_vp9,
             decoding.ability_av1,
+            decoding.video_feedback,
             decoding.prefer.enum_value_or(PreferCodec::Auto)
         );
         let mut misc = Misc::new();
@@ -3519,6 +3520,151 @@ pub enum MediaData {
 
 pub type MediaSender = mpsc::Sender<MediaData>;
 
+#[derive(Debug, Default)]
+pub(crate) struct VideoFeedbackTracker {
+    stream_id: u64,
+    display: i32,
+    received_frame_id: u64,
+    decoded_frame_id: u64,
+    render_submitted_frame_id: u64,
+    queue_depth_frames: u32,
+    decode_time_us: u32,
+    render_submit_time_us: u32,
+    dropped_frames: u64,
+    last_sent: Option<std::time::Instant>,
+    last_sent_decoded_frame_id: u64,
+    last_sent_render_submitted_frame_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VideoFeedbackSnapshot {
+    pub(crate) received_frame_id: u64,
+    pub(crate) decoded_frame_id: u64,
+    pub(crate) render_submitted_frame_id: u64,
+    pub(crate) queue_depth_frames: u32,
+    pub(crate) decode_time_us: u32,
+    pub(crate) render_submit_time_us: u32,
+    pub(crate) dropped_frames: u64,
+}
+
+impl VideoFeedbackTracker {
+    pub(crate) fn snapshot(&self) -> VideoFeedbackSnapshot {
+        VideoFeedbackSnapshot {
+            received_frame_id: self.received_frame_id,
+            decoded_frame_id: self.decoded_frame_id,
+            render_submitted_frame_id: self.render_submitted_frame_id,
+            queue_depth_frames: self.queue_depth_frames,
+            decode_time_us: self.decode_time_us,
+            render_submit_time_us: self.render_submit_time_us,
+            dropped_frames: self.dropped_frames,
+        }
+    }
+
+    pub(crate) fn record_received(&mut self, vf: &VideoFrame) -> bool {
+        if vf.stream_id == 0 || vf.frame_id == 0 {
+            return false;
+        }
+        let new_stream = self.stream_id != vf.stream_id || self.display != vf.display;
+        if new_stream {
+            *self = Self {
+                stream_id: vf.stream_id,
+                display: vf.display,
+                ..Default::default()
+            };
+        }
+        self.received_frame_id = self.received_frame_id.max(vf.frame_id);
+        new_stream
+    }
+
+    pub(crate) fn record_queue_depth(&mut self, queue_depth_frames: usize) {
+        self.queue_depth_frames = queue_depth_frames.min(u32::MAX as usize) as u32;
+    }
+
+    pub(crate) fn record_drop(&mut self) {
+        self.dropped_frames = self.dropped_frames.saturating_add(1);
+    }
+
+    fn duration_us(duration: std::time::Duration) -> u32 {
+        duration.as_micros().min(u32::MAX as u128) as u32
+    }
+
+    pub(crate) fn record_decoded(
+        &mut self,
+        stream_id: u64,
+        frame_id: u64,
+        decode_time: std::time::Duration,
+    ) {
+        if self.stream_id == stream_id && frame_id != 0 {
+            self.decoded_frame_id = self.decoded_frame_id.max(frame_id);
+            self.decode_time_us = Self::duration_us(decode_time);
+        }
+    }
+
+    pub(crate) fn record_render_submitted(
+        &mut self,
+        stream_id: u64,
+        frame_id: u64,
+        render_submit_time: std::time::Duration,
+        queue_depth_frames: usize,
+    ) {
+        if self.stream_id == stream_id && frame_id != 0 {
+            self.render_submitted_frame_id = self.render_submitted_frame_id.max(frame_id);
+            self.render_submit_time_us = Self::duration_us(render_submit_time);
+            self.record_queue_depth(queue_depth_frames);
+        }
+    }
+
+    fn take_due_at(&mut self, now: std::time::Instant, force: bool) -> Option<VideoFeedback> {
+        if self.stream_id == 0 || self.received_frame_id == 0 {
+            return None;
+        }
+        let decode_progress = self.decoded_frame_id > self.last_sent_decoded_frame_id;
+        let render_submit_progress =
+            self.render_submitted_frame_id > self.last_sent_render_submitted_frame_id;
+        let interval_elapsed = self
+            .last_sent
+            .map(|last| now.saturating_duration_since(last) >= VIDEO_FEEDBACK_INTERVAL)
+            .unwrap_or(true);
+        if !force && !decode_progress && !render_submit_progress && !interval_elapsed {
+            return None;
+        }
+        self.last_sent = Some(now);
+        self.last_sent_decoded_frame_id = self.decoded_frame_id;
+        self.last_sent_render_submitted_frame_id = self.render_submitted_frame_id;
+        Some(VideoFeedback {
+            stream_id: self.stream_id,
+            display: self.display,
+            received_frame_id: self.received_frame_id,
+            decoded_frame_id: self.decoded_frame_id,
+            render_submitted_frame_id: self.render_submitted_frame_id,
+            queue_depth_frames: self.queue_depth_frames,
+            decode_time_us: self.decode_time_us,
+            render_submit_time_us: self.render_submit_time_us,
+            dropped_frames: self.dropped_frames,
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn take_due(&mut self, force: bool) -> Option<VideoFeedback> {
+        self.take_due_at(std::time::Instant::now(), force)
+    }
+}
+
+pub(crate) fn send_video_feedback<T: InvokeUiSession>(
+    session: &Session<T>,
+    tracker: &Arc<Mutex<VideoFeedbackTracker>>,
+    force: bool,
+) {
+    let feedback = tracker.lock().unwrap().take_due(force);
+    if let Some(feedback) = feedback {
+        let mut misc = Misc::new();
+        misc.set_video_feedback(feedback);
+        let mut message = Message::new();
+        message.set_misc(misc);
+        session.send(Data::Message(message));
+    }
+}
+
 /// Start video thread.
 ///
 /// # Arguments
@@ -3530,8 +3676,12 @@ pub fn start_video_thread<F, T>(
     video_receiver: mpsc::Receiver<MediaData>,
     video_queue: Arc<RwLock<ArrayQueue<VideoFrame>>>,
     fps: Arc<RwLock<Option<usize>>>,
+    decoder_backend: Arc<RwLock<Option<&'static str>>>,
+    renderer: Arc<RwLock<Option<&'static str>>>,
+    frame_resolution: Arc<RwLock<Option<(usize, usize)>>>,
     chroma: Arc<RwLock<Option<Chroma>>>,
     discard_queue: Arc<RwLock<bool>>,
+    video_feedback: Arc<Mutex<VideoFeedbackTracker>>,
     video_callback: F,
 ) where
     F: 'static + FnMut(usize, &mut scrap::ImageRgb, *mut c_void, bool) + Send,
@@ -3549,24 +3699,21 @@ pub fn start_video_thread<F, T>(
         let mut count = 0;
         let mut duration = std::time::Duration::ZERO;
         let mut skip_beginning = 0;
-        let mut diag_frame_count = 0usize;
         loop {
             if let Ok(data) = video_receiver.recv() {
                 match data {
                     MediaData::VideoFrame(_) | MediaData::VideoQueue => {
-                        let (vf, queue_len, queue_source) = match data {
+                        let vf = match data {
                             MediaData::VideoFrame(vf) => {
                                 *discard_queue.write().unwrap() = false;
-                                let queue_len = video_queue.read().unwrap().len();
-                                (*vf, queue_len, "direct_keyframe")
+                                *vf
                             }
                             MediaData::VideoQueue => {
                                 if let Some(vf) = video_queue.read().unwrap().pop() {
                                     if discard_queue.read().unwrap().clone() {
                                         continue;
                                     }
-                                    let queue_len = video_queue.read().unwrap().len();
-                                    (vf, queue_len, "queued_delta")
+                                    vf
                                 } else {
                                     continue;
                                 }
@@ -3577,10 +3724,10 @@ pub fn start_video_thread<F, T>(
                             }
                         };
                         let display = vf.display as usize;
+                        let stream_id = vf.stream_id;
+                        let frame_id = vf.frame_id;
                         let start = std::time::Instant::now();
                         let format = CodecFormat::from(&vf);
-                        let (payload_bytes, encoded_frame_count, has_keyframe) =
-                            scrap::codec::video_frame_payload_stats(&vf).unwrap_or((0, 0, false));
                         if video_handler.is_none() {
                             let mut handler = VideoHandler::new(format, display);
                             let record_state = session.lc.read().unwrap().record_state;
@@ -3589,6 +3736,7 @@ pub fn start_video_thread<F, T>(
                             if record_state && record_permission {
                                 handler.record_screen(true, id, display, is_view_camera);
                             }
+                            *decoder_backend.write().unwrap() = Some(handler.decoder_backend());
                             video_handler = Some(handler);
                         }
                         if let Some(handler) = video_handler.as_mut() {
@@ -3597,15 +3745,43 @@ pub fn start_video_thread<F, T>(
                             let format_changed = handler.decoder.format() != format;
                             match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
                                 Ok(true) => {
-                                    let callback_start = std::time::Instant::now();
+                                    let decode_time = start.elapsed();
+                                    video_feedback.lock().unwrap().record_decoded(
+                                        stream_id,
+                                        frame_id,
+                                        decode_time,
+                                    );
+                                    *decoder_backend.write().unwrap() =
+                                        Some(handler.decoder_backend());
+                                    *renderer.write().unwrap() =
+                                        Some(if pixelbuffer { "rgba" } else { "texture" });
+                                    let resolution = if pixelbuffer {
+                                        Some((handler.rgb.w, handler.rgb.h))
+                                    } else if handler.texture.w > 0 && handler.texture.h > 0 {
+                                        Some((handler.texture.w, handler.texture.h))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(resolution) = resolution {
+                                        let mut current = frame_resolution.write().unwrap();
+                                        if *current != Some(resolution) {
+                                            *current = Some(resolution);
+                                        }
+                                    }
+                                    let render_submit_start = std::time::Instant::now();
                                     video_callback(
                                         display,
                                         &mut handler.rgb,
                                         handler.texture.texture,
                                         pixelbuffer,
                                     );
-                                    let callback_elapsed = callback_start.elapsed();
-                                    let total_elapsed = start.elapsed();
+                                    video_feedback.lock().unwrap().record_render_submitted(
+                                        stream_id,
+                                        frame_id,
+                                        render_submit_start.elapsed(),
+                                        video_queue.read().unwrap().len(),
+                                    );
+                                    send_video_feedback(&session, &video_feedback, false);
 
                                     // chroma
                                     if tmp_chroma.is_some() && last_chroma != tmp_chroma {
@@ -3618,125 +3794,10 @@ pub fn start_video_thread<F, T>(
                                         &mut skip_beginning,
                                         &fps,
                                         format_changed,
-                                        total_elapsed,
+                                        start.elapsed(),
                                         &mut count,
                                         &mut duration,
                                     );
-                                    diag_frame_count += 1;
-                                    let should_log_diag = diag_frame_count <= 5
-                                        || diag_frame_count % 30 == 0
-                                        || format_changed;
-                                    #[cfg(not(target_os = "android"))]
-                                    let _ = (
-                                        queue_len,
-                                        queue_source,
-                                        payload_bytes,
-                                        encoded_frame_count,
-                                        has_keyframe,
-                                        callback_elapsed,
-                                        should_log_diag,
-                                    );
-                                    #[cfg(target_os = "android")]
-                                    if should_log_diag {
-                                        let decode_fps = *fps.read().unwrap();
-                                        let perf = &handler.decode_perf;
-                                        let render_path = if pixelbuffer {
-                                            perf.render_path
-                                        } else {
-                                            "texture_render"
-                                        };
-                                        let media_format = format!(
-                                            "w:{:?} h:{:?} s:{:?} sh:{:?} cf:{:?} crop:{:?},{:?},{:?},{:?}",
-                                            perf.media_format_width,
-                                            perf.media_format_height,
-                                            perf.media_format_stride,
-                                            perf.media_format_slice_height,
-                                            perf.media_format_color_format,
-                                            perf.crop_left,
-                                            perf.crop_top,
-                                            perf.crop_right,
-                                            perf.crop_bottom,
-                                        );
-                                        let chroma = match tmp_chroma {
-                                            Some(Chroma::I444) => Some("4:4:4".to_owned()),
-                                            Some(Chroma::I420) => Some("4:2:0".to_owned()),
-                                            None => None,
-                                        };
-                                        session.update_quality_status(QualityStatus {
-                                            codec_format: Some(format.clone()),
-                                            chroma,
-                                            codec_path: Some(perf.codec_path.to_owned()),
-                                            render_path: Some(render_path.to_owned()),
-                                            frame_resolution: Some(format!(
-                                                "{}x{}",
-                                                perf.width, perf.height
-                                            )),
-                                            queue_len: Some(queue_len),
-                                            decode_fps,
-                                            mediacodec_input_queue_ms: Some(format_duration_ms(
-                                                perf.mediacodec_input_queue,
-                                            )),
-                                            mediacodec_output_dequeue_ms: Some(format_duration_ms(
-                                                perf.mediacodec_output_dequeue,
-                                            )),
-                                            yuv_to_rgba_ms: Some(format_duration_ms(
-                                                perf.yuv_to_rgba,
-                                            )),
-                                            mediacodec_decode_ms: Some(format_duration_ms(
-                                                perf.decoder_total,
-                                            )),
-                                            handle_frame_ms: Some(format_duration_ms(
-                                                perf.handle_frame_total,
-                                            )),
-                                            flutter_handoff_ms: Some(format_duration_ms(Some(
-                                                callback_elapsed,
-                                            ))),
-                                            end_to_end_ms: Some(format_duration_ms(Some(
-                                                total_elapsed,
-                                            ))),
-                                            rgba_bytes: Some(perf.rgba_bytes),
-                                            rgba_reallocated: Some(perf.rgba_reallocated),
-                                            output_buffer_bytes: Some(perf.output_buffer_bytes),
-                                            media_format: Some(media_format),
-                                            ..Default::default()
-                                        });
-                                        log::info!(
-                                            "diag android video pipeline: display={}, source={}, queue_len={}, codec={:?}, codec_path={}, render_path={}, frame_resolution={}x{}, payload_bytes={}, encoded_frames={}, keyframe={}, pixelbuffer={}, chroma={:?}, mediacodec_input_queue_ms={}, mediacodec_output_dequeue_ms={}, yuv_to_rgba_ms={}, mediacodec_decode_ms={}, handle_frame_ms={}, flutter_handoff_ms={}, end_to_end_ms={}, decode_fps={:?}, rgba_bytes={}, rgba_reallocated={}, output_buffer_bytes={}, media_format={{width:{:?}, height:{:?}, stride:{:?}, slice_height:{:?}, color_format:{:?}, crop:[{:?},{:?},{:?},{:?}]}}",
-                                            display,
-                                            queue_source,
-                                            queue_len,
-                                            format,
-                                            perf.codec_path,
-                                            render_path,
-                                            perf.width,
-                                            perf.height,
-                                            payload_bytes,
-                                            encoded_frame_count,
-                                            has_keyframe,
-                                            pixelbuffer,
-                                            tmp_chroma,
-                                            format_duration_ms(perf.mediacodec_input_queue),
-                                            format_duration_ms(perf.mediacodec_output_dequeue),
-                                            format_duration_ms(perf.yuv_to_rgba),
-                                            format_duration_ms(perf.decoder_total),
-                                            format_duration_ms(perf.handle_frame_total),
-                                            format_duration_ms(Some(callback_elapsed)),
-                                            format_duration_ms(Some(total_elapsed)),
-                                            decode_fps,
-                                            perf.rgba_bytes,
-                                            perf.rgba_reallocated,
-                                            perf.output_buffer_bytes,
-                                            perf.media_format_width,
-                                            perf.media_format_height,
-                                            perf.media_format_stride,
-                                            perf.media_format_slice_height,
-                                            perf.media_format_color_format,
-                                            perf.crop_left,
-                                            perf.crop_top,
-                                            perf.crop_right,
-                                            perf.crop_bottom,
-                                        );
-                                    }
                                 }
                                 Err(e) => {
                                     // This is a simple workaround.
@@ -3781,6 +3842,7 @@ pub fn start_video_thread<F, T>(
                     MediaData::Reset => {
                         if let Some(handler) = video_handler.as_mut() {
                             handler.reset(None);
+                            *decoder_backend.write().unwrap() = Some(handler.decoder_backend());
                         }
                     }
                     MediaData::RecordScreen(start) => {
@@ -3824,13 +3886,6 @@ pub fn start_audio_thread() -> MediaSender {
         log::info!("Audio decoder loop exits");
     });
     audio_sender
-}
-
-#[cfg(target_os = "android")]
-fn format_duration_ms(duration: Option<std::time::Duration>) -> String {
-    duration
-        .map(|duration| format!("{:.3}", duration.as_secs_f64() * 1000.0))
-        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 #[inline]
@@ -3882,6 +3937,14 @@ fn get_hwcodec_config() {
         } else {
             log::info!("{:?} used to get hwcodec config", start.elapsed());
         }
+    }
+    #[cfg(feature = "hwcodec")]
+    #[cfg(target_os = "ios")]
+    {
+        if !scrap::codec::enable_hwcodec_option() || scrap::hwcodec::HwCodecConfig::already_set() {
+            return;
+        }
+        scrap::hwcodec::start_check_process();
     }
 }
 
@@ -4044,25 +4107,22 @@ pub fn send_pointer_device_event(
 /// # Arguments
 ///
 /// * `interface` - The interface for sending data.
-/// * `send_left_click` - Whether to send a click event.
+/// * `send_left_click` - Whether to send a left click event.
 fn activate_os(interface: &impl Interface, send_left_click: bool) {
     let left_down = MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_DOWN;
     let left_up = MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_UP;
-    let right_down = MOUSE_BUTTON_RIGHT << 3 | MOUSE_TYPE_DOWN;
-    let right_up = MOUSE_BUTTON_RIGHT << 3 | MOUSE_TYPE_UP;
-    send_mouse(left_up, 0, 0, false, false, false, false, interface);
+    if send_left_click {
+        send_mouse(left_up, 0, 0, false, false, false, false, interface);
+    }
     std::thread::sleep(Duration::from_millis(50));
     send_mouse(0, 0, 0, false, false, false, false, interface);
     std::thread::sleep(Duration::from_millis(50));
     send_mouse(0, 3, 3, false, false, false, false, interface);
-    let (click_down, click_up) = if send_left_click {
-        (left_down, left_up)
-    } else {
-        (right_down, right_up)
-    };
-    std::thread::sleep(Duration::from_millis(50));
-    send_mouse(click_down, 0, 0, false, false, false, false, interface);
-    send_mouse(click_up, 0, 0, false, false, false, false, interface);
+    if send_left_click {
+        std::thread::sleep(Duration::from_millis(50));
+        send_mouse(left_down, 0, 0, false, false, false, false, interface);
+        send_mouse(left_up, 0, 0, false, false, false, false, interface);
+    }
     /*
     let mut key_event = KeyEvent::new();
     // do not use Esc, which has problem with Linux
@@ -4098,6 +4158,8 @@ fn _input_os_password(p: String, activate: bool, interface: impl Interface) {
     let input_password = !p.is_empty();
     if activate {
         // Click event is used to bring up the password input box.
+        // Empty activation is sent while waiting for the first image; it must not
+        // click because an unlocked desktop would receive an unexpected context menu.
         activate_os(&interface, input_password);
         std::thread::sleep(Duration::from_millis(1200));
     }
@@ -4991,6 +5053,109 @@ pub mod peer_online {
             )
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod video_feedback_tests {
+    use super::*;
+
+    fn frame(stream_id: u64, frame_id: u64, display: i32) -> VideoFrame {
+        VideoFrame {
+            stream_id,
+            frame_id,
+            display,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn feedback_reports_receive_decode_and_render_submission_progress() {
+        let start = std::time::Instant::now();
+        let mut tracker = VideoFeedbackTracker::default();
+
+        assert!(tracker.record_received(&frame(7, 1, 0)));
+        let received = tracker.take_due_at(start, true).unwrap();
+        assert_eq!(received.received_frame_id, 1);
+        assert_eq!(received.decoded_frame_id, 0);
+        assert_eq!(received.render_submitted_frame_id, 0);
+
+        tracker.record_decoded(7, 1, std::time::Duration::from_micros(120));
+        tracker.record_render_submitted(7, 1, std::time::Duration::from_micros(30), 2);
+        let rendered = tracker
+            .take_due_at(start + std::time::Duration::from_millis(1), false)
+            .unwrap();
+        assert_eq!(rendered.decoded_frame_id, 1);
+        assert_eq!(rendered.render_submitted_frame_id, 1);
+        assert_eq!(rendered.queue_depth_frames, 2);
+        assert_eq!(rendered.decode_time_us, 120);
+        assert_eq!(rendered.render_submit_time_us, 30);
+        assert_eq!(
+            tracker.snapshot(),
+            VideoFeedbackSnapshot {
+                received_frame_id: 1,
+                decoded_frame_id: 1,
+                render_submitted_frame_id: 1,
+                queue_depth_frames: 2,
+                decode_time_us: 120,
+                render_submit_time_us: 30,
+                dropped_frames: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn feedback_reports_later_decode_progress_before_periodic_interval() {
+        let start = std::time::Instant::now();
+        let mut tracker = VideoFeedbackTracker::default();
+
+        tracker.record_received(&frame(7, 1, 0));
+        tracker.record_decoded(7, 1, std::time::Duration::from_micros(120));
+        tracker.record_render_submitted(7, 1, std::time::Duration::from_micros(30), 0);
+        assert!(tracker.take_due_at(start, true).is_some());
+
+        tracker.record_received(&frame(7, 2, 0));
+        assert!(tracker
+            .take_due_at(start + std::time::Duration::from_millis(10), false)
+            .is_none());
+        tracker.record_decoded(7, 2, std::time::Duration::from_micros(125));
+        tracker.record_render_submitted(7, 2, std::time::Duration::from_micros(35), 0);
+
+        let progressed = tracker
+            .take_due_at(start + std::time::Duration::from_millis(11), false)
+            .expect("decode/render progress must not wait for another received frame");
+        assert_eq!(progressed.received_frame_id, 2);
+        assert_eq!(progressed.decoded_frame_id, 2);
+        assert_eq!(progressed.render_submitted_frame_id, 2);
+    }
+
+    #[test]
+    fn feedback_is_coalesced_and_reset_for_a_new_stream() {
+        let start = std::time::Instant::now();
+        let mut tracker = VideoFeedbackTracker::default();
+
+        tracker.record_received(&frame(7, 1, 0));
+        tracker.record_drop();
+        assert!(tracker.take_due_at(start, true).is_some());
+        tracker.record_received(&frame(7, 2, 0));
+        assert!(tracker
+            .take_due_at(start + std::time::Duration::from_millis(10), false)
+            .is_none());
+        assert_eq!(
+            tracker
+                .take_due_at(start + VIDEO_FEEDBACK_INTERVAL, false)
+                .unwrap()
+                .received_frame_id,
+            2
+        );
+
+        assert!(tracker.record_received(&frame(8, 1, 0)));
+        let reset = tracker
+            .take_due_at(start + VIDEO_FEEDBACK_INTERVAL, true)
+            .unwrap();
+        assert_eq!(reset.stream_id, 8);
+        assert_eq!(reset.received_frame_id, 1);
+        assert_eq!(reset.dropped_frames, 0);
     }
 }
 

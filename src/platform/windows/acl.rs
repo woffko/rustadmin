@@ -187,8 +187,38 @@ pub fn set_path_permission(dir: &Path, access_mask: u32) -> ResultType<()> {
     Ok(())
 }
 
-/// Returns the current process user SID as a standard SID string
+/// Returns a token user SID as a standard SID string
 /// (for example: `S-1-5-18`).
+pub(crate) fn token_user_sid_string(token: HANDLE, subject: &str) -> ResultType<String> {
+    let buffer = unsafe { read_token_user_buffer(token, subject)? };
+    let token_user: TOKEN_USER =
+        unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const TOKEN_USER) };
+    if token_user.User.Sid.0.is_null() {
+        bail!("{} token SID is null", subject);
+    }
+
+    let mut sid_string_ptr = PWSTR::null();
+    unsafe {
+        ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string_ptr).map_err(|e| {
+            anyhow!(
+                "ConvertSidToStringSidW failed for {} token SID: {}",
+                subject,
+                e
+            )
+        })?;
+    }
+    if sid_string_ptr.is_null() {
+        bail!("ConvertSidToStringSidW returned null SID string pointer");
+    }
+    let _sid_string_guard = LocalAllocGuard(sid_string_ptr.0 as *mut std::ffi::c_void);
+    unsafe {
+        sid_string_ptr
+            .to_string()
+            .map_err(|e| anyhow!("Failed to decode SID string as UTF-16: {}", e))
+    }
+}
+
+/// Returns the current process user SID as a standard SID string.
 ///
 /// Source:
 /// - Official SID-to-string API (`ConvertSidToStringSidW`):
@@ -200,32 +230,7 @@ pub(crate) fn current_process_user_sid_string() -> ResultType<String> {
             OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
                 .map_err(|e| anyhow!("Failed to open current process token: {}", e))?;
         }
-
-        let buffer = unsafe { read_token_user_buffer(token, "current process")? };
-        let token_user: TOKEN_USER =
-            unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const TOKEN_USER) };
-        if token_user.User.Sid.0.is_null() {
-            bail!("Token SID is null");
-        }
-
-        let mut sid_string_ptr = PWSTR::null();
-        unsafe {
-            ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string_ptr).map_err(|e| {
-                anyhow!(
-                    "ConvertSidToStringSidW failed for current process token SID: {}",
-                    e
-                )
-            })?;
-        }
-        if sid_string_ptr.is_null() {
-            bail!("ConvertSidToStringSidW returned null SID string pointer");
-        }
-        let _sid_string_guard = LocalAllocGuard(sid_string_ptr.0 as *mut std::ffi::c_void);
-        unsafe {
-            sid_string_ptr
-                .to_string()
-                .map_err(|e| anyhow!("Failed to decode SID string as UTF-16: {}", e))
-        }
+        token_user_sid_string(token, "current process")
     })();
 
     if !token.is_invalid() {
@@ -279,6 +284,33 @@ pub fn validate_path_for_portable_service_shmem_dir(path: &Path) -> ResultType<(
 #[inline]
 pub fn set_path_permission_for_portable_service_shmem_file(path: &Path) -> ResultType<()> {
     set_path_permission_for_portable_service_shmem_impl(path, false)
+}
+
+pub fn grant_user_capture_helper_shmem_file_access(path: &Path) -> ResultType<()> {
+    validate_portable_service_shmem_file_target(path)?;
+    if let Ok(user_sid) = super::get_current_session_user_sid_string() {
+        if let Ok(user_sid) = sid_string_to_local_alloc_guard(&user_sid) {
+            if apply_grant_sid_allow_ace_to_path(
+                path,
+                user_sid.as_sid_ptr(),
+                FILE_ALL_ACCESS.0,
+                false,
+                false,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+    let authenticated_users_sid = sid_string_to_local_alloc_guard("S-1-5-11")?;
+    apply_grant_sid_allow_ace_to_path(
+        path,
+        authenticated_users_sid.as_sid_ptr(),
+        FILE_ALL_ACCESS.0,
+        true,
+        false,
+    )
 }
 
 #[derive(Debug)]
@@ -369,6 +401,42 @@ fn validate_portable_service_shmem_dir_target(path: &Path) -> ResultType<()> {
     Ok(())
 }
 
+fn validate_portable_service_shmem_file_target(path: &Path) -> ResultType<()> {
+    let metadata_result = fs::symlink_metadata(path);
+    match metadata_result {
+        Ok(metadata) => {
+            if metadata.file_type().is_dir() {
+                bail!(
+                    "Portable service shared-memory ACL target is a directory, expected file-like path: '{}'",
+                    path.display()
+                );
+            }
+            if is_reparse_point(&metadata) {
+                bail!(
+                    "Portable service shared-memory ACL file target is a reparse point and is rejected: '{}'",
+                    path.display()
+                );
+            }
+        }
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                || e.kind() == io::ErrorKind::PermissionDenied =>
+        {
+            // Keep going and let Win32 ACL APIs return the final OS error.
+            // `Path::exists()/is_file()` and metadata can collapse ACL-denied paths into
+            // a false "not found" signal under restricted directory ACLs.
+        }
+        Err(e) => {
+            bail!(
+                "Failed to inspect portable service shared-memory ACL target '{}': {}",
+                path.display(),
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
 fn set_path_permission_for_portable_service_shmem_impl(
     path: &Path,
     expect_dir: bool,
@@ -376,38 +444,7 @@ fn set_path_permission_for_portable_service_shmem_impl(
     if expect_dir {
         validate_portable_service_shmem_dir_target(path)?;
     } else {
-        let metadata_result = fs::symlink_metadata(path);
-        match metadata_result {
-            Ok(metadata) => {
-                if metadata.file_type().is_dir() {
-                    bail!(
-                        "Portable service shared-memory ACL target is a directory, expected file-like path: '{}'",
-                        path.display()
-                    );
-                }
-                if is_reparse_point(&metadata) {
-                    bail!(
-                        "Portable service shared-memory ACL file target is a reparse point and is rejected: '{}'",
-                        path.display()
-                    );
-                }
-            }
-            Err(e)
-                if e.kind() == io::ErrorKind::NotFound
-                    || e.kind() == io::ErrorKind::PermissionDenied =>
-            {
-                // Keep going and let Win32 ACL APIs return the final OS error.
-                // `Path::exists()/is_file()` and metadata can collapse ACL-denied paths into
-                // a false "not found" signal under restricted directory ACLs.
-            }
-            Err(e) => {
-                bail!(
-                    "Failed to inspect portable service shared-memory ACL target '{}': {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
+        validate_portable_service_shmem_file_target(path)?;
     }
 
     let user_sid = current_process_user_sid_string()?;

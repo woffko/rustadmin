@@ -40,6 +40,18 @@ lazy_static::lazy_static! {
     static ref CONFIG_SET_BY_IPC: std::sync::Arc<std::sync::Mutex<bool>> = Default::default();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwEncoderProfile {
+    Default,
+    HighQuality,
+}
+
+impl Default for HwEncoderProfile {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HwRamEncoderConfig {
     pub name: String,
@@ -48,6 +60,7 @@ pub struct HwRamEncoderConfig {
     pub height: usize,
     pub quality: f32,
     pub keyframe_interval: Option<usize>,
+    pub profile: HwEncoderProfile,
 }
 
 pub struct HwRamEncoder {
@@ -66,6 +79,7 @@ impl EncoderApi for HwRamEncoder {
         match cfg {
             EncoderCfg::HWRAM(config) => {
                 let rc = Self::rate_control(&config);
+                let hw_quality = Self::encoder_quality(&config)?;
                 let mut bitrate =
                     Self::bitrate(&config.name, config.width, config.height, config.quality);
                 bitrate = Self::check_bitrate_range(&config, bitrate);
@@ -80,7 +94,7 @@ impl EncoderApi for HwRamEncoder {
                     kbs: bitrate as i32,
                     fps: DEFAULT_FPS,
                     gop,
-                    quality: DEFAULT_HW_QUALITY,
+                    quality: hw_quality,
                     rc,
                     q: -1,
                     thread_count: codec_thread_num(16) as _, // ffmpeg's thread_count is used for cpu
@@ -128,11 +142,7 @@ impl EncoderApi for HwRamEncoder {
                 frames: frames.into(),
                 ..Default::default()
             };
-            match self.format {
-                DataFormat::H264 => vf.set_h264s(frames),
-                DataFormat::H265 => vf.set_h265s(frames),
-                _ => bail!("unsupported format: {:?}", self.format),
-            }
+            set_encoded_video_frames(self.format, &mut vf, frames)?;
             Ok(vf)
         } else {
             Err(anyhow!("no valid frame"))
@@ -206,7 +216,618 @@ impl EncoderApi for HwRamEncoder {
     }
 }
 
+fn set_encoded_video_frames(
+    format: DataFormat,
+    vf: &mut VideoFrame,
+    frames: EncodedVideoFrames,
+) -> ResultType<()> {
+    match format {
+        DataFormat::H264 => vf.set_h264s(frames),
+        DataFormat::H265 => vf.set_h265s(frames),
+        DataFormat::AV1 => vf.set_av1s(frames),
+        _ => bail!("unsupported format: {:?}", format),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::message_proto::video_frame;
+    use std::sync::OnceLock;
+
+    #[test]
+    fn set_encoded_video_frames_routes_av1_to_av1_union() {
+        let mut vf = VideoFrame::new();
+
+        set_encoded_video_frames(DataFormat::AV1, &mut vf, EncodedVideoFrames::default())
+            .expect("AV1 HWRAM packets should be supported");
+
+        assert!(matches!(vf.union, Some(video_frame::Union::Av1s(_))));
+    }
+
+    fn encoder_config(name: &str, profile: HwEncoderProfile) -> HwRamEncoderConfig {
+        HwRamEncoderConfig {
+            name: name.to_owned(),
+            mc_name: None,
+            width: 1920,
+            height: 1080,
+            quality: 1.0,
+            keyframe_interval: None,
+            profile,
+        }
+    }
+
+    #[test]
+    fn default_profile_preserves_encoder_defaults() {
+        let config = encoder_config("h264_nvenc", HwEncoderProfile::Default);
+        assert_eq!(
+            HwRamEncoder::encoder_quality(&config).expect("default quality"),
+            Quality_Default
+        );
+    }
+
+    #[test]
+    fn high_quality_profile_is_supported_for_nvenc_and_videotoolbox_h26x() {
+        for name in [
+            "h264_nvenc",
+            "hevc_nvenc",
+            "h264_videotoolbox",
+            "hevc_videotoolbox",
+        ] {
+            let config = encoder_config(name, HwEncoderProfile::HighQuality);
+            assert_eq!(
+                HwRamEncoder::encoder_quality(&config).expect("supported high quality"),
+                Quality_High
+            );
+        }
+
+        for name in ["h264_amf", "hevc_qsv", "av1_nvenc", "av1_videotoolbox"] {
+            let config = encoder_config(name, HwEncoderProfile::HighQuality);
+            assert!(HwRamEncoder::encoder_quality(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn high_quality_selection_uses_matching_nvenc_encoder() {
+        let encoder = HwRamEncoder::select_high_quality_encoder(
+            vec![
+                CodecInfo {
+                    name: "h264_qsv".to_owned(),
+                    format: DataFormat::H264,
+                    priority: 0,
+                    ..Default::default()
+                },
+                CodecInfo {
+                    name: "h264_nvenc".to_owned(),
+                    format: DataFormat::H264,
+                    priority: 1,
+                    ..Default::default()
+                },
+                CodecInfo {
+                    name: "hevc_nvenc".to_owned(),
+                    format: DataFormat::H265,
+                    priority: 0,
+                    ..Default::default()
+                },
+            ],
+            CodecFormat::H264,
+        )
+        .expect("H264 NVENC should be selected");
+
+        assert_eq!(encoder.name, "h264_nvenc");
+    }
+
+    #[test]
+    fn high_quality_selection_uses_matching_videotoolbox_encoder() {
+        let encoder = HwRamEncoder::select_high_quality_encoder(
+            vec![
+                CodecInfo {
+                    name: "h264_videotoolbox".to_owned(),
+                    format: DataFormat::H264,
+                    priority: 0,
+                    ..Default::default()
+                },
+                CodecInfo {
+                    name: "hevc_videotoolbox".to_owned(),
+                    format: DataFormat::H265,
+                    priority: 0,
+                    ..Default::default()
+                },
+            ],
+            CodecFormat::H265,
+        )
+        .expect("HEVC VideoToolbox should be selected");
+
+        assert_eq!(encoder.name, "hevc_videotoolbox");
+    }
+
+    fn probed_hwcodec_config() -> &'static HwCodecConfig {
+        static CONFIG: OnceLock<HwCodecConfig> = OnceLock::new();
+        CONFIG.get_or_init(|| {
+            let json = check_available_hwcodec();
+            serde_json::from_str(&json).expect("hardware codec probe must return valid JSON")
+        })
+    }
+
+    fn fill_nv12_frame(
+        frame: &mut [u8],
+        linesize: &[i32],
+        offset: &[i32],
+        width: usize,
+        height: usize,
+        frame_index: usize,
+    ) {
+        let y_stride = linesize[0] as usize;
+        for y in 0..height {
+            let row = &mut frame[y * y_stride..y * y_stride + width];
+            for (x, pixel) in row.iter_mut().enumerate() {
+                *pixel = 16 + ((x + y + frame_index * 7) % 220) as u8;
+            }
+        }
+
+        let uv_stride = linesize[1] as usize;
+        let uv_offset = offset[0] as usize;
+        for y in 0..height / 2 {
+            let row = &mut frame[uv_offset + y * uv_stride..uv_offset + y * uv_stride + width];
+            for x in (0..width).step_by(2) {
+                row[x] = 96 + ((frame_index + y) % 48) as u8;
+                row[x + 1] = 112 + ((frame_index * 3 + x / 2) % 32) as u8;
+            }
+        }
+    }
+
+    fn run_nvenc_high_quality_encode_decode_smoke(format: CodecFormat) -> bool {
+        const WIDTH: usize = 640;
+        const HEIGHT: usize = 360;
+        const FRAME_COUNT: usize = 12;
+
+        let Some(info) = HwRamEncoder::select_high_quality_encoder(
+            probed_hwcodec_config().ram_encode.clone(),
+            format,
+        ) else {
+            eprintln!(
+                "SKIPPED: no {:?} NVENC encoder was confirmed by the probe",
+                format
+            );
+            return false;
+        };
+
+        let config = HwRamEncoderConfig {
+            name: info.name.clone(),
+            mc_name: info.mc_name.clone(),
+            width: WIDTH,
+            height: HEIGHT,
+            quality: 1.0,
+            keyframe_interval: Some(30),
+            profile: HwEncoderProfile::HighQuality,
+        };
+        let mut encoder = HwRamEncoder::new(EncoderCfg::HWRAM(config), false)
+            .unwrap_or_else(|err| panic!("failed to open {} with NVENC p5: {err}", info.name));
+        assert_eq!(encoder.format, info.format);
+
+        let (linesize, offset, length) =
+            ffmpeg_linesize_offset_length(DEFAULT_PIXFMT, WIDTH, HEIGHT, HW_STRIDE_ALIGN)
+                .expect("failed to calculate aligned NV12 layout");
+        let mut yuv = vec![0; length as usize];
+        let mut packets = Vec::with_capacity(FRAME_COUNT);
+        let mut saw_keyframe = false;
+
+        for frame_index in 0..FRAME_COUNT {
+            fill_nv12_frame(&mut yuv, &linesize, &offset, WIDTH, HEIGHT, frame_index);
+            let frames = encoder
+                .encode(&yuv, (frame_index * 1_000 / DEFAULT_FPS as usize) as i64)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{} did not produce low-delay output for frame {frame_index}: {err}",
+                        info.name
+                    )
+                });
+            for frame in frames {
+                saw_keyframe |= frame.key == 1;
+                packets.push(frame.data);
+            }
+        }
+
+        assert!(!packets.is_empty(), "{} produced no packets", info.name);
+        assert!(saw_keyframe, "{} produced no keyframe", info.name);
+
+        let decoder_name = match format {
+            CodecFormat::H264 => "h264",
+            CodecFormat::H265 => "hevc",
+            _ => unreachable!("HQ smoke test only supports H264 and H265"),
+        };
+        let mut decoder = Decoder::new(DecodeContext {
+            name: decoder_name.to_owned(),
+            device_type: hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+            thread_count: 4,
+        })
+        .unwrap_or_else(|_| panic!("failed to open software {} decoder", decoder_name));
+        let mut decoded_frames = 0;
+        for packet in packets {
+            let frames = decoder.decode(&packet).unwrap_or_else(|err| {
+                panic!(
+                    "software {} decoder rejected NVENC output: {}",
+                    decoder_name, err
+                )
+            });
+            for frame in frames {
+                assert_eq!(frame.width, WIDTH as i32);
+                assert_eq!(frame.height, HEIGHT as i32);
+                decoded_frames += 1;
+            }
+        }
+        assert_eq!(
+            decoded_frames, FRAME_COUNT,
+            "software decoder did not reproduce every encoded frame"
+        );
+        eprintln!(
+            "PASSED: {} NVENC p5 produced and decoded {decoded_frames} frames",
+            info.name
+        );
+        true
+    }
+
+    #[test]
+    #[ignore = "requires a locally available NVIDIA NVENC H264 encoder"]
+    fn nvenc_high_quality_h264_encode_decode_smoke() {
+        run_nvenc_high_quality_encode_decode_smoke(CodecFormat::H264);
+    }
+
+    #[test]
+    #[ignore = "requires a locally available NVIDIA NVENC HEVC encoder"]
+    fn nvenc_high_quality_h265_encode_decode_smoke() {
+        run_nvenc_high_quality_encode_decode_smoke(CodecFormat::H265);
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA NVENC and intentionally churns HEVC encoder sessions"]
+    fn nvenc_hevc_delivery_recovery_recreate_stress() {
+        const WIDTH: usize = 2560;
+        const HEIGHT: usize = 1440;
+        const DEFAULT_RECREATIONS: usize = 64;
+        const DEFAULT_FRAMES_PER_GENERATION: usize = 4;
+
+        let Some(info) = HwRamEncoder::select_high_quality_encoder(
+            probed_hwcodec_config().ram_encode.clone(),
+            CodecFormat::H265,
+        ) else {
+            eprintln!("SKIPPED: no HEVC NVENC encoder was confirmed by the probe");
+            return;
+        };
+        let recreations = std::env::var("RUSTADMIN_NVENC_RECREATE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_RECREATIONS)
+            .clamp(1, 1_000);
+        let frames_per_generation = std::env::var("RUSTADMIN_NVENC_FRAMES_PER_GENERATION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_FRAMES_PER_GENERATION)
+            .clamp(1, 60);
+        let mut config = HwRamEncoderConfig {
+            name: info.name.clone(),
+            mc_name: info.mc_name.clone(),
+            width: WIDTH,
+            height: HEIGHT,
+            quality: 0.25,
+            keyframe_interval: None,
+            profile: HwEncoderProfile::Default,
+        };
+        let mut encoder = HwRamEncoder::new(EncoderCfg::HWRAM(config.clone()), false)
+            .unwrap_or_else(|err| panic!("failed to open initial {} encoder: {err}", info.name));
+        let mut bgra = vec![0; WIDTH * HEIGHT * 4];
+        let mut yuv = Vec::new();
+        let mut mid_data = Vec::new();
+
+        for generation in 0..=recreations {
+            if generation > 0 {
+                if generation == 1 {
+                    encoder
+                        .set_quality(0.67)
+                        .expect("failed to apply the production QoS bitrate increase");
+                }
+                config.quality = 0.67;
+                let replacement = HwRamEncoder::new(EncoderCfg::HWRAM(config.clone()), false)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to recreate {} encoder at generation {generation}: {err}",
+                            info.name
+                        )
+                    });
+                encoder = replacement;
+            }
+
+            for frame_in_generation in 0..frames_per_generation {
+                let frame_index = generation * frames_per_generation + frame_in_generation;
+                let pixel_offset = (frame_index * 4) % bgra.len();
+                bgra[pixel_offset] = frame_index as u8;
+                bgra[pixel_offset + 1] = frame_index.wrapping_mul(3) as u8;
+                bgra[pixel_offset + 2] = frame_index.wrapping_mul(7) as u8;
+                bgra[pixel_offset + 3] = u8::MAX;
+                let frame = crate::Frame::PixelBuffer(crate::PixelBuffer::new(
+                    &bgra,
+                    Pixfmt::BGRA,
+                    WIDTH,
+                    HEIGHT,
+                ));
+                let input = frame
+                    .to(encoder.yuvfmt(), &mut yuv, &mut mid_data)
+                    .expect("failed to convert the captured BGRA frame to encoder NV12");
+                let frames = encoder
+                    .encode(
+                        input.yuv().expect("converted frame was not CPU YUV"),
+                        (frame_index * 1_000 / DEFAULT_FPS as usize) as i64,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "{} failed after delivery-recovery recreation {generation}, frame {frame_in_generation}: {err}",
+                            info.name
+                        )
+                    });
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "{} recreation {generation}, frame {frame_in_generation} did not produce one low-delay frame",
+                    info.name
+                );
+                if frame_in_generation == 0 {
+                    assert_eq!(
+                        frames[0].key, 1,
+                        "{} recreation {generation} did not start with a keyframe",
+                        info.name
+                    );
+                }
+            }
+            if generation % 8 == 0 || generation == recreations {
+                eprintln!(
+                    "{} delivery-recovery recreation {generation}/{recreations} passed",
+                    info.name
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct VideoToolboxProfileResult {
+        encoded_fps: f64,
+        encoded_bytes: usize,
+        luma_psnr: f64,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn videotoolbox_encoder(format: CodecFormat) -> Option<CodecInfo> {
+        let data_format = match format {
+            CodecFormat::H264 => DataFormat::H264,
+            CodecFormat::H265 => DataFormat::H265,
+            _ => return None,
+        };
+        probed_hwcodec_config()
+            .ram_encode
+            .iter()
+            .find(|encoder| encoder.format == data_format && encoder.name.contains("videotoolbox"))
+            .cloned()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn decoded_luma_error(
+        frame: &DecodeFrame,
+        frame_index: usize,
+        width: usize,
+        height: usize,
+    ) -> (f64, usize) {
+        let stride = frame.linesize[0] as usize;
+        let luma = &frame.data[0];
+        let mut squared_error = 0.0;
+        for y in 0..height {
+            let row = &luma[y * stride..y * stride + width];
+            for (x, pixel) in row.iter().enumerate() {
+                let expected = 16 + ((x + y + frame_index * 7) % 220) as i32;
+                let error = *pixel as i32 - expected;
+                squared_error += (error * error) as f64;
+            }
+        }
+        (squared_error, width * height)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_videotoolbox_profile(
+        info: &CodecInfo,
+        format: CodecFormat,
+        quality: Quality,
+        profile_name: &str,
+    ) -> VideoToolboxProfileResult {
+        const WIDTH: usize = 1280;
+        const HEIGHT: usize = 720;
+        const FRAME_COUNT: usize = 30;
+        const BITRATE_KBPS: i32 = 4_000;
+
+        let ctx = EncodeContext {
+            name: info.name.clone(),
+            mc_name: info.mc_name.clone(),
+            width: WIDTH as i32,
+            height: HEIGHT as i32,
+            pixfmt: DEFAULT_PIXFMT,
+            align: HW_STRIDE_ALIGN as i32,
+            kbs: BITRATE_KBPS,
+            fps: DEFAULT_FPS,
+            gop: 30,
+            quality,
+            rc: RC_CBR,
+            q: -1,
+            thread_count: 4,
+        };
+        let mut encoder = Encoder::new(ctx).unwrap_or_else(|_| {
+            panic!(
+                "failed to open {} VideoToolbox {} profile",
+                info.name, profile_name
+            )
+        });
+        let (linesize, offset, length) =
+            ffmpeg_linesize_offset_length(DEFAULT_PIXFMT, WIDTH, HEIGHT, HW_STRIDE_ALIGN)
+                .expect("failed to calculate aligned NV12 layout");
+        let mut yuv = vec![0; length as usize];
+        let mut packets = Vec::with_capacity(FRAME_COUNT);
+        let mut first_packet_frame = None;
+        let mut saw_keyframe = false;
+        let mut encode_time = std::time::Duration::ZERO;
+
+        for frame_index in 0..FRAME_COUNT {
+            fill_nv12_frame(&mut yuv, &linesize, &offset, WIDTH, HEIGHT, frame_index);
+            let started = std::time::Instant::now();
+            let encoded = encoder.encode(&yuv, (frame_index * 1_000 / DEFAULT_FPS as usize) as i64);
+            encode_time += started.elapsed();
+            match encoded {
+                Ok(frames) => {
+                    if !frames.is_empty() && first_packet_frame.is_none() {
+                        first_packet_frame = Some(frame_index);
+                    }
+                    for frame in frames {
+                        saw_keyframe |= frame.key == 1;
+                        packets.push(frame.data.clone());
+                    }
+                }
+                Err(ERR_NO_PACKET) => {}
+                Err(err) => panic!(
+                    "{} VideoToolbox {} encode failed on frame {}: {}",
+                    info.name, profile_name, frame_index, err
+                ),
+            }
+        }
+
+        assert_eq!(
+            first_packet_frame,
+            Some(0),
+            "{} VideoToolbox {} added frame buffering",
+            info.name,
+            profile_name
+        );
+        assert!(
+            saw_keyframe,
+            "{} VideoToolbox {} produced no keyframe",
+            info.name, profile_name
+        );
+        let encoded_bytes = packets.iter().map(Vec::len).sum();
+
+        let decoder_name = match format {
+            CodecFormat::H264 => "h264",
+            CodecFormat::H265 => "hevc",
+            _ => unreachable!("VideoToolbox HQ smoke test only supports H264 and H265"),
+        };
+        let mut decoder = Decoder::new(DecodeContext {
+            name: decoder_name.to_owned(),
+            device_type: hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+            thread_count: 4,
+        })
+        .unwrap_or_else(|_| panic!("failed to open software {} decoder", decoder_name));
+        let mut decoded_frames = 0;
+        let mut squared_error = 0.0;
+        let mut sample_count = 0;
+        for packet in packets {
+            let frames = decoder.decode(&packet).unwrap_or_else(|err| {
+                panic!(
+                    "software {} decoder rejected {} VideoToolbox output: {}",
+                    decoder_name, profile_name, err
+                )
+            });
+            for frame in frames {
+                assert_eq!(frame.width, WIDTH as i32);
+                assert_eq!(frame.height, HEIGHT as i32);
+                let (frame_error, frame_samples) =
+                    decoded_luma_error(frame, decoded_frames, WIDTH, HEIGHT);
+                squared_error += frame_error;
+                sample_count += frame_samples;
+                decoded_frames += 1;
+            }
+        }
+        assert_eq!(
+            decoded_frames, FRAME_COUNT,
+            "{} VideoToolbox {} did not reproduce every encoded frame",
+            info.name, profile_name
+        );
+
+        let encoded_fps = FRAME_COUNT as f64 / encode_time.as_secs_f64();
+        assert!(
+            encoded_fps >= DEFAULT_FPS as f64,
+            "{} VideoToolbox {} encoded only {:.1} FPS",
+            info.name,
+            profile_name,
+            encoded_fps
+        );
+        let mean_squared_error = squared_error / sample_count as f64;
+        let luma_psnr = if mean_squared_error == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (255.0 * 255.0 / mean_squared_error).log10()
+        };
+
+        VideoToolboxProfileResult {
+            encoded_fps,
+            encoded_bytes,
+            luma_psnr,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn compare_videotoolbox_profiles(format: CodecFormat) {
+        let Some(info) = videotoolbox_encoder(format) else {
+            eprintln!(
+                "SKIPPED: no {:?} VideoToolbox encoder was confirmed by the probe",
+                format
+            );
+            return;
+        };
+        let baseline = run_videotoolbox_profile(&info, format, Quality_Default, "baseline");
+        let high_quality = run_videotoolbox_profile(&info, format, Quality_High, "high-quality");
+
+        eprintln!(
+            "RESULT: {} baseline fps={:.1} bytes={} y_psnr={:.3}dB",
+            info.name, baseline.encoded_fps, baseline.encoded_bytes, baseline.luma_psnr
+        );
+        eprintln!(
+            "RESULT: {} high-quality fps={:.1} bytes={} y_psnr={:.3}dB",
+            info.name, high_quality.encoded_fps, high_quality.encoded_bytes, high_quality.luma_psnr
+        );
+        assert!(
+            high_quality.luma_psnr + 0.25 >= baseline.luma_psnr,
+            "{} VideoToolbox high-quality profile reduced luma PSNR by more than 0.25dB",
+            info.name
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a locally available VideoToolbox H264 encoder"]
+    fn videotoolbox_high_quality_h264_profile_smoke() {
+        compare_videotoolbox_profiles(CodecFormat::H264);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a locally available VideoToolbox HEVC encoder"]
+    fn videotoolbox_high_quality_h265_profile_smoke() {
+        compare_videotoolbox_profiles(CodecFormat::H265);
+    }
+}
+
 impl HwRamEncoder {
+    pub fn supports_high_quality_profile(name: &str) -> bool {
+        (name.contains("nvenc") || name.contains("videotoolbox"))
+            && (name.contains("h264") || name.contains("hevc"))
+    }
+
+    fn encoder_quality(config: &HwRamEncoderConfig) -> ResultType<Quality> {
+        match config.profile {
+            HwEncoderProfile::Default => Ok(DEFAULT_HW_QUALITY),
+            HwEncoderProfile::HighQuality if Self::supports_high_quality_profile(&config.name) => {
+                Ok(Quality_High)
+            }
+            HwEncoderProfile::HighQuality => {
+                bail!("high-quality profile is unsupported for {}", config.name)
+            }
+        }
+    }
+
     pub fn try_get(format: CodecFormat) -> Option<CodecInfo> {
         let mut info = None;
         let best = CodecInfo::prioritized(HwCodecConfig::get().ram_encode);
@@ -221,9 +842,35 @@ impl HwRamEncoder {
                     info = Some(v);
                 }
             }
+            CodecFormat::AV1 => {
+                if let Some(v) = best.av1 {
+                    info = Some(v);
+                }
+            }
             _ => {}
         }
         info
+    }
+
+    pub fn try_get_high_quality(format: CodecFormat) -> Option<CodecInfo> {
+        Self::select_high_quality_encoder(HwCodecConfig::get().ram_encode, format)
+    }
+
+    fn select_high_quality_encoder(
+        encoders: Vec<CodecInfo>,
+        format: CodecFormat,
+    ) -> Option<CodecInfo> {
+        let data_format = match format {
+            CodecFormat::H264 => DataFormat::H264,
+            CodecFormat::H265 => DataFormat::H265,
+            _ => return None,
+        };
+        encoders
+            .into_iter()
+            .filter(|encoder| {
+                encoder.format == data_format && Self::supports_high_quality_profile(&encoder.name)
+            })
+            .min_by_key(|encoder| encoder.priority)
     }
 
     pub fn encode(&mut self, yuv: &[u8], ms: i64) -> ResultType<Vec<EncodeFrame>> {
@@ -322,6 +969,7 @@ impl HwRamDecoder {
                     info = Some(v);
                 }
             }
+            CodecFormat::AV1 => {}
             _ => {}
         }
         if enable_hwcodec_option() {
@@ -334,6 +982,11 @@ impl HwRamDecoder {
                 }
                 CodecFormat::H265 => {
                     if let Some(v) = best.h265 {
+                        info = Some(v);
+                    }
+                }
+                CodecFormat::AV1 => {
+                    if let Some(v) = best.av1 {
                         info = Some(v);
                     }
                 }
@@ -517,7 +1170,7 @@ struct HwCodecConfig2 {
 // portable: ui start check process, check process send to ui
 // sciter and unilink: get from ipc server
 impl HwCodecConfig {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(target_os = "android"))]
     pub fn set(config: String) {
         let config: HwCodecConfig = serde_json::from_str(&config).unwrap_or_default();
         log::info!("set hwcodec config");
@@ -638,11 +1291,11 @@ impl HwCodecConfig {
         }
         #[cfg(target_os = "ios")]
         {
-            HwCodecConfig::default()
+            CONFIG.lock().unwrap().clone().unwrap_or_default()
         }
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(target_os = "android"))]
     pub fn get_set_value() -> Option<HwCodecConfig> {
         let set = CONFIG_SET_BY_IPC.lock().unwrap().clone();
         if set {
@@ -652,12 +1305,12 @@ impl HwCodecConfig {
         }
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(target_os = "android"))]
     pub fn already_set() -> bool {
         CONFIG_SET_BY_IPC.lock().unwrap().clone()
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(target_os = "android"))]
     pub fn reset() {
         log::info!("reset hwcodec config");
         *CONFIG.lock().unwrap() = None;
@@ -740,6 +1393,28 @@ pub fn start_check_process() {
 pub fn recheck_hwcodec() {
     HwCodecConfig::reset();
     start_check_process_inner(true);
+}
+
+#[cfg(target_os = "ios")]
+pub fn start_check_process() {
+    start_check_process_inner_ios(false);
+}
+
+#[cfg(target_os = "ios")]
+pub fn recheck_hwcodec() {
+    HwCodecConfig::reset();
+    start_check_process_inner_ios(true);
+}
+
+#[cfg(target_os = "ios")]
+fn start_check_process_inner_ios(force: bool) {
+    if !enable_hwcodec_option() || (!force && HwCodecConfig::already_set()) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let config = check_available_hwcodec();
+        HwCodecConfig::set(config);
+    });
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

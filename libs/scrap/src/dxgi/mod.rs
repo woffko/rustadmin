@@ -54,7 +54,6 @@ pub struct Capturer {
     height: usize,
     rotated: Vec<u8>,
     gdi_capturer: Option<CapturerGDI>,
-    gdi_fallback_reason: String,
     gdi_buffer: Vec<u8>,
     saved_raw_data: Vec<u8>, // for faster compare and copy
     output_texture: bool,
@@ -72,10 +71,8 @@ impl Capturer {
         #[allow(invalid_value)]
         let mut adapter_desc1 = unsafe { mem::MaybeUninit::uninit().assume_init() };
         let mut gdi_capturer = None;
-        let mut gdi_fallback_reason = String::new();
 
         let mut res = if display.gdi {
-            gdi_fallback_reason = "display_gdi".to_owned();
             wrap_hresult(1)
         } else {
             let res = wrap_hresult(unsafe {
@@ -102,9 +99,6 @@ impl Capturer {
         let context = ComPtr(context);
 
         if res.is_err() {
-            if gdi_fallback_reason.is_empty() {
-                gdi_fallback_reason = "dxgi_device_init".to_owned();
-            }
             gdi_capturer = display.create_gdi();
             println!("Fallback to GDI");
             if gdi_capturer.is_some() {
@@ -114,7 +108,6 @@ impl Capturer {
             res = wrap_hresult(unsafe {
                 let hres = (*display.inner.0).DuplicateOutput(device.0 as *mut _, &mut duplication);
                 if hres != S_OK {
-                    gdi_fallback_reason = "duplicate_output".to_owned();
                     gdi_capturer = display.create_gdi();
                     println!("Fallback to GDI");
                     if gdi_capturer.is_some() {
@@ -177,7 +170,6 @@ impl Capturer {
             display,
             rotated: Vec::new(),
             gdi_capturer,
-            gdi_fallback_reason,
             gdi_buffer: Vec::new(),
             saved_raw_data: Vec::new(),
             output_texture: false,
@@ -325,27 +317,12 @@ impl Capturer {
 
     pub fn set_gdi(&mut self) -> bool {
         self.gdi_capturer = self.display.create_gdi();
-        if self.is_gdi() {
-            self.gdi_fallback_reason = "runtime_set_gdi".to_owned();
-        }
         self.is_gdi()
-    }
-
-    pub fn gdi_fallback_reason(&self) -> &str {
-        if !self.is_gdi() {
-            return "none";
-        }
-        if self.gdi_fallback_reason.is_empty() {
-            "unknown"
-        } else {
-            &self.gdi_fallback_reason
-        }
     }
 
     pub fn cancel_gdi(&mut self) {
         self.gdi_buffer = Vec::new();
         self.gdi_capturer.take();
-        self.gdi_fallback_reason.clear();
     }
 
     #[cfg(feature = "vram")]

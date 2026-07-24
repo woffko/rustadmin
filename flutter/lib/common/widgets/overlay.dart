@@ -1,5 +1,9 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:auto_size_text/auto_size_text.dart';
 import 'package:debounce_throttle/debounce_throttle.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
@@ -560,60 +564,132 @@ class IOSDraggableState extends State<IOSDraggable> {
 
 class QualityMonitor extends StatelessWidget {
   final QualityMonitorModel qualityMonitorModel;
-  QualityMonitor(this.qualityMonitorModel);
+  final GestureDragUpdateCallback? onGripPanUpdate;
 
-  static const _labelStyle = TextStyle(
-      color: Color.fromARGB(255, 210, 210, 210), fontSize: 9, height: 1.08);
-  static const _valueStyle =
-      TextStyle(color: Colors.white, fontSize: 9, height: 1.08);
+  const QualityMonitor(this.qualityMonitorModel,
+      {Key? key, this.onGripPanUpdate})
+      : super(key: key);
+
+  String _pipelineLabel(String? value) {
+    if (value == null || value.isEmpty) {
+      return '-';
+    }
+    switch (value) {
+      case 'Windows Graphics Capture':
+        return 'WGC';
+      case 'Windows Graphics Capture Helper (CPU)':
+        return 'WGC helper CPU';
+      case 'DXGI Desktop Duplication':
+        return 'DXGI';
+      case 'Windows Magnification API':
+        return 'WinMag CPU';
+      case 'Windows GDI':
+        return 'GDI';
+      case 'Windows GDI Helper (CPU)':
+        return 'GDI helper CPU';
+      case 'User Capture Helper (CPU)':
+        return 'Helper CPU';
+      case 'GPU texture frame':
+        return 'GPU texture';
+      case 'CPU BGRA frame':
+        return 'CPU BGRA';
+      case 'CPU RGBA frame':
+        return 'CPU RGBA';
+      case 'CPU RGB565 frame':
+        return 'CPU RGB565';
+      case 'CPU I420 frame':
+        return 'CPU I420';
+      case 'CPU NV12 frame':
+        return 'CPU NV12';
+      case 'CPU I444 frame':
+        return 'CPU I444';
+      case 'GPU texture':
+        return 'GPU texture';
+      case 'CPU YUV frame':
+        return 'CPU YUV';
+      case 'Hardware NVIDIA NVENC via FFmpeg':
+        return 'NVENC';
+      case 'Hardware NVIDIA NVENC p5 via FFmpeg':
+        return 'NVENC p5';
+      case 'Hardware Intel QSV via FFmpeg':
+        return 'QSV';
+      case 'Hardware AMD AMF via FFmpeg':
+        return 'AMF';
+      case 'Hardware VideoToolbox via FFmpeg':
+        return 'VideoToolbox';
+      case 'Hardware VideoToolbox HQ via FFmpeg':
+        return 'VideoToolbox HQ';
+      case 'Hardware FFmpeg D3D11VA':
+        return 'D3D11VA';
+      case 'Hardware FFmpeg DXVA2':
+        return 'DXVA2';
+      case 'Hardware FFmpeg CUDA':
+        return 'CUDA';
+      case 'Hardware FFmpeg VAAPI':
+        return 'VAAPI';
+      case 'Hardware FFmpeg Vulkan':
+        return 'Vulkan';
+      case 'Hardware FFmpeg decoder':
+        return 'FFmpeg HW';
+      case 'Hardware Android MediaCodec':
+        return 'MediaCodec';
+      case 'Software FFmpeg decoder':
+        return 'FFmpeg SW';
+      case 'Software FFmpeg':
+        return 'FFmpeg SW';
+      case 'Software libvpx':
+        return 'libvpx';
+      case 'Software libaom':
+        return 'libaom';
+      case 'Software libaom AV1':
+        return 'libaom AV1';
+      case 'Software libvpx VP8':
+        return 'libvpx VP8';
+      case 'Software libvpx VP9':
+        return 'libvpx VP9';
+      case 'rgba':
+        return 'CPU RGBA';
+      case 'texture':
+        return 'GPU texture';
+      case 'Hardware encoder via FFmpeg':
+        return 'FFmpeg HW';
+      case 'Hardware FFmpeg QSV':
+        return 'QSV';
+      case 'Hardware FFmpeg VideoToolbox':
+        return 'VideoToolbox';
+      case 'Hardware FFmpeg MediaCodec':
+        return 'MediaCodec';
+      default:
+        return value;
+    }
+  }
 
   Widget _row(String info, String? value, {Color? rightColor}) {
+    final valueText = value ?? '';
     return Row(
       children: [
         Expanded(
-            flex: 7,
+            flex: 8,
             child: AutoSizeText(info,
-                style: _labelStyle,
+                style: TextStyle(color: Color.fromARGB(255, 210, 210, 210)),
                 textAlign: TextAlign.right,
-                minFontSize: 6,
                 maxLines: 1)),
-        const SizedBox(width: 4),
+        Spacer(flex: 1),
         Expanded(
-            flex: 9,
-            child: AutoSizeText(value ?? '',
-                style: rightColor == null
-                    ? _valueStyle
-                    : _valueStyle.copyWith(color: rightColor),
-                minFontSize: 6,
+            flex: 8,
+            child: AutoSizeText(valueText,
+                style: TextStyle(color: rightColor ?? Colors.white),
                 maxLines: 1)),
       ],
     );
   }
 
-  Widget _optionalRow(String info, String? value, {Color? rightColor}) {
-    if (value == null || value.isEmpty) return const SizedBox.shrink();
-    return _row(info, value, rightColor: rightColor);
-  }
-
-  Widget _debugToggle(QualityMonitorModel model) {
+  Widget _section(String title) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 16,
-            height: 16,
-            child: Checkbox(
-              value: model.debugMode,
-              onChanged: (value) => model.setDebugMode(value == true),
-              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              visualDensity: VisualDensity.compact,
-            ),
-          ),
-          const SizedBox(width: 4),
-          Text(translate('Debug mode'), style: _valueStyle),
-        ],
-      ),
+      padding: const EdgeInsets.only(top: 5, bottom: 1),
+      child: Text(title,
+          style: const TextStyle(
+              color: Color.fromARGB(210, 210, 210, 210), fontSize: 10)),
     );
   }
 
@@ -623,117 +699,542 @@ class QualityMonitor extends StatelessWidget {
       child: Consumer<QualityMonitorModel>(
           builder: (context, qualityMonitorModel, child) => qualityMonitorModel
                   .show
-              ? Container(
-                  constraints: const BoxConstraints(maxWidth: 300),
-                  padding: const EdgeInsets.all(6),
-                  color: MyTheme.canvasColor.withAlpha(150),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      _debugToggle(qualityMonitorModel),
-                      _row("Speed", qualityMonitorModel.data.speed ?? '-'),
-                      if (qualityMonitorModel.debugMode)
-                        _optionalRow(
-                            "HostVer", qualityMonitorModel.data.hostVersion),
-                      if (qualityMonitorModel.debugMode)
-                        _optionalRow("ClientVer",
-                            qualityMonitorModel.data.clientVersion),
-                      _row("FPS", qualityMonitorModel.data.fps ?? '-'),
-                      // let delay be 0 if fps is 0
-                      _row(
-                          "Delay",
-                          "${qualityMonitorModel.data.delay == null ? '-' : (qualityMonitorModel.data.fps ?? "").replaceAll(' ', '').replaceAll('0', '').isEmpty ? 0 : qualityMonitorModel.data.delay}ms",
-                          rightColor: Colors.green),
-                      _row("Target Bitrate",
-                          "${qualityMonitorModel.data.targetBitrate ?? '-'}kb"),
-                      _row(
-                          "Codec", qualityMonitorModel.data.codecFormat ?? '-'),
-                      _row("Chroma", qualityMonitorModel.data.chroma ?? '-'),
-                      if (qualityMonitorModel.debugMode) ...[
-                        _optionalRow(
-                            "Path", qualityMonitorModel.data.codecPath),
-                        _optionalRow(
-                            "Render", qualityMonitorModel.data.renderPath),
-                        _optionalRow(
-                            "Res", qualityMonitorModel.data.frameResolution),
-                        _optionalRow(
-                            "Queue", qualityMonitorModel.data.queueLen),
-                        _optionalRow(
-                            "DecFPS", qualityMonitorModel.data.decodeFps),
-                        _optionalRow(
-                            "AutoFPS", qualityMonitorModel.data.autoFps),
-                        _optionalRow("Mode", qualityMonitorModel.data.fpsMode),
-                        _optionalRow("Direct", qualityMonitorModel.data.direct),
-                        _optionalRow(
-                            "HostFPS", qualityMonitorModel.data.hostVideoFps),
-                        _optionalRow("HostCodec",
-                            qualityMonitorModel.data.hostVideoCodec),
-                        _optionalRow("HostBackend",
-                            qualityMonitorModel.data.hostVideoBackend),
-                        _optionalRow(
-                            "HostQoS", qualityMonitorModel.data.hostVideoQos),
-                        _optionalRow("HostFallback",
-                            qualityMonitorModel.data.hostVideoFallback),
-                        _optionalRow(
-                            "HostWait", qualityMonitorModel.data.hostVideoWait),
-                        _optionalRow("MC in",
-                            qualityMonitorModel.data.mediacodecInputQueueMs),
-                        _optionalRow("MC out",
-                            qualityMonitorModel.data.mediacodecOutputDequeueMs),
-                        _optionalRow("YUV->RGBA",
-                            qualityMonitorModel.data.yuvToRgbaMs),
-                        _optionalRow(
-                            "MC dec", qualityMonitorModel.data.mediacodecDecodeMs),
-                        _optionalRow(
-                            "Frame", qualityMonitorModel.data.handleFrameMs),
-                        _optionalRow("Flutter",
-                            qualityMonitorModel.data.flutterHandoffMs),
-                        _optionalRow(
-                            "Total", qualityMonitorModel.data.endToEndMs),
-                        _optionalRow("RGBA", qualityMonitorModel.data.rgbaBytes),
-                        _optionalRow("Realloc",
-                            qualityMonitorModel.data.rgbaReallocated),
-                        _optionalRow(
-                            "Out buf", qualityMonitorModel.data.outputBufferBytes),
-                        _optionalRow(
-                            "Format", qualityMonitorModel.data.mediaFormat),
-                      ],
-                    ],
-                  ),
+              ? Stack(
+                  children: [
+                    IgnorePointer(
+                      child: Container(
+                        constraints: BoxConstraints(
+                          maxWidth:
+                              qualityMonitorModel.extendedDetails ? 240 : 200,
+                        ),
+                        padding: const EdgeInsets.all(8),
+                        color: MyTheme.canvasColor.withAlpha(150),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _section("Network"),
+                            _row(
+                                "Speed", qualityMonitorModel.data.speed ?? '-'),
+                            // let delay be 0 if fps is 0
+                            _row(
+                                "Delay",
+                                "${qualityMonitorModel.data.delay == null ? '-' : (qualityMonitorModel.data.fps ?? "").replaceAll(' ', '').replaceAll('0', '').isEmpty ? 0 : qualityMonitorModel.data.delay}ms",
+                                rightColor: Colors.green),
+                            _row("Path",
+                                qualityMonitorModel.data.connectionType ?? '-'),
+                            if (qualityMonitorModel.extendedDetails)
+                              _row("Direct",
+                                  qualityMonitorModel.data.direct ?? '-'),
+                            _section("QoS"),
+                            _row("FPS", qualityMonitorModel.data.fps ?? '-'),
+                            _row("Bitrate",
+                                "${qualityMonitorModel.data.targetBitrate ?? '-'}kb"),
+                            _row("Codec",
+                                qualityMonitorModel.data.codecLabel ?? '-'),
+                            _row("Chroma",
+                                qualityMonitorModel.data.chroma ?? '-'),
+                            if (qualityMonitorModel.extendedDetails) ...[
+                              _section("Remote"),
+                              _row("Host Ver",
+                                  qualityMonitorModel.data.hostVersion ?? '-'),
+                              _row(
+                                  "Capture API",
+                                  _pipelineLabel(
+                                      qualityMonitorModel.data.captureBackend)),
+                              _row(
+                                  "Capture Frame",
+                                  _pipelineLabel(
+                                      qualityMonitorModel.data.captureFrame)),
+                              _row(
+                                  "Encoder API",
+                                  _pipelineLabel(
+                                      qualityMonitorModel.data.encoderBackend)),
+                              _row("Encoder Input",
+                                  _pipelineLabel(
+                                      qualityMonitorModel.data.encoderInput)),
+                              _row("Video Threads",
+                                  qualityMonitorModel.data.videoThreads ?? '-'),
+                              _row(
+                                  "Frame Size",
+                                  qualityMonitorModel.data.frameResolution ??
+                                      '-'),
+                              _row("FPS Mode",
+                                  qualityMonitorModel.data.fpsMode ?? '-'),
+                              _row("Auto FPS",
+                                  qualityMonitorModel.data.autoFps ?? '-'),
+                              _row("Delivery",
+                                  qualityMonitorModel.data.videoDeliveryPhase ??
+                                      '-'),
+                              _row(
+                                  "Recoveries",
+                                  qualityMonitorModel
+                                          .data.videoRecoveryCount ??
+                                      '-'),
+                              _row(
+                                  "Last Stall",
+                                  qualityMonitorModel.data.videoStallMs == null
+                                      ? '-'
+                                      : '${qualityMonitorModel.data.videoStallMs}ms'),
+                              _section("Local"),
+                              _row(
+                                  "Client Ver",
+                                  qualityMonitorModel.data.clientVersion ??
+                                      '-'),
+                              _row("Decoder API",
+                                  _pipelineLabel(
+                                      qualityMonitorModel.data.decoder)),
+                              _row("Renderer Path",
+                                  _pipelineLabel(
+                                      qualityMonitorModel.data.renderer)),
+                              _row(
+                                  "Texture Render",
+                                  qualityMonitorModel.data.textureRender ??
+                                      '-'),
+                              _row("Decode FPS",
+                                  qualityMonitorModel.data.decodeFps ?? '-'),
+                              _row(
+                                  "Queue",
+                                  qualityMonitorModel
+                                          .data.videoFeedbackQueue ??
+                                      qualityMonitorModel.data.videoQueue ??
+                                      '-'),
+                              _row("Frames R/D/S",
+                                  qualityMonitorModel.data.videoProgress ?? '-'),
+                              _row("Dropped",
+                                  qualityMonitorModel.data.videoDropped ?? '-'),
+                              _row(
+                                  "Decode Time",
+                                  qualityMonitorModel.data.videoDecodeTimeUs ==
+                                          null
+                                      ? '-'
+                                      : '${qualityMonitorModel.data.videoDecodeTimeUs}us'),
+                              _row(
+                                  "Submit Time",
+                                  qualityMonitorModel
+                                              .data.videoRenderSubmitTimeUs ==
+                                          null
+                                      ? '-'
+                                      : '${qualityMonitorModel.data.videoRenderSubmitTimeUs}us'),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (onGripPanUpdate != null)
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        child: QualityMonitorGrip(
+                          details: qualityMonitorModel.details,
+                          onPanUpdate: onGripPanUpdate!,
+                          onDetailsChanged: qualityMonitorModel.setDetails,
+                        ),
+                      ),
+                  ],
                 )
               : const SizedBox.shrink()));
 }
 
-class PositionedQualityMonitor extends StatelessWidget {
-  final QualityMonitorModel qualityMonitorModel;
-  final Widget Function(Widget child)? childBuilder;
+class QualityMonitorGrip extends StatelessWidget {
+  final String details;
+  final GestureDragUpdateCallback onPanUpdate;
+  final Future<void> Function(String details) onDetailsChanged;
 
-  const PositionedQualityMonitor(
-      {Key? key, required this.qualityMonitorModel, this.childBuilder})
+  const QualityMonitorGrip(
+      {Key? key,
+      required this.details,
+      required this.onPanUpdate,
+      required this.onDetailsChanged})
+      : super(key: key);
+
+  Future<void> _showDetailsMenu(
+      BuildContext context, Offset globalPosition) async {
+    if (!(isDesktop || isWebDesktop)) return;
+    final overlay = Overlay.of(context).context.findRenderObject();
+    if (overlay is! RenderBox) return;
+    final position = overlay.globalToLocal(globalPosition);
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        overlay.size.width - position.dx,
+        overlay.size.height - position.dy,
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: kQualityMonitorDetailsBasic,
+          height: 32,
+          child: _detailsMenuRow(kQualityMonitorDetailsBasic),
+        ),
+        PopupMenuItem<String>(
+          value: kQualityMonitorDetailsExtended,
+          height: 32,
+          child: _detailsMenuRow(kQualityMonitorDetailsExtended),
+        ),
+      ],
+    );
+    if (selected != null && selected != details) {
+      await onDetailsChanged(selected);
+    }
+  }
+
+  Widget _detailsMenuRow(String value) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 16,
+            child: details == value ? const Icon(Icons.check, size: 14) : null,
+          ),
+          const SizedBox(width: 6),
+          Text(translate(qualityMonitorDetailsLabel(value))),
+        ],
+      );
+
+  @override
+  Widget build(BuildContext context) => MouseRegion(
+        cursor: SystemMouseCursors.move,
+        child: Listener(
+          behavior: HitTestBehavior.opaque,
+          onPointerDown: (event) {
+            if (event.buttons & kSecondaryMouseButton != 0) {
+              _showDetailsMenu(context, event.position);
+            }
+          },
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onPanUpdate: onPanUpdate,
+            child: Container(
+              width: 16,
+              height: 16,
+              color: MyTheme.canvasColor.withAlpha(180),
+            ),
+          ),
+        ),
+      );
+}
+
+class QualityMonitorHoverFade extends StatefulWidget {
+  static const settingsRefreshInterval = Duration(milliseconds: 1000);
+  static const restoreDuration = Duration(milliseconds: 180);
+
+  final Widget child;
+  final QualityMonitorFadeSettings Function()? settingsProvider;
+
+  const QualityMonitorHoverFade(
+      {Key? key, required this.child, this.settingsProvider})
       : super(key: key);
 
   @override
-  Widget build(BuildContext context) => ChangeNotifierProvider.value(
-      value: qualityMonitorModel,
-      child: Consumer<QualityMonitorModel>(
-        builder: (context, qualityMonitorModel, child) {
-          final monitor =
-              childBuilder?.call(QualityMonitor(qualityMonitorModel)) ??
-                  QualityMonitor(qualityMonitorModel);
-          const inset = 10.0;
-          switch (qualityMonitorModel.position) {
-            case kQualityMonitorPositionTopLeft:
-              return Positioned(top: inset, left: inset, child: monitor);
-            case kQualityMonitorPositionBottomRight:
-              return Positioned(bottom: inset, right: inset, child: monitor);
-            case kQualityMonitorPositionBottomLeft:
-              return Positioned(bottom: inset, left: inset, child: monitor);
-            case kQualityMonitorPositionTopRight:
-            default:
-              return Positioned(top: inset, right: inset, child: monitor);
-          }
-        },
-      ));
+  State<QualityMonitorHoverFade> createState() =>
+      _QualityMonitorHoverFadeState();
+}
+
+class QualityMonitorFadeSettings {
+  final double opacity;
+  final Duration delay;
+  final Duration duration;
+
+  const QualityMonitorFadeSettings({
+    required this.opacity,
+    required this.delay,
+    required this.duration,
+  });
+
+  factory QualityMonitorFadeSettings.fromUserDefaults() {
+    int option(String key,
+        {required int defaultValue, required int min, required int max}) {
+      return (int.tryParse(bind.mainGetUserDefaultOption(key: key)) ??
+              defaultValue)
+          .clamp(min, max);
+    }
+
+    return QualityMonitorFadeSettings(
+      opacity: option(
+            kOptionRemoteToolbarPinnedOpacityPercent,
+            defaultValue: kDefaultRemoteToolbarPinnedOpacityPercent,
+            min: kMinRemoteToolbarPinnedOpacityPercent,
+            max: kMaxRemoteToolbarPinnedOpacityPercent,
+          ) /
+          100.0,
+      delay: Duration(
+        milliseconds: option(
+          kOptionRemoteToolbarPinnedDimDelayMs,
+          defaultValue: kDefaultRemoteToolbarPinnedDimDelayMs,
+          min: kMinRemoteToolbarPinnedDimDelayMs,
+          max: kMaxRemoteToolbarPinnedDimDelayMs,
+        ),
+      ),
+      duration: Duration(
+        milliseconds: option(
+          kOptionRemoteToolbarPinnedDimDurationMs,
+          defaultValue: kDefaultRemoteToolbarPinnedDimDurationMs,
+          min: kMinRemoteToolbarPinnedDimDurationMs,
+          max: kMaxRemoteToolbarPinnedDimDurationMs,
+        ),
+      ),
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is QualityMonitorFadeSettings &&
+      opacity == other.opacity &&
+      delay == other.delay &&
+      duration == other.duration;
+
+  @override
+  int get hashCode => Object.hash(opacity, delay, duration);
+}
+
+class _QualityMonitorHoverFadeState extends State<QualityMonitorHoverFade> {
+  Timer? _dimTimer;
+  Timer? _settingsTimer;
+  late QualityMonitorFadeSettings _settings;
+  double _opacity = 1.0;
+  Duration _duration = QualityMonitorHoverFade.restoreDuration;
+  bool _hovered = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _settings = _readSettings();
+    if (isDesktop || isWebDesktop) {
+      _scheduleDim();
+      _settingsTimer = Timer.periodic(
+        QualityMonitorHoverFade.settingsRefreshInterval,
+        (_) => _refreshSettings(),
+      );
+    }
+  }
+
+  QualityMonitorFadeSettings _readSettings() =>
+      widget.settingsProvider?.call() ??
+      QualityMonitorFadeSettings.fromUserDefaults();
+
+  void _refreshSettings() {
+    if (!mounted) return;
+    final next = _readSettings();
+    if (next == _settings) return;
+    _settings = next;
+    _cancelDim();
+    if (_hovered) {
+      _setOpacity(1.0, QualityMonitorHoverFade.restoreDuration);
+    } else if (_opacity < 1.0) {
+      _setOpacity(_settings.opacity, QualityMonitorHoverFade.restoreDuration);
+    } else {
+      _scheduleDim();
+    }
+  }
+
+  void _cancelDim() {
+    _dimTimer?.cancel();
+    _dimTimer = null;
+  }
+
+  void _setOpacity(double opacity, Duration duration) {
+    if (!mounted || (_opacity == opacity && _duration == duration)) return;
+    setState(() {
+      _opacity = opacity;
+      _duration = duration;
+    });
+  }
+
+  void _scheduleDim() {
+    _cancelDim();
+    _dimTimer = Timer(_settings.delay, () {
+      _dimTimer = null;
+      if (_hovered) return;
+      _setOpacity(_settings.opacity, _settings.duration);
+    });
+  }
+
+  void _handleEnter(PointerEnterEvent event) {
+    _hovered = true;
+    _cancelDim();
+    _setOpacity(1.0, QualityMonitorHoverFade.restoreDuration);
+  }
+
+  void _handleExit(PointerExitEvent event) {
+    _hovered = false;
+    _scheduleDim();
+  }
+
+  @override
+  void dispose() {
+    _cancelDim();
+    _settingsTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => MouseRegion(
+        opaque: false,
+        onEnter: _handleEnter,
+        onExit: _handleExit,
+        child: AnimatedOpacity(
+          opacity: _opacity,
+          duration: _duration,
+          curve: Curves.easeOutCubic,
+          child: widget.child,
+        ),
+      );
+}
+
+class PositionedQualityMonitor extends StatefulWidget {
+  final QualityMonitorModel qualityMonitorModel;
+  final ValueChanged<Rect?>? onBoundsChanged;
+
+  const PositionedQualityMonitor(
+      {Key? key, required this.qualityMonitorModel, this.onBoundsChanged})
+      : super(key: key);
+
+  @override
+  State<PositionedQualityMonitor> createState() =>
+      _PositionedQualityMonitorState();
+}
+
+class _PositionedQualityMonitorState extends State<PositionedQualityMonitor> {
+  final _monitorKey = GlobalKey();
+  Rect? _lastBounds;
+  bool _boundsUpdateScheduled = false;
+
+  static const _inset = 10.0;
+  static const _monitorWidth = 200.0;
+  static const _basicHeight = 180.0;
+  static const _extendedHeight = 420.0;
+
+  double _boundedWidth(BoxConstraints constraints) {
+    return constraints.hasBoundedWidth
+        ? constraints.maxWidth
+        : _monitorWidth + _inset * 2;
+  }
+
+  double _boundedHeight(BoxConstraints constraints, bool extended) {
+    final fallback = (extended ? _extendedHeight : _basicHeight) + _inset * 2;
+    return constraints.hasBoundedHeight ? constraints.maxHeight : fallback;
+  }
+
+  Offset _fixedOrigin(
+      BoxConstraints constraints, String position, bool extended) {
+    final width = _boundedWidth(constraints);
+    final height = _boundedHeight(constraints, extended);
+    final monitorHeight = extended ? _extendedHeight : _basicHeight;
+    switch (position) {
+      case kQualityMonitorPositionTopLeft:
+        return const Offset(_inset, _inset);
+      case kQualityMonitorPositionBottomRight:
+        return Offset(
+            width - _monitorWidth - _inset, height - monitorHeight - _inset);
+      case kQualityMonitorPositionBottomLeft:
+        return Offset(_inset, height - monitorHeight - _inset);
+      case kQualityMonitorPositionTopRight:
+      default:
+        return Offset(width - _monitorWidth - _inset, _inset);
+    }
+  }
+
+  Offset _clampPosition(
+      BoxConstraints constraints, Offset position, bool extended) {
+    final width = _boundedWidth(constraints);
+    final height = _boundedHeight(constraints, extended);
+    final monitorHeight = extended ? _extendedHeight : _basicHeight;
+    final maxX = math.max(0.0, width - _monitorWidth);
+    final maxY = math.max(0.0, height - monitorHeight);
+    return Offset(position.dx.clamp(0.0, maxX).toDouble(),
+        position.dy.clamp(0.0, maxY).toDouble());
+  }
+
+  void _scheduleBoundsUpdate() {
+    if (widget.onBoundsChanged == null || _boundsUpdateScheduled) {
+      return;
+    }
+    _boundsUpdateScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _boundsUpdateScheduled = false;
+      if (!mounted) {
+        return;
+      }
+      Rect? bounds;
+      final renderObject = _monitorKey.currentContext?.findRenderObject();
+      if (renderObject is RenderBox && renderObject.hasSize) {
+        final topLeft = renderObject.localToGlobal(Offset.zero);
+        bounds = topLeft & renderObject.size;
+        if (bounds.width <= 0 || bounds.height <= 0) {
+          bounds = null;
+        }
+      }
+      if (bounds != _lastBounds) {
+        _lastBounds = bounds;
+        widget.onBoundsChanged!(bounds);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.onBoundsChanged?.call(null);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Positioned.fill(
+        child: ChangeNotifierProvider.value(
+            value: widget.qualityMonitorModel,
+            child: Consumer<QualityMonitorModel>(
+              builder: (context, qualityMonitorModel, child) {
+                return LayoutBuilder(builder: (context, constraints) {
+                  final extended = qualityMonitorModel.extendedDetails;
+                  _scheduleBoundsUpdate();
+                  final monitor = KeyedSubtree(
+                    key: _monitorKey,
+                    child: QualityMonitorHoverFade(
+                      child: QualityMonitor(
+                        qualityMonitorModel,
+                        onGripPanUpdate: (details) {
+                          final base = qualityMonitorModel.floatingPosition ??
+                              _fixedOrigin(constraints,
+                                  qualityMonitorModel.position, extended);
+                          qualityMonitorModel.updateFloatingPosition(
+                              _clampPosition(constraints,
+                                  base + details.delta, extended));
+                        },
+                      ),
+                    ),
+                  );
+                  final floatingPosition = qualityMonitorModel.floatingPosition;
+                  Widget positionedMonitor;
+                  if (floatingPosition != null) {
+                    final position =
+                        _clampPosition(constraints, floatingPosition, extended);
+                    positionedMonitor = Positioned(
+                        top: position.dy, left: position.dx, child: monitor);
+                  } else {
+                    switch (qualityMonitorModel.position) {
+                      case kQualityMonitorPositionTopLeft:
+                        positionedMonitor = Positioned(
+                            top: _inset, left: _inset, child: monitor);
+                        break;
+                      case kQualityMonitorPositionBottomRight:
+                        positionedMonitor = Positioned(
+                            bottom: _inset, right: _inset, child: monitor);
+                        break;
+                      case kQualityMonitorPositionBottomLeft:
+                        positionedMonitor = Positioned(
+                            bottom: _inset, left: _inset, child: monitor);
+                        break;
+                      case kQualityMonitorPositionTopRight:
+                      default:
+                        positionedMonitor = Positioned(
+                            top: _inset, right: _inset, child: monitor);
+                        break;
+                    }
+                  }
+                  return Stack(children: [positionedMonitor]);
+                });
+              },
+            )),
+      );
 }
 
 class BlockableOverlayState extends OverlayKeyState {

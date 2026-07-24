@@ -20,7 +20,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
 import 'package:get/get_rx/src/rx_workers/utils/debouncer.dart';
 import 'package:provider/provider.dart';
-import 'package:uni_links/uni_links.dart';
+import 'package:app_links/app_links.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:uuid/uuid.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -48,6 +48,8 @@ import 'package:flutter_hbb/utils/http_service.dart' as http;
 
 final globalKey = GlobalKey<NavigatorState>();
 final navigationBarKey = GlobalKey();
+
+const Size kDesktopDefaultMainWindowSize = Size(1280, 800);
 
 final isAndroid = isAndroid_;
 final isIOS = isIOS_;
@@ -412,7 +414,7 @@ class MyTheme {
     appBarTheme: AppBarTheme(
       shadowColor: Colors.transparent,
     ),
-    dialogTheme: DialogTheme(
+    dialogTheme: DialogThemeData(
       elevation: 15,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(4.0),
@@ -443,7 +445,7 @@ class MyTheme {
     cardColor: grayBg,
     hintColor: Color(0xFFAAAAAA),
     visualDensity: VisualDensity.adaptivePlatformDensity,
-    tabBarTheme: const TabBarTheme(
+    tabBarTheme: const TabBarThemeData(
       labelColor: Colors.black87,
     ),
     tooltipTheme: tooltipTheme(),
@@ -519,7 +521,7 @@ class MyTheme {
     appBarTheme: AppBarTheme(
       shadowColor: Colors.transparent,
     ),
-    dialogTheme: DialogTheme(
+    dialogTheme: DialogThemeData(
       elevation: 15,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(4.0),
@@ -553,7 +555,7 @@ class MyTheme {
     ),
     cardColor: Color(0xFF24252B),
     visualDensity: VisualDensity.adaptivePlatformDensity,
-    tabBarTheme: const TabBarTheme(
+    tabBarTheme: const TabBarThemeData(
       labelColor: Colors.white70,
     ),
     tooltipTheme: tooltipTheme(),
@@ -1539,6 +1541,14 @@ void msgBoxCommon(OverlayDialogManager dialogManager, String title,
       ));
 }
 
+void showCodecUnavailableDialog(
+    OverlayDialogManager dialogManager, String codec) {
+  msgBoxCommon(dialogManager, 'Codec',
+      Text('${translate(codec)}\n\n${translate('codec_unavailable_tip')}'), [
+    dialogButton('OK', onPressed: dialogManager.dismissAll),
+  ]);
+}
+
 Color str2color(String str, [alpha = 0xFF]) {
   var hash = 160 << 16 + 114 << 8 + 91;
   for (var i = 0; i < str.length; i += 1) {
@@ -2209,12 +2219,14 @@ Future<Size> _adjustRestoreMainWindowSize(double? width, double? height) async {
   const double maxWidth = 6480;
   const double maxHeight = 6480;
 
-  final defaultWidth =
-      ((isDesktop || isWebDesktop) ? 1280 : kMobileDefaultDisplayWidth)
-          .toDouble();
-  final defaultHeight =
-      ((isDesktop || isWebDesktop) ? 720 : kMobileDefaultDisplayHeight)
-          .toDouble();
+  final defaultWidth = ((isDesktop || isWebDesktop)
+          ? kDesktopDefaultMainWindowSize.width
+          : kMobileDefaultDisplayWidth)
+      .toDouble();
+  final defaultHeight = ((isDesktop || isWebDesktop)
+          ? kDesktopDefaultMainWindowSize.height
+          : kMobileDefaultDisplayHeight)
+      .toDouble();
   double restoreWidth = width ?? defaultWidth;
   double restoreHeight = height ?? defaultHeight;
 
@@ -2467,6 +2479,7 @@ Future<bool> restoreWindowPosition(WindowType type,
 }
 
 var webInitialLink = "";
+final AppLinks appLinks = AppLinks();
 
 /// Initialize uni links for macos/windows
 ///
@@ -2479,7 +2492,8 @@ Future<bool> initUniLinks() async {
   }
   // check cold boot
   try {
-    final initialLink = await getInitialLink();
+    final initialUri = await appLinks.getInitialLink();
+    final initialLink = initialUri?.toString();
     print("initialLink: $initialLink");
     if (initialLink == null || initialLink.isEmpty) {
       return false;
@@ -2506,16 +2520,12 @@ StreamSubscription? listenUniLinks({handleByFlutter = true}) {
     return null;
   }
 
-  final sub = uriLinkStream.listen((Uri? uri) {
+  final sub = appLinks.uriLinkStream.listen((Uri uri) {
     debugPrint("A uri was received: $uri. handleByFlutter $handleByFlutter");
-    if (uri != null) {
-      if (handleByFlutter) {
-        handleUriLink(uri: uri);
-      } else {
-        bind.sendUrlScheme(url: uri.toString());
-      }
+    if (handleByFlutter) {
+      handleUriLink(uri: uri);
     } else {
-      print("uni listen error: uri is empty.");
+      bind.sendUrlScheme(url: uri.toString());
     }
   }, onError: (err) {
     print("uni links error: $err");
@@ -3219,9 +3229,36 @@ Future<void> onActiveWindowChanged() async {
 }
 
 Timer periodic_immediate(Duration duration, Future<void> Function() callback) {
-  Future.delayed(Duration.zero, callback);
-  return Timer.periodic(duration, (timer) async {
-    await callback();
+  // Keep periodic UI refreshes from flooding the shared FRB worker queue.
+  return periodicImmediateSingleFlight(duration, callback);
+}
+
+Timer periodicImmediateSingleFlight(
+    Duration duration, Future<void> Function() callback) {
+  var running = false;
+  var pending = false;
+
+  Future<void> run() async {
+    if (running) {
+      pending = true;
+      return;
+    }
+    running = true;
+    try {
+      do {
+        pending = false;
+        await callback();
+      } while (pending);
+    } catch (e, s) {
+      debugPrint('periodicImmediateSingleFlight failed: $e\n$s');
+    } finally {
+      running = false;
+    }
+  }
+
+  Future.delayed(Duration.zero, run);
+  return Timer.periodic(duration, (timer) {
+    run();
   });
 }
 
@@ -3470,7 +3507,7 @@ void onCopyFingerprint(String value) {
 }
 
 Future<bool> callMainCheckSuperUserPermission() async {
-  bool checked = await bind.mainCheckSuperUserPermission();
+  final checked = await bind.mainCheckSuperUserPermission();
   if (isMacOS) {
     await windowManager.show();
   }

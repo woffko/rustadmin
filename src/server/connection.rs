@@ -42,7 +42,7 @@ use hbb_common::{
         option_message::{BoolOption, CaptureBackend},
         permission_info::Permission,
         supported_decoding::PreferCodec,
-        SessionPermissionRequest, SessionPermissionResponse,
+        SessionPermissionRequest, SessionPermissionResponse, VideoFeedback, VideoFrame,
     },
     password_security::{self as password, ApproveMode},
     sha2::{Digest, Sha256},
@@ -62,12 +62,15 @@ use serde_json::{json, value::Value};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::Ordering;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::Ipv6Addr,
     num::NonZeroI64,
     path::PathBuf,
     str::FromStr,
-    sync::{atomic::AtomicI64, mpsc as std_mpsc},
+    sync::{
+        atomic::{AtomicBool, AtomicI64},
+        mpsc as std_mpsc,
+    },
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use system_shutdown;
@@ -77,6 +80,160 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use crate::virtual_display_manager;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
+type QueuedVideoMessage = (Instant, Arc<Message>);
+const VIDEO_QUEUE_CAPACITY: usize = 8;
+
+struct VideoQueueInner {
+    messages: std::sync::Mutex<VecDeque<QueuedVideoMessage>>,
+    drop_diagnostics: std::sync::Mutex<VideoQueueDropDiagnostics>,
+    notify: hbb_common::tokio::sync::Notify,
+}
+
+struct VideoQueueDropDiagnostics {
+    dropped_since_log: usize,
+    last_log: Instant,
+}
+
+#[derive(Clone)]
+pub(crate) struct VideoQueueSender {
+    inner: Arc<VideoQueueInner>,
+}
+
+struct VideoQueueReceiver {
+    inner: Arc<VideoQueueInner>,
+}
+
+fn video_queue() -> (VideoQueueSender, VideoQueueReceiver) {
+    let inner = Arc::new(VideoQueueInner {
+        messages: std::sync::Mutex::new(VecDeque::with_capacity(VIDEO_QUEUE_CAPACITY)),
+        drop_diagnostics: std::sync::Mutex::new(VideoQueueDropDiagnostics {
+            dropped_since_log: 0,
+            last_log: Instant::now(),
+        }),
+        notify: hbb_common::tokio::sync::Notify::new(),
+    });
+    (
+        VideoQueueSender {
+            inner: inner.clone(),
+        },
+        VideoQueueReceiver { inner },
+    )
+}
+
+fn is_video_frame(message: &Message) -> bool {
+    matches!(&message.union, Some(message::Union::VideoFrame(_)))
+}
+
+impl VideoQueueSender {
+    fn send(&self, message: QueuedVideoMessage) -> Option<QueuedVideoMessage> {
+        let incoming_is_video = is_video_frame(&message.1);
+        let mut messages = self.inner.messages.lock().unwrap();
+        let dropped = if messages.len() >= VIDEO_QUEUE_CAPACITY {
+            if let Some(position) = messages
+                .iter()
+                .position(|(_, queued)| is_video_frame(queued))
+            {
+                messages.remove(position)
+            } else if incoming_is_video {
+                return Some(message);
+            } else {
+                messages.pop_front()
+            }
+        } else {
+            None
+        };
+        messages.push_back(message);
+        drop(messages);
+        self.inner.notify.notify_one();
+        dropped
+    }
+
+    fn record_drop(&self, conn_id: i32, queued_at: Instant) {
+        let mut diagnostics = self.inner.drop_diagnostics.lock().unwrap();
+        diagnostics.dropped_since_log += 1;
+        if diagnostics.last_log.elapsed() < VIDEO_STALE_DROP_LOG_INTERVAL {
+            return;
+        }
+        let queue_depth = self.inner.messages.lock().unwrap().len();
+        log::warn!(
+            "#{conn_id} diag bounded video queue dropped stale frames: dropped_since_last_log={}, queue_depth={}, queue_capacity={}, dropped_queue_latency_ms={}",
+            diagnostics.dropped_since_log,
+            queue_depth,
+            VIDEO_QUEUE_CAPACITY,
+            queued_at.elapsed().as_millis()
+        );
+        diagnostics.dropped_since_log = 0;
+        diagnostics.last_log = Instant::now();
+    }
+}
+
+impl VideoQueueReceiver {
+    async fn recv(&mut self) -> QueuedVideoMessage {
+        loop {
+            let notified = self.inner.notify.notified();
+            if let Some(message) = self.inner.messages.lock().unwrap().pop_front() {
+                return message;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod video_queue_tests {
+    use super::*;
+
+    fn video_message(frame_id: u64) -> Arc<Message> {
+        let mut frame = VideoFrame::new();
+        frame.frame_id = frame_id;
+        let mut message = Message::new();
+        message.set_video_frame(frame);
+        Arc::new(message)
+    }
+
+    #[test]
+    fn bounded_video_queue_evicts_oldest_video_frame() {
+        let (sender, _receiver) = video_queue();
+        for frame_id in 1..=VIDEO_QUEUE_CAPACITY as u64 {
+            assert!(sender
+                .send((Instant::now(), video_message(frame_id)))
+                .is_none());
+        }
+
+        let dropped = sender
+            .send((Instant::now(), video_message(99)))
+            .expect("full queue must evict a video frame");
+        let Some(message::Union::VideoFrame(frame)) = &dropped.1.union else {
+            panic!("evicted message must be a video frame");
+        };
+        assert_eq!(frame.frame_id, 1);
+        assert_eq!(
+            sender.inner.messages.lock().unwrap().len(),
+            VIDEO_QUEUE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn bounded_video_queue_preserves_ordering_messages() {
+        let (sender, _receiver) = video_queue();
+        let ordering_message = Arc::new(Message::new());
+        assert!(sender
+            .send((Instant::now(), ordering_message.clone()))
+            .is_none());
+        for frame_id in 1..VIDEO_QUEUE_CAPACITY as u64 {
+            assert!(sender
+                .send((Instant::now(), video_message(frame_id)))
+                .is_none());
+        }
+
+        let dropped = sender
+            .send((Instant::now(), video_message(99)))
+            .expect("full queue must evict a video frame");
+        assert!(is_video_frame(&dropped.1));
+        let messages = sender.inner.messages.lock().unwrap();
+        assert!(Arc::ptr_eq(&messages.front().unwrap().1, &ordering_message));
+    }
+}
 
 lazy_static::lazy_static! {
     static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
@@ -185,7 +342,8 @@ pub fn plugin_block_input(peer: &str, block: bool) -> bool {
 pub struct ConnInner {
     id: i32,
     tx: Option<Sender>,
-    tx_video: Option<Sender>,
+    tx_video: Option<VideoQueueSender>,
+    video_source: VideoSource,
 }
 
 struct InputMouse {
@@ -391,6 +549,259 @@ struct PendingPermissionRequest {
 }
 
 const PENDING_PERMISSION_REQUEST_TIMEOUT_SECS: u64 = 120;
+const VIDEO_FEEDBACK_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_VIDEO_FEEDBACK_DISPLAYS: usize = 32;
+const VIDEO_DELIVERY_TICK_INTERVAL: Duration = Duration::from_millis(100);
+const VIDEO_DELIVERY_DEFAULT_NETWORK_DELAY_MS: u32 = 250;
+const VIDEO_DELIVERY_MIN_PROGRESS_TIMEOUT: Duration = Duration::from_millis(500);
+const VIDEO_DELIVERY_MAX_PROGRESS_TIMEOUT: Duration = Duration::from_secs(4);
+const VIDEO_DELIVERY_MIN_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+// Feedback can be emitted after receive but before asynchronous decode/render.
+// Older viewers may never send the final same-frame update on an idle desktop.
+const VIDEO_DELIVERY_PIPELINE_SLACK_FRAMES: u64 = 2;
+
+#[derive(Clone)]
+struct VideoFeedbackDiagnostics {
+    feedback: VideoFeedback,
+    last_log: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoDeliveryPhase {
+    Starting,
+    Healthy,
+    Recovering,
+}
+
+impl VideoDeliveryPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Healthy => "healthy",
+            Self::Recovering => "recovering",
+        }
+    }
+
+    fn severity(self) -> u8 {
+        match self {
+            Self::Healthy => 0,
+            Self::Starting => 1,
+            Self::Recovering => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VideoDeliveryState {
+    stream_id: u64,
+    highest_sent_frame_id: u64,
+    highest_decoded_frame_id: u64,
+    highest_render_submitted_frame_id: u64,
+    first_sent_at: Instant,
+    decode_pending_since: Option<Instant>,
+    last_refresh_at: Option<Instant>,
+    phase: VideoDeliveryPhase,
+    recovery_count: u64,
+    latest_stall_ms: u64,
+}
+
+impl VideoDeliveryState {
+    fn new(stream_id: u64, highest_sent_frame_id: u64, now: Instant) -> Self {
+        Self {
+            stream_id,
+            highest_sent_frame_id,
+            highest_decoded_frame_id: 0,
+            highest_render_submitted_frame_id: 0,
+            first_sent_at: now,
+            decode_pending_since: Some(now),
+            last_refresh_at: None,
+            phase: VideoDeliveryPhase::Starting,
+            recovery_count: 0,
+            latest_stall_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoDeliveryStatus {
+    phase: VideoDeliveryPhase,
+    recovery_count: u64,
+    latest_stall_ms: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct VideoRecoveryAction {
+    display: i32,
+    stream_id: u64,
+    highest_sent_frame_id: u64,
+    highest_decoded_frame_id: u64,
+    highest_render_submitted_frame_id: u64,
+    stalled_ms: u128,
+    previous_phase: VideoDeliveryPhase,
+}
+
+#[derive(Default)]
+struct VideoDeliveryController {
+    by_display: HashMap<i32, VideoDeliveryState>,
+}
+
+impl VideoDeliveryController {
+    fn progress_timeout(network_delay_ms: u32) -> Duration {
+        let network_delay_ms = if network_delay_ms == 0 {
+            VIDEO_DELIVERY_DEFAULT_NETWORK_DELAY_MS
+        } else {
+            network_delay_ms
+        };
+        Duration::from_millis(u64::from(network_delay_ms.max(50)).saturating_mul(3)).clamp(
+            VIDEO_DELIVERY_MIN_PROGRESS_TIMEOUT,
+            VIDEO_DELIVERY_MAX_PROGRESS_TIMEOUT,
+        )
+    }
+
+    fn refresh_cooldown(network_delay_ms: u32) -> Duration {
+        Self::progress_timeout(network_delay_ms).max(VIDEO_DELIVERY_MIN_REFRESH_COOLDOWN)
+    }
+
+    fn on_frame_sent(&mut self, frame: &VideoFrame, now: Instant) {
+        if frame.stream_id == 0 || frame.frame_id == 0 || frame.display < 0 {
+            return;
+        }
+        if !self.by_display.contains_key(&frame.display)
+            && self.by_display.len() >= MAX_VIDEO_FEEDBACK_DISPLAYS
+        {
+            return;
+        }
+        let state = self
+            .by_display
+            .entry(frame.display)
+            .or_insert_with(|| VideoDeliveryState::new(frame.stream_id, frame.frame_id, now));
+        if state.stream_id != frame.stream_id {
+            *state = VideoDeliveryState::new(frame.stream_id, frame.frame_id, now);
+            return;
+        }
+        if frame.frame_id > state.highest_sent_frame_id
+            && state.highest_sent_frame_id <= state.highest_decoded_frame_id
+        {
+            state.decode_pending_since = Some(now);
+        }
+        state.highest_sent_frame_id = state.highest_sent_frame_id.max(frame.frame_id);
+    }
+
+    fn on_feedback(&mut self, feedback: &VideoFeedback, now: Instant) -> bool {
+        if !self.by_display.contains_key(&feedback.display)
+            && self.by_display.len() >= MAX_VIDEO_FEEDBACK_DISPLAYS
+        {
+            return false;
+        }
+        let state = self.by_display.entry(feedback.display).or_insert_with(|| {
+            VideoDeliveryState::new(feedback.stream_id, feedback.received_frame_id, now)
+        });
+        if state.stream_id != feedback.stream_id {
+            *state = VideoDeliveryState::new(feedback.stream_id, feedback.received_frame_id, now);
+        }
+        if feedback.received_frame_id > state.highest_sent_frame_id
+            && state.highest_sent_frame_id <= state.highest_decoded_frame_id
+        {
+            // `on_frame_sent` normally starts this clock. Feedback can win the
+            // race during stream setup, so use its arrival as a conservative
+            // fallback rather than inheriting an old idle timestamp.
+            state.decode_pending_since = Some(now);
+        }
+        state.highest_sent_frame_id = state.highest_sent_frame_id.max(feedback.received_frame_id);
+        if feedback.decoded_frame_id > state.highest_decoded_frame_id {
+            state.highest_decoded_frame_id = feedback.decoded_frame_id;
+            state.decode_pending_since =
+                if state.highest_decoded_frame_id >= state.highest_sent_frame_id {
+                    None
+                } else {
+                    Some(now)
+                };
+            state.phase = VideoDeliveryPhase::Healthy;
+        }
+        let first_render =
+            state.highest_render_submitted_frame_id == 0 && feedback.render_submitted_frame_id > 0;
+        state.highest_render_submitted_frame_id = state
+            .highest_render_submitted_frame_id
+            .max(feedback.render_submitted_frame_id);
+        first_render
+    }
+
+    fn poll_recovery(&mut self, now: Instant, network_delay_ms: u32) -> Vec<VideoRecoveryAction> {
+        let progress_timeout = Self::progress_timeout(network_delay_ms);
+        let refresh_cooldown = Self::refresh_cooldown(network_delay_ms);
+        let mut actions = Vec::new();
+        for (&display, state) in self.by_display.iter_mut() {
+            if state.highest_sent_frame_id <= state.highest_decoded_frame_id {
+                continue;
+            }
+            let undecoded_frames = state
+                .highest_sent_frame_id
+                .saturating_sub(state.highest_decoded_frame_id);
+            if state.phase != VideoDeliveryPhase::Starting
+                && undecoded_frames <= VIDEO_DELIVERY_PIPELINE_SLACK_FRAMES
+            {
+                continue;
+            }
+            let progress_at = state.decode_pending_since.unwrap_or(state.first_sent_at);
+            let stalled = now.saturating_duration_since(progress_at);
+            if stalled < progress_timeout
+                || state
+                    .last_refresh_at
+                    .is_some_and(|last| now.saturating_duration_since(last) < refresh_cooldown)
+            {
+                continue;
+            }
+            let previous_phase = state.phase;
+            state.phase = VideoDeliveryPhase::Recovering;
+            state.last_refresh_at = Some(now);
+            state.recovery_count = state.recovery_count.saturating_add(1);
+            state.latest_stall_ms = stalled.as_millis().min(u64::MAX as u128) as u64;
+            actions.push(VideoRecoveryAction {
+                display,
+                stream_id: state.stream_id,
+                highest_sent_frame_id: state.highest_sent_frame_id,
+                highest_decoded_frame_id: state.highest_decoded_frame_id,
+                highest_render_submitted_frame_id: state.highest_render_submitted_frame_id,
+                stalled_ms: stalled.as_millis(),
+                previous_phase,
+            });
+        }
+        actions
+    }
+
+    fn status(&self, display: i32) -> Option<VideoDeliveryStatus> {
+        let state = self.by_display.get(&display).or_else(|| {
+            self.by_display.values().max_by_key(|state| {
+                (
+                    state.phase.severity(),
+                    state.latest_stall_ms,
+                    state.recovery_count,
+                )
+            })
+        })?;
+        Some(VideoDeliveryStatus {
+            phase: state.phase,
+            recovery_count: state.recovery_count,
+            latest_stall_ms: state.latest_stall_ms,
+        })
+    }
+}
+
+fn valid_video_feedback(feedback: &VideoFeedback) -> bool {
+    feedback.stream_id != 0
+        && feedback.display >= 0
+        && feedback.received_frame_id != 0
+        && feedback.decoded_frame_id <= feedback.received_frame_id
+        && feedback.render_submitted_frame_id <= feedback.decoded_frame_id
+}
+
+fn video_feedback_regressed(previous: &VideoFeedback, next: &VideoFeedback) -> bool {
+    previous.stream_id == next.stream_id
+        && (next.received_frame_id < previous.received_frame_id
+            || next.decoded_frame_id < previous.decoded_frame_id
+            || next.render_submitted_frame_id < previous.render_submitted_frame_id
+            || next.dropped_frames < previous.dropped_frames)
+}
 
 fn pending_permission_response_values<'a>(
     pending: &'a PendingPermissionRequest,
@@ -597,11 +1008,19 @@ pub struct Connection {
     terminal_user_token: Option<TerminalUserToken>,
     terminal_generic_service: Option<Box<GenericService>>,
     pending_permission_requests: HashMap<u64, PendingPermissionRequest>,
+    video_feedback_by_display: HashMap<i32, VideoFeedbackDiagnostics>,
+    video_feedback_capable: AtomicBool,
+    video_delivery: VideoDeliveryController,
 }
 
 impl ConnInner {
-    pub fn new(id: i32, tx: Option<Sender>, tx_video: Option<Sender>) -> Self {
-        Self { id, tx, tx_video }
+    pub(crate) fn new(id: i32, tx: Option<Sender>, tx_video: Option<VideoQueueSender>) -> Self {
+        Self {
+            id,
+            tx,
+            tx_video,
+            video_source: VideoSource::Monitor,
+        }
     }
 }
 
@@ -622,14 +1041,24 @@ impl Subscriber for ConnInner {
             },
             _ => false,
         };
-        let tx = if tx_by_video {
-            self.tx_video.as_mut()
-        } else {
-            self.tx.as_mut()
-        };
-        tx.map(|tx| {
-            allow_err!(tx.send((Instant::now(), msg)));
-        });
+        let queued = (Instant::now(), msg);
+        if tx_by_video {
+            if let Some(tx) = self.tx_video.as_ref() {
+                if let Some((instant, dropped)) = tx.send(queued) {
+                    tx.record_drop(self.id, instant);
+                    if let Some(message::Union::VideoFrame(frame)) = &dropped.union {
+                        video_service::notify_video_frame_fetched(
+                            self.video_source,
+                            frame.display as usize,
+                            self.id,
+                            Some(instant.into()),
+                        );
+                    }
+                }
+            }
+        } else if let Some(tx) = self.tx.as_ref() {
+            allow_err!(tx.send(queued));
+        }
     }
 }
 
@@ -642,7 +1071,7 @@ const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
 const SEND_TIMEOUT_VIDEO_STARTUP: u64 = 60_000;
 const VIDEO_STARTUP_SEND_TIMEOUT_WINDOW: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
-const VIDEO_FRAME_STALE_DROP_AFTER: Duration = Duration::from_millis(200);
+const VIDEO_FRAME_STALE_DROP_AFTER: Duration = Duration::from_secs(3);
 const VIDEO_STALE_DROP_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 fn steady_send_timeout_ms(file_transfer: bool, port_forward: bool, terminal: bool) -> u64 {
@@ -722,7 +1151,7 @@ impl Connection {
         let tx_from_cm = tx_from_cm_holder.clone();
         let (tx_to_cm, rx_to_cm) = mpsc::unbounded_channel::<ipc::Data>();
         let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
-        let (tx_video, mut rx_video) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
+        let (tx_video, mut rx_video) = video_queue();
         let (tx_input, _rx_input) = std_mpsc::channel();
         let (tx_from_authed, mut rx_from_authed) = mpsc::unbounded_channel::<ipc::Data>();
         let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();
@@ -746,6 +1175,7 @@ impl Connection {
                 id,
                 tx: Some(tx),
                 tx_video: Some(tx_video),
+                video_source: VideoSource::Monitor,
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
             display_idx: *display_service::PRIMARY_DISPLAY_IDX,
@@ -833,6 +1263,9 @@ impl Connection {
             terminal_user_token: None,
             terminal_generic_service: None,
             pending_permission_requests: HashMap::new(),
+            video_feedback_by_display: HashMap::new(),
+            video_feedback_capable: AtomicBool::new(false),
+            video_delivery: VideoDeliveryController::default(),
         };
         let addr = hbb_common::try_into_v4(addr);
         log::info!("#{} diag conn accepted: addr={}", conn.inner.id(), addr);
@@ -914,6 +1347,8 @@ impl Connection {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned));
         let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
+        let mut video_delivery_timer =
+            crate::rustdesk_interval(time::interval(VIDEO_DELIVERY_TICK_INTERVAL));
         let mut first_video_frame_sent = false;
         let mut stale_video_drop_log_at: Option<Instant> = None;
         let mut stale_video_drop_count = 0u64;
@@ -1084,7 +1519,7 @@ impl Connection {
                         }
                         #[cfg(windows)]
                         ipc::Data::DataPortableService(ipc::DataPortableService::RequestStart) => {
-                            if let Err(e) = portable_client::start_portable_service(portable_client::StartPara::Direct) {
+                            if let Err(e) = portable_client::start_portable_service(portable_client::StartPara::ElevatedDirect) {
                                 log::error!("Failed to start portable service from cm: {:?}", e);
                             }
                         }
@@ -1194,7 +1629,7 @@ impl Connection {
                         break;
                     }
                 }
-                Some((instant, value)) = rx_video.recv() => {
+                (instant, value) = rx_video.recv() => {
                     let is_video_frame = matches!(&value.union, Some(message::Union::VideoFrame(_)));
                     if is_video_frame && first_video_frame_sent && instant.elapsed() >= VIDEO_FRAME_STALE_DROP_AFTER {
                         stale_video_drop_count += 1;
@@ -1213,7 +1648,12 @@ impl Connection {
                         }
                         if !conn.video_ack_required {
                             if let Some(message::Union::VideoFrame(vf)) = &value.union {
-                                video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
+                                video_service::notify_video_frame_fetched(
+                                    conn.video_source(),
+                                    vf.display as usize,
+                                    id,
+                                    Some(instant.into()),
+                                );
                             }
                         }
                         continue;
@@ -1239,19 +1679,39 @@ impl Connection {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
+                    if is_video_frame
+                        && conn
+                            .video_feedback_capable
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if let Some(message::Union::VideoFrame(vf)) = &value.union {
+                            conn.video_delivery.on_frame_sent(vf, Instant::now());
+                        }
+                    }
                     if is_video_frame && !conn.video_ack_required {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
-                            video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
+                            video_service::notify_video_frame_fetched(
+                                conn.video_source(),
+                                vf.display as usize,
+                                id,
+                                Some(instant.into()),
+                            );
                         }
                     }
                     if is_video_frame && !first_video_frame_sent {
                         first_video_frame_sent = true;
-                        log::info!(
-                            "#{} diag first video frame sent to stream: queue_latency_ms={}, video_ack_required={}",
-                            conn.inner.id(),
-                            instant.elapsed().as_millis(),
-                            conn.video_ack_required
-                        );
+                        if let Some(message::Union::VideoFrame(vf)) = &value.union {
+                            log::info!(
+                                "#{} diag first video frame sent to stream: display={}, stream_id={}, frame_id={}, capture_ms={}, queue_latency_ms={}, video_ack_required={}",
+                                conn.inner.id(),
+                                vf.display,
+                                vf.stream_id,
+                                vf.frame_id,
+                                vf.capture_time_ms,
+                                instant.elapsed().as_millis(),
+                                conn.video_ack_required
+                            );
+                        }
                     }
                 },
                 Some((instant, value)) = rx.recv() => {
@@ -1344,6 +1804,31 @@ impl Connection {
                         _ => {}
                     }
                 }
+                _ = video_delivery_timer.tick() => {
+                    if conn
+                        .video_feedback_capable
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let actions = conn
+                            .video_delivery
+                            .poll_recovery(Instant::now(), conn.network_delay);
+                        for action in actions {
+                            log::warn!(
+                                "#{} diag video delivery recovery: display={}, stream_id={}, sent={}, decoded={}, render_submitted={}, stalled_ms={}, network_delay_ms={}, previous_phase={:?}",
+                                conn.inner.id(),
+                                action.display,
+                                action.stream_id,
+                                action.highest_sent_frame_id,
+                                action.highest_decoded_frame_id,
+                                action.highest_render_submitted_frame_id,
+                                action.stalled_ms,
+                                conn.network_delay,
+                                action.previous_phase
+                            );
+                            conn.refresh_video_reference(action.display as usize);
+                        }
+                    }
+                }
                 _ = second_timer.tick() => {
                     if send_timeout_ms != steady_timeout_ms
                         && startup_send_timeout_until
@@ -1380,17 +1865,51 @@ impl Connection {
                     // The control end will jump out of the loop after receiving LoginResponse and will not reply to the TestDelay
                     if conn.last_test_delay.is_none() && !(conn.port_forward_socket.is_some() && conn.authorized) {
                         conn.last_test_delay = Some(Instant::now());
-                        let host_video_diag = video_service::HOST_VIDEO_DIAG.lock().unwrap().clone();
+                        let (
+                            target_bitrate,
+                            capture_backend,
+                            capture_frame,
+                            encoder_backend,
+                            encoder_input,
+                        ) = {
+                            let video_qos = video_service::VIDEO_QOS.lock().unwrap();
+                            let video_service_name = video_service::get_service_name(
+                                conn.video_source(),
+                                conn.display_idx,
+                            );
+                            let (
+                                capture_backend,
+                                capture_frame,
+                                encoder_backend,
+                                encoder_input,
+                            ) =
+                                video_qos.pipeline_status(&video_service_name);
+                            (
+                                video_qos.bitrate(&video_service_name),
+                                capture_backend.unwrap_or_default(),
+                                capture_frame.unwrap_or_default(),
+                                encoder_backend.unwrap_or_default(),
+                                encoder_input.unwrap_or_default(),
+                            )
+                        };
+                        let delivery_status = conn.video_delivery.status(conn.display_idx as i32);
                         let mut msg_out = Message::new();
                         msg_out.set_test_delay(TestDelay{
                             last_delay: conn.network_delay,
-                            target_bitrate: video_service::VIDEO_QOS.lock().unwrap().bitrate(),
-                            host_video_fps: host_video_diag.fps,
-                            host_video_codec: host_video_diag.codec,
-                            host_video_qos: host_video_diag.qos,
-                            host_video_wait: host_video_diag.wait,
-                            host_video_backend: host_video_diag.backend,
-                            host_video_fallback: host_video_diag.fallback,
+                            target_bitrate,
+                            capture_backend,
+                            capture_frame,
+                            encoder_backend,
+                            encoder_input,
+                            video_delivery_phase: delivery_status
+                                .map(|status| status.phase.as_str().to_owned())
+                                .unwrap_or_default(),
+                            video_recovery_count: delivery_status
+                                .map(|status| status.recovery_count)
+                                .unwrap_or_default(),
+                            video_stall_ms: delivery_status
+                                .map(|status| status.latest_stall_ms)
+                                .unwrap_or_default(),
                             ..Default::default()
                         });
                         conn.send(msg_out.into()).await;
@@ -3241,14 +3760,16 @@ impl Connection {
         if let Some(o) = self.lr.clone().option.as_ref() {
             if let Some(q) = o.supported_decoding.clone().take() {
                 log::info!(
-                    "#{} supported_decoding on login: h264={}, h265={}, vp9={}, av1={}, prefer={:?}",
+                    "#{} supported_decoding on login: h264={}, h265={}, vp9={}, av1={}, video_feedback={}, prefer={:?}",
                     self.inner.id(),
                     q.ability_h264,
                     q.ability_h265,
                     q.ability_vp9,
                     q.ability_av1,
+                    q.video_feedback,
                     q.prefer.enum_value_or(PreferCodec::Auto)
                 );
+                self.set_video_feedback_capability(q.video_feedback);
                 Encoder::update(Update(self.inner.id(), q));
                 log::info!(
                     "#{} diag negotiated codec on login: codec={:?}, usable={:?}",
@@ -3348,6 +3869,133 @@ impl Connection {
         }
     }
 
+    fn handle_video_feedback(&mut self, feedback: VideoFeedback) {
+        if !valid_video_feedback(&feedback) {
+            log::warn!(
+                "#{} ignored invalid video feedback: display={}, stream_id={}, received={}, decoded={}, render_submitted={}, queue={}, dropped={}",
+                self.inner.id(),
+                feedback.display,
+                feedback.stream_id,
+                feedback.received_frame_id,
+                feedback.decoded_frame_id,
+                feedback.render_submitted_frame_id,
+                feedback.queue_depth_frames,
+                feedback.dropped_frames
+            );
+            return;
+        }
+
+        let previous = self
+            .video_feedback_by_display
+            .get(&feedback.display)
+            .cloned();
+        if previous
+            .as_ref()
+            .is_some_and(|state| video_feedback_regressed(&state.feedback, &feedback))
+        {
+            log::warn!(
+                "#{} ignored regressed video feedback: display={}, stream_id={}, received={}, decoded={}, render_submitted={}, dropped={}",
+                self.inner.id(),
+                feedback.display,
+                feedback.stream_id,
+                feedback.received_frame_id,
+                feedback.decoded_frame_id,
+                feedback.render_submitted_frame_id,
+                feedback.dropped_frames
+            );
+            return;
+        }
+        if previous.is_none() && self.video_feedback_by_display.len() >= MAX_VIDEO_FEEDBACK_DISPLAYS
+        {
+            log::warn!(
+                "#{} ignored video feedback for excess display {}",
+                self.inner.id(),
+                feedback.display
+            );
+            return;
+        }
+
+        // Revision 084 viewers already send valid feedback but predate the
+        // explicit capability bit. Accept the message itself as proof.
+        self.set_video_feedback_capability(true);
+
+        let now = Instant::now();
+        let new_stream = previous
+            .as_ref()
+            .map(|state| state.feedback.stream_id != feedback.stream_id)
+            .unwrap_or(true);
+        let dropped_increased = previous
+            .as_ref()
+            .map(|state| feedback.dropped_frames > state.feedback.dropped_frames)
+            .unwrap_or(feedback.dropped_frames > 0);
+        let should_log = new_stream
+            || dropped_increased
+            || previous.as_ref().map_or(true, |state| {
+                now.saturating_duration_since(state.last_log) >= VIDEO_FEEDBACK_LOG_INTERVAL
+            });
+        let last_log = if should_log {
+            now
+        } else {
+            previous.as_ref().map(|state| state.last_log).unwrap_or(now)
+        };
+
+        if should_log {
+            log::info!(
+                "#{} diag video feedback: display={}, stream_id={}, received={}, decoded={}, render_submitted={}, queue={}, decode_us={}, render_submit_us={}, dropped={}, new_stream={}",
+                self.inner.id(),
+                feedback.display,
+                feedback.stream_id,
+                feedback.received_frame_id,
+                feedback.decoded_frame_id,
+                feedback.render_submitted_frame_id,
+                feedback.queue_depth_frames,
+                feedback.decode_time_us,
+                feedback.render_submit_time_us,
+                feedback.dropped_frames,
+                new_stream
+            );
+        }
+        self.video_feedback_by_display.insert(
+            feedback.display,
+            VideoFeedbackDiagnostics {
+                feedback: feedback.clone(),
+                last_log,
+            },
+        );
+        if self.video_delivery.on_feedback(&feedback, now)
+            && video_service::VIDEO_QOS
+                .lock()
+                .unwrap()
+                .user_video_frame_rendered(self.inner.id())
+        {
+            log::info!(
+                "#{} diag video startup released by first render submission: display={}, stream_id={}, frame_id={}",
+                self.inner.id(),
+                feedback.display,
+                feedback.stream_id,
+                feedback.render_submitted_frame_id
+            );
+        }
+    }
+
+    fn set_video_feedback_capability(&self, capable: bool) {
+        let previous = self
+            .video_feedback_capable
+            .swap(capable, std::sync::atomic::Ordering::Relaxed);
+        if previous == capable {
+            return;
+        }
+        video_service::VIDEO_QOS
+            .lock()
+            .unwrap()
+            .user_video_feedback_capability(self.inner.id(), capable);
+        log::info!(
+            "#{} diag video feedback capability: {}",
+            self.inner.id(),
+            capable
+        );
+    }
+
     async fn on_message(&mut self, msg: Message) -> bool {
         if let Some(message::Union::Misc(misc)) = &msg.union {
             // Move the CloseReason forward, as this message needs to be received when unauthorized, especially for kcp.
@@ -3385,6 +4033,7 @@ impl Connection {
                         return false;
                     }
                     self.view_camera = true;
+                    self.inner.video_source = VideoSource::Camera;
                 }
                 Some(login_request::Union::Terminal(terminal)) => {
                     if !Self::permission(keys::OPTION_ENABLE_TERMINAL, &self.control_permissions) {
@@ -4380,6 +5029,9 @@ impl Connection {
                             Some(Instant::now().into()),
                         );
                     }
+                    Some(misc::Union::VideoFeedback(feedback)) => {
+                        self.handle_video_feedback(feedback);
+                    }
                     Some(misc::Union::RestartRemoteDevice(_)) => {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         if self.restart {
@@ -4399,8 +5051,10 @@ impl Connection {
                     #[cfg(windows)]
                     Some(misc::Union::ElevationRequest(r)) => match r.union {
                         Some(elevation_request::Union::Direct(_)) => {
-                            self.handle_elevation_request(portable_client::StartPara::Direct)
-                                .await;
+                            self.handle_elevation_request(
+                                portable_client::StartPara::ElevatedDirect,
+                            )
+                            .await;
                         }
                         Some(elevation_request::Union::Logon(r)) => {
                             self.handle_elevation_request(portable_client::StartPara::Logon(
@@ -5016,6 +5670,16 @@ impl Connection {
         });
     }
 
+    fn refresh_video_reference(&self, display: usize) {
+        self.server.upgrade().map(|s| {
+            s.read().unwrap().set_video_service_opt(
+                Some((self.video_source(), display)),
+                video_service::OPTION_REFERENCE_REFRESH,
+                super::service::SERVICE_OPTION_VALUE_TRUE,
+            );
+        });
+    }
+
     async fn handle_switch_display(&mut self, s: SwitchDisplay) {
         let display_idx = s.display as usize;
         if self.display_idx != display_idx {
@@ -5376,14 +6040,16 @@ impl Connection {
         }
         if let Some(q) = o.supported_decoding.clone().take() {
             log::info!(
-                "#{} supported_decoding update: h264={}, h265={}, vp9={}, av1={}, prefer={:?}",
+                "#{} supported_decoding update: h264={}, h265={}, vp9={}, av1={}, video_feedback={}, prefer={:?}",
                 self.inner.id(),
                 q.ability_h264,
                 q.ability_h265,
                 q.ability_vp9,
                 q.ability_av1,
+                q.video_feedback,
                 q.prefer.enum_value_or(PreferCodec::Auto)
             );
+            self.set_video_feedback_capability(q.video_feedback);
             scrap::codec::Encoder::update(scrap::codec::EncodingUpdate::Update(self.inner.id(), q));
             log::info!(
                 "#{} diag negotiated codec after update: codec={:?}, usable={:?}",
@@ -5607,6 +6273,26 @@ impl Connection {
     }
 
     async fn turn_on_privacy(&mut self, impl_key: String) {
+        #[cfg(windows)]
+        if crate::platform::is_prelogin()
+            || crate::platform::is_locked()
+            || crate::platform::windows::desktop_changed()
+        {
+            let reason = "Privacy mode is not available on the Windows logon or locked desktop.";
+            log::warn!(
+                "Privacy mode denied: conn={}, auth_kind={}, reason={}",
+                self.inner.id,
+                self.session_auth_kind.as_str(),
+                reason
+            );
+            let msg_out = crate::common::make_privacy_mode_msg_with_details(
+                back_notification::PrivacyModeState::PrvOnFailed,
+                reason.to_owned(),
+                impl_key,
+            );
+            self.send(msg_out).await;
+            return;
+        }
         if let Some(reason) = self.privacy_mode_policy_denial_reason() {
             log::warn!(
                 "Privacy mode denied: conn={}, auth_kind={}, reason={}",
@@ -6096,7 +6782,7 @@ impl Connection {
             return;
         }
         let running = portable_client::running();
-        let show_elevation = !running;
+        let show_elevation = crate::ui_cm_interface::can_elevate();
         self.send_to_cm(ipc::Data::DataPortableService(
             ipc::DataPortableService::CmShowElevation(show_elevation),
         ));
@@ -6177,15 +6863,21 @@ impl Connection {
         };
         if usable.vp8 != last.vp8
             || usable.av1 != last.av1
+            || usable.av1_hw != last.av1_hw
             || usable.h264 != last.h264
             || usable.h265 != last.h265
+            || usable.h264_hq != last.h264_hq
+            || usable.h265_hq != last.h265_hq
         {
             let mut misc: Misc = Misc::new();
             let supported_encoding = SupportedEncoding {
                 vp8: usable.vp8,
                 av1: usable.av1,
+                av1_hw: usable.av1_hw,
                 h264: usable.h264,
                 h265: usable.h265,
+                h264_hq: usable.h264_hq,
+                h265_hq: usable.h265_hq,
                 ..last.clone()
             };
             log::info!("update supported encoding: {:?}", supported_encoding);
@@ -7302,6 +7994,467 @@ mod test {
                 SEND_TIMEOUT_OTHER
             );
         }
+    }
+
+    #[test]
+    fn video_feedback_requires_ordered_pipeline_progress() {
+        assert!(valid_video_feedback(&VideoFeedback {
+            stream_id: 7,
+            display: 0,
+            received_frame_id: 3,
+            decoded_frame_id: 2,
+            render_submitted_frame_id: 2,
+            ..Default::default()
+        }));
+        assert!(!valid_video_feedback(&VideoFeedback {
+            stream_id: 7,
+            display: 0,
+            received_frame_id: 2,
+            decoded_frame_id: 3,
+            render_submitted_frame_id: 2,
+            ..Default::default()
+        }));
+        assert!(!valid_video_feedback(&VideoFeedback {
+            stream_id: 0,
+            display: 0,
+            received_frame_id: 1,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn video_feedback_rejects_progress_regression_within_a_stream() {
+        let previous = VideoFeedback {
+            stream_id: 7,
+            display: 0,
+            received_frame_id: 5,
+            decoded_frame_id: 4,
+            render_submitted_frame_id: 4,
+            dropped_frames: 1,
+            ..Default::default()
+        };
+        let mut next = previous.clone();
+        next.received_frame_id = 6;
+        next.decoded_frame_id = 5;
+        next.render_submitted_frame_id = 5;
+        assert!(!video_feedback_regressed(&previous, &next));
+
+        next.decoded_frame_id = 3;
+        assert!(video_feedback_regressed(&previous, &next));
+
+        next.stream_id = 8;
+        assert!(!video_feedback_regressed(&previous, &next));
+    }
+
+    #[test]
+    fn video_delivery_startup_recovery_is_not_retried_for_same_pipeline_gap() {
+        let start = Instant::now();
+        let mut controller = VideoDeliveryController::default();
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 1,
+                display: 0,
+                ..Default::default()
+            },
+            start,
+        );
+
+        assert!(controller
+            .poll_recovery(
+                start + VIDEO_DELIVERY_MIN_PROGRESS_TIMEOUT - Duration::from_millis(1),
+                10,
+            )
+            .is_empty());
+        let actions = controller.poll_recovery(start + VIDEO_DELIVERY_MIN_PROGRESS_TIMEOUT, 10);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].display, 0);
+        assert_eq!(actions[0].previous_phase, VideoDeliveryPhase::Starting);
+        assert_eq!(
+            controller.status(0),
+            Some(VideoDeliveryStatus {
+                phase: VideoDeliveryPhase::Recovering,
+                recovery_count: 1,
+                latest_stall_ms: VIDEO_DELIVERY_MIN_PROGRESS_TIMEOUT.as_millis() as u64,
+            })
+        );
+
+        assert!(controller
+            .poll_recovery(
+                start + VIDEO_DELIVERY_MIN_PROGRESS_TIMEOUT + Duration::from_millis(999),
+                10,
+            )
+            .is_empty());
+        let retry = controller.poll_recovery(
+            start + VIDEO_DELIVERY_MIN_PROGRESS_TIMEOUT + Duration::from_secs(1),
+            10,
+        );
+        assert!(retry.is_empty());
+        assert_eq!(controller.status(0).unwrap().recovery_count, 1);
+    }
+
+    #[test]
+    fn video_delivery_uses_conservative_timeout_before_first_rtt_sample() {
+        assert_eq!(
+            VideoDeliveryController::progress_timeout(0),
+            Duration::from_millis(
+                u64::from(VIDEO_DELIVERY_DEFAULT_NETWORK_DELAY_MS).saturating_mul(3)
+            )
+        );
+        assert_eq!(
+            VideoDeliveryController::progress_timeout(10),
+            VIDEO_DELIVERY_MIN_PROGRESS_TIMEOUT
+        );
+        assert_eq!(
+            VideoDeliveryController::progress_timeout(2_000),
+            VIDEO_DELIVERY_MAX_PROGRESS_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn video_delivery_small_pipeline_gap_remains_healthy() {
+        let start = Instant::now();
+        let mut controller = VideoDeliveryController::default();
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 1,
+                display: 0,
+                ..Default::default()
+            },
+            start,
+        );
+        let feedback = VideoFeedback {
+            stream_id: 7,
+            display: 0,
+            received_frame_id: 1,
+            decoded_frame_id: 1,
+            render_submitted_frame_id: 1,
+            ..Default::default()
+        };
+        assert!(controller.on_feedback(&feedback, start + Duration::from_millis(100)));
+        assert!(!controller.on_feedback(&feedback, start + Duration::from_millis(200)));
+        assert!(controller
+            .poll_recovery(start + Duration::from_secs(2), 10)
+            .is_empty());
+
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 2,
+                display: 0,
+                ..Default::default()
+            },
+            start + Duration::from_millis(250),
+        );
+        assert!(controller
+            .poll_recovery(start + Duration::from_secs(2), 10)
+            .is_empty());
+
+        let mut recovered = feedback;
+        recovered.received_frame_id = 2;
+        recovered.decoded_frame_id = 2;
+        recovered.render_submitted_frame_id = 2;
+        assert!(!controller.on_feedback(&recovered, start + Duration::from_millis(800)));
+        assert!(controller
+            .poll_recovery(start + Duration::from_secs(2), 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn video_delivery_idle_pipeline_slack_does_not_request_recovery() {
+        let start = Instant::now();
+        let mut controller = VideoDeliveryController::default();
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 1,
+                display: 0,
+                ..Default::default()
+            },
+            start,
+        );
+        controller.on_feedback(
+            &VideoFeedback {
+                stream_id: 7,
+                display: 0,
+                received_frame_id: 1,
+                decoded_frame_id: 1,
+                render_submitted_frame_id: 1,
+                ..Default::default()
+            },
+            start + Duration::from_millis(100),
+        );
+
+        let fresh_frame_sent_at = start + Duration::from_secs(10);
+        assert!(controller.poll_recovery(fresh_frame_sent_at, 10).is_empty());
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 2,
+                display: 0,
+                ..Default::default()
+            },
+            fresh_frame_sent_at,
+        );
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 3,
+                display: 0,
+                ..Default::default()
+            },
+            fresh_frame_sent_at + Duration::from_millis(1),
+        );
+
+        let polled_at = fresh_frame_sent_at + Duration::from_millis(1);
+        assert!(controller.poll_recovery(polled_at, 10).is_empty());
+        assert!(controller
+            .poll_recovery(fresh_frame_sent_at + Duration::from_secs(10), 10)
+            .is_empty());
+        assert_eq!(
+            polled_at.saturating_duration_since(fresh_frame_sent_at),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn video_delivery_decoder_progress_does_not_recover_a_render_only_gap() {
+        let start = Instant::now();
+        let mut controller = VideoDeliveryController::default();
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 1,
+                display: 0,
+                ..Default::default()
+            },
+            start,
+        );
+        controller.on_feedback(
+            &VideoFeedback {
+                stream_id: 7,
+                display: 0,
+                received_frame_id: 1,
+                decoded_frame_id: 1,
+                render_submitted_frame_id: 1,
+                ..Default::default()
+            },
+            start + Duration::from_millis(100),
+        );
+
+        let fresh_frame_sent_at = start + Duration::from_secs(10);
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 2,
+                display: 0,
+                ..Default::default()
+            },
+            fresh_frame_sent_at,
+        );
+        assert!(!controller.on_feedback(
+            &VideoFeedback {
+                stream_id: 7,
+                display: 0,
+                received_frame_id: 2,
+                decoded_frame_id: 2,
+                render_submitted_frame_id: 1,
+                ..Default::default()
+            },
+            fresh_frame_sent_at + Duration::from_millis(1),
+        ));
+
+        assert!(controller
+            .poll_recovery(fresh_frame_sent_at + Duration::from_secs(2), 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn video_delivery_one_frame_pipeline_gap_does_not_recover_while_decode_advances() {
+        let start = Instant::now();
+        let mut controller = VideoDeliveryController::default();
+        for frame_id in 1..=100 {
+            let sent_at = start + Duration::from_millis(frame_id * 100);
+            controller.on_frame_sent(
+                &VideoFrame {
+                    stream_id: 7,
+                    frame_id,
+                    display: 0,
+                    ..Default::default()
+                },
+                sent_at,
+            );
+            controller.on_feedback(
+                &VideoFeedback {
+                    stream_id: 7,
+                    display: 0,
+                    received_frame_id: frame_id,
+                    decoded_frame_id: frame_id - 1,
+                    render_submitted_frame_id: frame_id - 1,
+                    ..Default::default()
+                },
+                sent_at + Duration::from_millis(10),
+            );
+            assert!(controller
+                .poll_recovery(sent_at + Duration::from_millis(20), 10)
+                .is_empty());
+        }
+
+        assert_eq!(
+            controller.status(0),
+            Some(VideoDeliveryStatus {
+                phase: VideoDeliveryPhase::Healthy,
+                recovery_count: 0,
+                latest_stall_ms: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn video_delivery_fast_link_progress_never_requests_recovery() {
+        let start = Instant::now();
+        let mut controller = VideoDeliveryController::default();
+        for frame_id in 1..=120 {
+            let now = start + Duration::from_millis(frame_id * 16);
+            controller.on_frame_sent(
+                &VideoFrame {
+                    stream_id: 7,
+                    frame_id,
+                    display: 0,
+                    ..Default::default()
+                },
+                now,
+            );
+            controller.on_feedback(
+                &VideoFeedback {
+                    stream_id: 7,
+                    display: 0,
+                    received_frame_id: frame_id,
+                    decoded_frame_id: frame_id,
+                    render_submitted_frame_id: frame_id,
+                    ..Default::default()
+                },
+                now + Duration::from_millis(2),
+            );
+            assert!(controller
+                .poll_recovery(now + Duration::from_millis(3), 10)
+                .is_empty());
+        }
+
+        assert_eq!(
+            controller.status(0),
+            Some(VideoDeliveryStatus {
+                phase: VideoDeliveryPhase::Healthy,
+                recovery_count: 0,
+                latest_stall_ms: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn video_delivery_high_rtt_waits_for_scaled_timeout() {
+        let start = Instant::now();
+        let mut controller = VideoDeliveryController::default();
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 1,
+                display: 0,
+                ..Default::default()
+            },
+            start,
+        );
+
+        assert!(controller
+            .poll_recovery(start + Duration::from_millis(1_799), 600)
+            .is_empty());
+        let actions = controller.poll_recovery(start + Duration::from_millis(1_800), 600);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].stalled_ms, 1_800);
+    }
+
+    #[test]
+    fn video_delivery_repeated_stalls_recover_after_progress_resumes() {
+        let start = Instant::now();
+        let mut controller = VideoDeliveryController::default();
+        controller.on_frame_sent(
+            &VideoFrame {
+                stream_id: 7,
+                frame_id: 1,
+                display: 0,
+                ..Default::default()
+            },
+            start,
+        );
+        controller.on_feedback(
+            &VideoFeedback {
+                stream_id: 7,
+                display: 0,
+                received_frame_id: 1,
+                decoded_frame_id: 1,
+                render_submitted_frame_id: 1,
+                ..Default::default()
+            },
+            start + Duration::from_millis(100),
+        );
+
+        for frame_id in 2..=4 {
+            controller.on_frame_sent(
+                &VideoFrame {
+                    stream_id: 7,
+                    frame_id,
+                    display: 0,
+                    ..Default::default()
+                },
+                start + Duration::from_millis(150),
+            );
+        }
+        assert!(controller
+            .poll_recovery(start + Duration::from_millis(649), 10)
+            .is_empty());
+        assert_eq!(
+            controller
+                .poll_recovery(start + Duration::from_millis(650), 10)
+                .len(),
+            1
+        );
+        controller.on_feedback(
+            &VideoFeedback {
+                stream_id: 7,
+                display: 0,
+                received_frame_id: 4,
+                decoded_frame_id: 4,
+                render_submitted_frame_id: 4,
+                ..Default::default()
+            },
+            start + Duration::from_millis(700),
+        );
+        for frame_id in 5..=7 {
+            controller.on_frame_sent(
+                &VideoFrame {
+                    stream_id: 7,
+                    frame_id,
+                    display: 0,
+                    ..Default::default()
+                },
+                start + Duration::from_millis(750),
+            );
+        }
+        assert!(controller
+            .poll_recovery(start + Duration::from_millis(1_649), 10)
+            .is_empty());
+        assert_eq!(
+            controller
+                .poll_recovery(start + Duration::from_millis(1_650), 10)
+                .len(),
+            1
+        );
+
+        let status = controller.status(0).unwrap();
+        assert_eq!(status.phase, VideoDeliveryPhase::Recovering);
+        assert_eq!(status.recovery_count, 2);
+        assert_eq!(status.latest_stall_ms, 900);
     }
 
     #[test]

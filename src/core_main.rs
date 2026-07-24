@@ -155,7 +155,15 @@ pub fn core_main() -> Option<Vec<String>> {
         .any(|arg| arg.starts_with(crate::portable_service::SHMEM_ARG_PREFIX));
     #[cfg(not(windows))]
     let has_portable_service_shmem_arg = false;
-    if has_portable_service_shmem_arg {
+    #[cfg(windows)]
+    let has_user_capture_helper_arg = args
+        .iter()
+        .any(|arg| arg == crate::server::user_capture_helper::ARG);
+    #[cfg(not(windows))]
+    let has_user_capture_helper_arg = false;
+    if has_user_capture_helper_arg {
+        log_name = "user-capture-helper".to_owned();
+    } else if has_portable_service_shmem_arg {
         log_name = "portable-service".to_owned();
     } else if args.len() > 0 && args[0].starts_with("--") {
         let name = args[0].replace("--", "");
@@ -200,7 +208,14 @@ pub fn core_main() -> Option<Vec<String>> {
         && !_is_run_as_system
     {
         use crate::portable_service::client;
-        if let Err(e) = client::start_portable_service(client::StartPara::Direct) {
+        let elevated = crate::platform::is_elevated(None).unwrap_or(false);
+        let start_para = client::start_para_for_quick_support_process(elevated);
+        log::info!(
+            "Start quick-support portable service: elevated={}, input_via_helper={}",
+            elevated,
+            elevated
+        );
+        if let Err(e) = client::start_portable_service(start_para) {
             log::error!("Failed to start portable service: {:?}", e);
         }
     }
@@ -278,6 +293,9 @@ pub fn core_main() -> Option<Vec<String>> {
                 if let Err(err) = platform::run_after_install() {
                     log::error!("Failed to after-install: {}", err);
                 }
+                return None;
+            } else if args[0] == crate::server::user_capture_helper::ARG {
+                crate::server::user_capture_helper::server::run_user_capture_helper();
                 return None;
             } else if args[0] == "--before-uninstall" {
                 if let Err(err) = platform::run_before_uninstall() {
@@ -435,10 +453,12 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             #[cfg(target_os = "macos")]
             {
-                if !crate::check_process("--tray", true) {
-                    hbb_common::allow_err!(crate::run_me(vec!["--tray"]));
-                }
-                crate::start_server(true, false);
+                let handler = std::thread::spawn(move || crate::start_server(true, false));
+                crate::tray::start_tray();
+                // macOS input injection is dispatched onto the main GUI run loop.
+                // Keep the LaunchAgent `--server` process GUI-backed so Accessibility/TCC
+                // sees the same app context as a normal app launch.
+                hbb_common::allow_err!(handler.join());
             }
             return None;
         } else if args[0] == "--import-config" {

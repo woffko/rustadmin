@@ -53,17 +53,16 @@ impl TraitCapturer for Capturer {
         self.inner.is_gdi()
     }
 
+    fn capture_backend(&self) -> &'static str {
+        if self.inner.is_gdi() {
+            "Windows GDI"
+        } else {
+            "DXGI Desktop Duplication"
+        }
+    }
+
     fn set_gdi(&mut self) -> bool {
         self.inner.set_gdi()
-    }
-
-    fn cancel_gdi(&mut self) -> bool {
-        self.inner.cancel_gdi();
-        !self.inner.is_gdi()
-    }
-
-    fn gdi_fallback_reason(&self) -> String {
-        self.inner.gdi_fallback_reason().to_owned()
     }
 
     #[cfg(feature = "vram")]
@@ -263,6 +262,14 @@ impl TraitCapturer for CapturerMag {
         true
     }
 
+    fn is_cpu_only(&self) -> bool {
+        true
+    }
+
+    fn capture_backend(&self) -> &'static str {
+        "Windows Magnification API"
+    }
+
     fn set_gdi(&mut self) -> bool {
         false
     }
@@ -288,11 +295,7 @@ impl CapturerWgc {
 
     pub fn new(display: Display) -> io::Result<Self> {
         Ok(CapturerWgc {
-            inner: dxgi::wgc::CapturerWgc::new(
-                display.0.hmonitor(),
-                display.width(),
-                display.height(),
-            )?,
+            inner: dxgi::wgc::CapturerWgc::new(display.0)?,
             data: Vec::new(),
         })
     }
@@ -308,6 +311,11 @@ impl CapturerWgc {
 
 impl TraitCapturer for CapturerWgc {
     fn frame<'a>(&'a mut self, timeout: Duration) -> io::Result<Frame<'a>> {
+        #[cfg(feature = "vram")]
+        if self.inner.output_texture() {
+            return self.inner.frame_texture(timeout).map(Frame::Texture);
+        }
+
         self.inner.frame(&mut self.data, timeout)?;
         Ok(Frame::PixelBuffer(PixelBuffer::with_BGRA(
             &self.data,
@@ -320,8 +328,19 @@ impl TraitCapturer for CapturerWgc {
         false
     }
 
-    fn is_wgc(&self) -> bool {
-        true
+    fn is_cpu_only(&self) -> bool {
+        #[cfg(feature = "vram")]
+        {
+            false
+        }
+        #[cfg(not(feature = "vram"))]
+        {
+            true
+        }
+    }
+
+    fn capture_backend(&self) -> &'static str {
+        "Windows Graphics Capture"
     }
 
     fn set_gdi(&mut self) -> bool {
@@ -330,9 +349,11 @@ impl TraitCapturer for CapturerWgc {
 
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice {
-        AdapterDevice::default()
+        self.inner.device()
     }
 
     #[cfg(feature = "vram")]
-    fn set_output_texture(&mut self, _texture: bool) {}
+    fn set_output_texture(&mut self, texture: bool) {
+        self.inner.set_output_texture(texture);
+    }
 }

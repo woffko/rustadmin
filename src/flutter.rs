@@ -27,11 +27,6 @@ use std::{
         Arc, RwLock,
     },
 };
-#[cfg(target_os = "android")]
-use std::{
-    sync::Mutex,
-    time::{Duration, Instant},
-};
 
 /// tag "main" for [Desktop Main Page] and [Mobile (Client and Server)] (the mobile don't need multiple windows, only one global event stream is needed)
 /// tag "cm" only for [Desktop CM Page]
@@ -250,19 +245,6 @@ struct RgbaData {
     // We must check the `rgba_valid` before reading [rgba].
     data: Vec<u8>,
     valid: bool,
-}
-
-#[cfg(target_os = "android")]
-#[derive(Default)]
-struct RgbaSoftRenderDiag {
-    delivered: usize,
-    skipped: usize,
-    last_log: Option<Instant>,
-}
-
-#[cfg(target_os = "android")]
-lazy_static::lazy_static! {
-    static ref RGBA_SOFT_RENDER_DIAG: Mutex<HashMap<usize, RgbaSoftRenderDiag>> = Default::default();
 }
 
 pub type FlutterRgbaRendererPluginOnRgba = unsafe extern "C" fn(
@@ -747,107 +729,105 @@ impl InvokeUiSession for FlutterHandler {
                 ),
                 ("chroma", &status.chroma.map_or(NULL, |it| it.to_string())),
                 (
-                    "codec_path",
-                    &status.codec_path.map_or(NULL, |it| it.to_string()),
+                    "connection_type",
+                    &status.connection_type.map_or(NULL, |it| it.to_string()),
+                ),
+                ("decoder", &status.decoder.map_or(NULL, |it| it)),
+                ("renderer", &status.renderer.map_or(NULL, |it| it)),
+                (
+                    "capture_backend",
+                    &status.capture_backend.map_or(NULL, |it| it),
+                ),
+                ("capture_frame", &status.capture_frame.map_or(NULL, |it| it)),
+                (
+                    "encoder_backend",
+                    &status.encoder_backend.map_or(NULL, |it| it),
+                ),
+                ("encoder_input", &status.encoder_input.map_or(NULL, |it| it)),
+                (
+                    "decode_fps",
+                    &serde_json::ser::to_string(&status.decode_fps).unwrap_or(NULL.to_owned()),
                 ),
                 (
-                    "render_path",
-                    &status.render_path.map_or(NULL, |it| it.to_string()),
+                    "video_queue",
+                    &serde_json::ser::to_string(&status.video_queue).unwrap_or(NULL.to_owned()),
                 ),
                 (
                     "frame_resolution",
-                    &status.frame_resolution.map_or(NULL, |it| it.to_string()),
+                    &serde_json::ser::to_string(&status.frame_resolution)
+                        .unwrap_or(NULL.to_owned()),
                 ),
                 (
-                    "queue_len",
-                    &status.queue_len.map_or(NULL, |it| it.to_string()),
+                    "video_threads",
+                    &status.video_threads.map_or(NULL, |it| it.to_string()),
                 ),
                 (
-                    "decode_fps",
-                    &status.decode_fps.map_or(NULL, |it| it.to_string()),
+                    "texture_render",
+                    &status.texture_render.map_or(NULL, |it| it.to_string()),
                 ),
+                ("direct", &status.direct.map_or(NULL, |it| it.to_string())),
+                ("fps_mode", &status.fps_mode.map_or(NULL, |it| it)),
                 (
                     "auto_fps",
                     &status.auto_fps.map_or(NULL, |it| it.to_string()),
                 ),
                 (
-                    "fps_mode",
-                    &status.fps_mode.map_or(NULL, |it| it.to_string()),
+                    "video_progress",
+                    &if status.video_progress.is_empty() {
+                        NULL
+                    } else {
+                        serde_json::ser::to_string(&status.video_progress)
+                            .unwrap_or(NULL.to_owned())
+                    },
                 ),
-                ("direct", &status.direct.map_or(NULL, |it| it.to_string())),
                 (
-                    "mediacodec_input_queue_ms",
+                    "video_dropped",
+                    &if status.video_dropped.is_empty() {
+                        NULL
+                    } else {
+                        serde_json::ser::to_string(&status.video_dropped).unwrap_or(NULL.to_owned())
+                    },
+                ),
+                (
+                    "video_decode_time_us",
+                    &if status.video_decode_time_us.is_empty() {
+                        NULL
+                    } else {
+                        serde_json::ser::to_string(&status.video_decode_time_us)
+                            .unwrap_or(NULL.to_owned())
+                    },
+                ),
+                (
+                    "video_render_submit_time_us",
+                    &if status.video_render_submit_time_us.is_empty() {
+                        NULL
+                    } else {
+                        serde_json::ser::to_string(&status.video_render_submit_time_us)
+                            .unwrap_or(NULL.to_owned())
+                    },
+                ),
+                (
+                    "video_feedback_queue",
+                    &if status.video_feedback_queue.is_empty() {
+                        NULL
+                    } else {
+                        serde_json::ser::to_string(&status.video_feedback_queue)
+                            .unwrap_or(NULL.to_owned())
+                    },
+                ),
+                (
+                    "video_delivery_phase",
+                    &status.video_delivery_phase.map_or(NULL, |it| it),
+                ),
+                (
+                    "video_recovery_count",
                     &status
-                        .mediacodec_input_queue_ms
+                        .video_recovery_count
                         .map_or(NULL, |it| it.to_string()),
                 ),
                 (
-                    "mediacodec_output_dequeue_ms",
-                    &status
-                        .mediacodec_output_dequeue_ms
-                        .map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "yuv_to_rgba_ms",
-                    &status.yuv_to_rgba_ms.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "mediacodec_decode_ms",
-                    &status
-                        .mediacodec_decode_ms
-                        .map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "handle_frame_ms",
-                    &status.handle_frame_ms.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "flutter_handoff_ms",
-                    &status.flutter_handoff_ms.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "end_to_end_ms",
-                    &status.end_to_end_ms.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "rgba_bytes",
-                    &status.rgba_bytes.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "rgba_reallocated",
-                    &status.rgba_reallocated.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "output_buffer_bytes",
-                    &status.output_buffer_bytes.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "media_format",
-                    &status.media_format.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "host_video_fps",
-                    &status.host_video_fps.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "host_video_codec",
-                    &status.host_video_codec.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "host_video_qos",
-                    &status.host_video_qos.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "host_video_wait",
-                    &status.host_video_wait.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "host_video_backend",
-                    &status.host_video_backend.map_or(NULL, |it| it.to_string()),
-                ),
-                (
-                    "host_video_fallback",
-                    &status.host_video_fallback.map_or(NULL, |it| it.to_string()),
+                    "video_stall_ms",
+                    &status.video_stall_ms.map_or(NULL, |it| it.to_string()),
                 ),
             ],
             &[],
@@ -1304,45 +1284,6 @@ impl InvokeUiSession for FlutterHandler {
 }
 
 impl FlutterHandler {
-    #[cfg(target_os = "android")]
-    fn diag_rgba_soft_render(
-        display: usize,
-        skipped: bool,
-        width: usize,
-        height: usize,
-        rgba_bytes: usize,
-        reason: &'static str,
-    ) {
-        let now = Instant::now();
-        let mut lock = RGBA_SOFT_RENDER_DIAG.lock().unwrap();
-        let entry = lock.entry(display).or_default();
-        let event_count = if skipped {
-            entry.skipped += 1;
-            entry.skipped
-        } else {
-            entry.delivered += 1;
-            entry.delivered
-        };
-        let periodic = entry
-            .last_log
-            .map(|last| now.saturating_duration_since(last) >= Duration::from_secs(5))
-            .unwrap_or(true);
-        if event_count <= 5 || periodic {
-            entry.last_log = Some(now);
-            log::info!(
-                "diag android rgba soft render: display={}, render_path=rgba_soft_render, skipped={}, reason={}, frame_resolution={}x{}, rgba_bytes={}, delivered_total={}, skipped_total={}",
-                display,
-                skipped,
-                reason,
-                width,
-                height,
-                rgba_bytes,
-                entry.delivered,
-                entry.skipped
-            );
-        }
-    }
-
     #[inline]
     fn on_rgba_soft_render(&self, display: usize, rgba: &mut scrap::ImageRgb) {
         // Give a chance for plugins or etc to hook a rgba data.
@@ -1354,23 +1295,11 @@ impl FlutterHandler {
                 }
             }
         }
-        let frame_width = rgba.w;
-        let frame_height = rgba.h;
-        let frame_bytes = rgba.raw.len();
         // If the current rgba is not fetched by flutter, i.e., is valid.
         // We give up sending a new event to flutter.
         let mut rgba_write_lock = self.display_rgbas.write().unwrap();
         if let Some(rgba_data) = rgba_write_lock.get_mut(&display) {
             if rgba_data.valid {
-                #[cfg(target_os = "android")]
-                Self::diag_rgba_soft_render(
-                    display,
-                    true,
-                    frame_width,
-                    frame_height,
-                    frame_bytes,
-                    "previous_rgba_valid",
-                );
                 return;
             } else {
                 rgba_data.valid = true;
@@ -1415,19 +1344,6 @@ impl FlutterHandler {
                 rgba_data.valid = false;
             }
         }
-        #[cfg(target_os = "android")]
-        Self::diag_rgba_soft_render(
-            display,
-            false,
-            frame_width,
-            frame_height,
-            frame_bytes,
-            if is_sent {
-                "event_sent"
-            } else {
-                "no_matching_flutter_session"
-            },
-        );
     }
 
     #[inline]

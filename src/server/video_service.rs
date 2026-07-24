@@ -40,70 +40,207 @@ use hbb_common::{
     },
 };
 #[cfg(feature = "hwcodec")]
-use scrap::hwcodec::{HwRamEncoder, HwRamEncoderConfig};
+use scrap::hwcodec::{HwEncoderProfile, HwRamEncoder, HwRamEncoderConfig};
 #[cfg(feature = "vram")]
 use scrap::vram::{VRamEncoder, VRamEncoderConfig};
-#[cfg(not(windows))]
-use scrap::Capturer;
 use scrap::{
     aom::AomEncoderConfig,
     codec::{Encoder, EncoderCfg},
     record::{Recorder, RecorderContext},
     vpxcodec::{VpxEncoderConfig, VpxVideoCodecId},
-    CodecFormat, Display, EncodeInput, TraitCapturer, TraitPixelBuffer,
+    Capturer, CodecFormat, Display, EncodeInput, Pixfmt, TraitCapturer, TraitPixelBuffer,
 };
 #[cfg(windows)]
-use std::sync::Once;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Once,
+};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::ErrorKind::WouldBlock,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     time::{self, Duration, Instant},
 };
 
 pub const OPTION_REFRESH: &'static str = "refresh";
+pub const OPTION_REFERENCE_REFRESH: &'static str = "reference-refresh";
 const ENCODE_NO_VALID_FRAME: &str = "no valid frame";
 const HW_ENCODER_WARMUP_TIMEOUT: Duration = Duration::from_secs(3);
 const HOST_VIDEO_DIAG_INTERVAL: Duration = Duration::from_secs(5);
-const HOST_VIDEO_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
-const VIDEO_FRAME_FETCH_WAIT_MAX: Duration = Duration::from_millis(50);
-const VIDEO_FRAME_FETCH_WAIT_MIN: Duration = Duration::from_millis(1);
+const HQ_REFERENCE_REFRESH_BITRATE_MULTIPLIER: u32 = 3;
+const HQ_REFERENCE_REFRESH_BITRATE_DIVISOR: u32 = 2;
+const HQ_REFERENCE_REFRESH_COOLDOWN: Duration = Duration::from_secs(6);
+const DELIVERY_REFERENCE_REFRESH_COOLDOWN: Duration = Duration::from_secs(2);
 #[cfg(windows)]
-const DXGI_STARTUP_GDI_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
+const USER_CAPTURE_HELPER_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+static NEXT_VIDEO_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_video_stream_id() -> u64 {
+    let id = NEXT_VIDEO_STREAM_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    if id == 0 {
+        NEXT_VIDEO_STREAM_ID.store(2, AtomicOrdering::Relaxed);
+        1
+    } else {
+        id
+    }
+}
+
+fn stamp_video_frame(
+    vf: &mut hbb_common::message_proto::VideoFrame,
+    stream_id: u64,
+    next_frame_id: &mut u64,
+    capture_time_ms: i64,
+) -> u64 {
+    let frame_id = (*next_frame_id).max(1);
+    *next_frame_id = frame_id.wrapping_add(1).max(1);
+    vf.stream_id = stream_id;
+    vf.frame_id = frame_id;
+    vf.capture_time_ms = capture_time_ms.max(0) as u64;
+    frame_id
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReferenceRefreshReason {
+    StartupSafeEnded,
+    SignificantBitrateIncrease,
+    DeliveryRecovery,
+}
+
+#[derive(Debug)]
+struct HqReferenceRefreshPolicy {
+    startup_safe: bool,
+    reference_bitrate: u32,
+    last_refresh: Option<Instant>,
+    last_delivery_refresh_attempt: Option<Instant>,
+}
+
+impl HqReferenceRefreshPolicy {
+    fn new(startup_safe: bool, bitrate: u32) -> Self {
+        Self {
+            startup_safe,
+            reference_bitrate: bitrate,
+            last_refresh: None,
+            last_delivery_refresh_attempt: None,
+        }
+    }
+
+    fn evaluate(
+        &mut self,
+        eligible: bool,
+        startup_safe: bool,
+        bitrate: u32,
+        now: Instant,
+    ) -> Option<ReferenceRefreshReason> {
+        let startup_safe_ended = self.startup_safe && !startup_safe;
+        self.startup_safe = startup_safe;
+        if !eligible || startup_safe || bitrate == 0 {
+            return None;
+        }
+        if startup_safe_ended {
+            return Some(ReferenceRefreshReason::StartupSafeEnded);
+        }
+        let threshold = self
+            .reference_bitrate
+            .saturating_mul(HQ_REFERENCE_REFRESH_BITRATE_MULTIPLIER)
+            / HQ_REFERENCE_REFRESH_BITRATE_DIVISOR;
+        let cooldown_elapsed = self.last_refresh.map_or(true, |last_refresh| {
+            now.duration_since(last_refresh) >= HQ_REFERENCE_REFRESH_COOLDOWN
+        });
+        if self.reference_bitrate > 0 && bitrate >= threshold && cooldown_elapsed {
+            return Some(ReferenceRefreshReason::SignificantBitrateIncrease);
+        }
+        None
+    }
+
+    fn record_refresh(&mut self, bitrate: u32, now: Instant) {
+        self.reference_bitrate = bitrate;
+        self.last_refresh = Some(now);
+    }
+
+    fn request_delivery_refresh(
+        &mut self,
+        requested: bool,
+        now: Instant,
+    ) -> Option<ReferenceRefreshReason> {
+        if !requested
+            || self
+                .last_delivery_refresh_attempt
+                .is_some_and(|last_attempt| {
+                    now.duration_since(last_attempt) < DELIVERY_REFERENCE_REFRESH_COOLDOWN
+                })
+        {
+            return None;
+        }
+        self.last_delivery_refresh_attempt = Some(now);
+        Some(ReferenceRefreshReason::DeliveryRecovery)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingReferenceRefresh {
+    reason: ReferenceRefreshReason,
+    requested_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QosUpdate {
+    startup_safe: bool,
+    ratio_changed: bool,
+    previous_bitrate: u32,
+    current_bitrate: u32,
+}
+
+fn capture_frame_label(frame: &scrap::Frame<'_>) -> &'static str {
+    match frame {
+        scrap::Frame::Texture(_) => "GPU texture frame",
+        scrap::Frame::PixelBuffer(pixelbuffer) => match pixelbuffer.pixfmt() {
+            Pixfmt::BGRA => "CPU BGRA frame",
+            Pixfmt::RGBA => "CPU RGBA frame",
+            Pixfmt::RGB565LE => "CPU RGB565 frame",
+            Pixfmt::I420 => "CPU I420 frame",
+            Pixfmt::NV12 => "CPU NV12 frame",
+            Pixfmt::I444 => "CPU I444 frame",
+        },
+    }
+}
+
 #[cfg(windows)]
-const DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
-#[cfg(windows)]
-const WGC_STALLED_NO_FRAME_FALLBACK_TIMEOUT: Duration = Duration::from_secs(6);
+static USER_CAPTURE_HELPER_DISABLED: AtomicBool = AtomicBool::new(false);
 
 type FrameFetchedNotifierSender = UnboundedSender<(i32, Option<Instant>)>;
 type FrameFetchedNotifierReceiver = Arc<TokioMutex<UnboundedReceiver<(i32, Option<Instant>)>>>;
 
-lazy_static::lazy_static! {
-    static ref FRAME_FETCHED_NOTIFIERS: Mutex<HashMap<usize, (FrameFetchedNotifierSender, FrameFetchedNotifierReceiver)>> = Mutex::new(HashMap::default());
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct VideoStreamKey {
+    source: VideoSource,
+    display_idx: usize,
+}
 
-    // display_idx -> set of conn id.
+impl VideoStreamKey {
+    fn new(source: VideoSource, display_idx: usize) -> Self {
+        Self {
+            source,
+            display_idx,
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref FRAME_FETCHED_NOTIFIERS: Mutex<HashMap<VideoStreamKey, (FrameFetchedNotifierSender, FrameFetchedNotifierReceiver)>> = Mutex::new(HashMap::default());
+
+    // (source, display_idx) -> set of conn id.
     // Used to record which connections need to be notified when
     // 1. A new frame is received from a web client.
     //   Because web client does not send the display index in message `VideoReceived`.
     // 2. The client is closing.
-    static ref DISPLAY_CONN_IDS: Arc<Mutex<HashMap<usize, HashSet<i32>>>> = Default::default();
+    static ref DISPLAY_CONN_IDS: Arc<Mutex<HashMap<VideoStreamKey, HashSet<i32>>>> = Default::default();
     pub static ref VIDEO_QOS: Arc<Mutex<VideoQoS>> = Default::default();
-    pub static ref HOST_VIDEO_DIAG: Arc<Mutex<HostVideoDiagnosticsSnapshot>> = Default::default();
     static ref CAPTURE_BACKEND_PREFERENCE: Mutex<CaptureBackend> =
         Mutex::new(CaptureBackend::CaptureBackendAuto);
     pub static ref IS_UAC_RUNNING: Arc<Mutex<bool>> = Default::default();
     pub static ref IS_FOREGROUND_WINDOW_ELEVATED: Arc<Mutex<bool>> = Default::default();
     static ref SCREENSHOTS: Mutex<HashMap<usize, Screenshot>> = Default::default();
-}
-
-#[derive(Clone, Default)]
-pub struct HostVideoDiagnosticsSnapshot {
-    pub fps: String,
-    pub codec: String,
-    pub qos: String,
-    pub wait: String,
-    pub backend: String,
-    pub fallback: String,
 }
 
 struct Screenshot {
@@ -113,21 +250,27 @@ struct Screenshot {
 }
 
 #[inline]
-pub fn notify_video_frame_fetched(display_idx: usize, conn_id: i32, frame_tm: Option<Instant>) {
-    if let Some(notifier) = FRAME_FETCHED_NOTIFIERS.lock().unwrap().get(&display_idx) {
+pub fn notify_video_frame_fetched(
+    source: VideoSource,
+    display_idx: usize,
+    conn_id: i32,
+    frame_tm: Option<Instant>,
+) {
+    let key = VideoStreamKey::new(source, display_idx);
+    if let Some(notifier) = FRAME_FETCHED_NOTIFIERS.lock().unwrap().get(&key) {
         notifier.0.send((conn_id, frame_tm)).ok();
     }
 }
 
 #[inline]
 pub fn notify_video_frame_fetched_by_conn_id(conn_id: i32, frame_tm: Option<Instant>) {
-    let vec_display_idx: Vec<usize> = {
+    let stream_keys: Vec<VideoStreamKey> = {
         let display_conn_ids = DISPLAY_CONN_IDS.lock().unwrap();
         display_conn_ids
             .iter()
-            .filter_map(|(display_idx, conn_ids)| {
+            .filter_map(|(stream_key, conn_ids)| {
                 if conn_ids.contains(&conn_id) {
-                    Some(*display_idx)
+                    Some(*stream_key)
                 } else {
                     None
                 }
@@ -135,8 +278,8 @@ pub fn notify_video_frame_fetched_by_conn_id(conn_id: i32, frame_tm: Option<Inst
             .collect()
     };
     let notifiers = FRAME_FETCHED_NOTIFIERS.lock().unwrap();
-    for display_idx in vec_display_idx {
-        if let Some(notifier) = notifiers.get(&display_idx) {
+    for stream_key in stream_keys {
+        if let Some(notifier) = notifiers.get(&stream_key) {
             notifier.0.send((conn_id, frame_tm)).ok();
         }
     }
@@ -155,15 +298,15 @@ pub fn set_capture_backend_preference(backend: CaptureBackend) {
 }
 
 struct VideoFrameController {
-    display_idx: usize,
+    stream_key: VideoStreamKey,
     cur: Instant,
     send_conn_ids: HashSet<i32>,
 }
 
 impl VideoFrameController {
-    fn new(display_idx: usize) -> Self {
+    fn new(source: VideoSource, display_idx: usize) -> Self {
         Self {
-            display_idx,
+            stream_key: VideoStreamKey::new(source, display_idx),
             cur: Instant::now(),
             send_conn_ids: HashSet::new(),
         }
@@ -180,8 +323,21 @@ impl VideoFrameController {
             DISPLAY_CONN_IDS
                 .lock()
                 .unwrap()
-                .insert(self.display_idx, self.send_conn_ids.clone());
+                .insert(self.stream_key, self.send_conn_ids.clone());
         }
+    }
+
+    fn delivery_ready(&self, fetched_conn_ids: &HashSet<i32>) -> bool {
+        if self.send_conn_ids.is_empty() {
+            return true;
+        }
+        let fetched_expected = self
+            .send_conn_ids
+            .iter()
+            .filter(|id| fetched_conn_ids.contains(id))
+            .count();
+        fetched_expected == self.send_conn_ids.len()
+            || (self.send_conn_ids.len() > 1 && fetched_expected > 0)
     }
 
     #[tokio::main(flavor = "current_thread")]
@@ -195,7 +351,7 @@ impl VideoFrameController {
             match FRAME_FETCHED_NOTIFIERS
                 .lock()
                 .unwrap()
-                .get(&self.display_idx)
+                .get(&self.stream_key)
             {
                 Some(notifier) => notifier.1.clone(),
                 None => {
@@ -213,7 +369,9 @@ impl VideoFrameController {
                 if let Some(tm) = instant {
                     log::trace!("Channel recv latency: {}", tm.elapsed().as_secs_f32());
                 }
-                fetched_conn_ids.insert(id);
+                if self.send_conn_ids.contains(&id) {
+                    fetched_conn_ids.insert(id);
+                }
             }
             Ok(None) => {
                 // this branch would never be reached
@@ -224,25 +382,15 @@ impl VideoFrameController {
                 if let Some(tm) = instant {
                     log::trace!("Channel recv latency: {}", tm.elapsed().as_secs_f32());
                 }
-                fetched_conn_ids.insert(id);
+                if self.send_conn_ids.contains(&id) {
+                    fetched_conn_ids.insert(id);
+                }
             }
         }
     }
 }
 
-fn video_frame_fetch_wait_timeout_ms(spf: Duration) -> u64 {
-    let wait = if spf > VIDEO_FRAME_FETCH_WAIT_MAX {
-        VIDEO_FRAME_FETCH_WAIT_MAX
-    } else if spf < VIDEO_FRAME_FETCH_WAIT_MIN {
-        VIDEO_FRAME_FETCH_WAIT_MIN
-    } else {
-        spf
-    };
-    wait.as_millis().max(1) as u64
-}
-
 struct HostVideoDiagnostics {
-    last_monitor: Instant,
     last_log: Instant,
     valid_capture: usize,
     invalid_capture: usize,
@@ -260,10 +408,8 @@ struct HostVideoDiagnostics {
 
 impl HostVideoDiagnostics {
     fn new() -> Self {
-        let now = Instant::now();
         Self {
-            last_monitor: now,
-            last_log: now,
+            last_log: Instant::now(),
             valid_capture: 0,
             invalid_capture: 0,
             would_block: 0,
@@ -313,103 +459,51 @@ impl HostVideoDiagnostics {
         quality: f32,
         spf: Duration,
         gdi: bool,
-        backend: &str,
-        fallback: &str,
     ) {
-        let elapsed = self.last_monitor.elapsed();
-        if elapsed < HOST_VIDEO_MONITOR_INTERVAL {
+        if self.last_log.elapsed() < HOST_VIDEO_DIAG_INTERVAL {
             return;
         }
-        let sample_secs = elapsed.as_secs_f64().max(0.001);
         let target_fps = if spf.as_nanos() == 0 {
             0.0
         } else {
             1.0 / spf.as_secs_f64()
         };
-        let capture_fps = self.valid_capture as f64 / sample_secs;
-        let encode_fps = self.encode_calls as f64 / sample_secs;
-        let sent_fps = self.sent_batches as f64 / sample_secs;
         let wait_avg_ms = if self.wait_frames == 0 {
             0
         } else {
             self.wait_total_ms / self.wait_frames as u128
         };
-        *HOST_VIDEO_DIAG.lock().unwrap() = HostVideoDiagnosticsSnapshot {
-            fps: format!(
-                "target:{target_fps:.1} cap:{capture_fps:.1} enc:{encode_fps:.1} sent:{sent_fps:.1}"
-            ),
-            codec: format!(
-                "{}#{} {:?} {}",
-                source.service_name_prefix(),
-                display_idx,
-                negotiated_codec,
-                if hardware { "hw" } else { "sw" }
-            ),
-            qos: format!("br:{bitrate} q:{quality:.2} gdi:{gdi}"),
-            wait: format!(
-                "wb:{} inv:{} rep:{} empty:{} wait:{}/{} avg:{} max:{}",
-                self.would_block,
-                self.invalid_capture,
-                self.repeat_encode_calls,
-                self.empty_send_results,
-                self.wait_timeouts,
-                self.wait_frames,
-                wait_avg_ms,
-                self.wait_max_ms
-            ),
-            backend: backend.to_owned(),
-            fallback: fallback.to_owned(),
-        };
-        if self.last_log.elapsed() >= HOST_VIDEO_DIAG_INTERVAL {
-            log::info!(
-                "diag host fps: service={}, source={:?}, display_idx={}, codec={:?}, hardware={}, bitrate={}, quality={:.3}, target_fps={:.1}, capture_fps={:.1}, encode_fps={:.1}, sent_fps={:.1}, gdi={}, backend={}, fallback={}, valid_capture={}, invalid_capture={}, would_block={}, encode_calls={}, repeat_encode_calls={}, sent_batches={}, sent_targets={}, empty_send_results={}, wait_frames={}, wait_timeouts={}, wait_avg_ms={}, wait_max_ms={}",
-                service_name,
-                source,
-                display_idx,
-                negotiated_codec,
-                hardware,
-                bitrate,
-                quality,
-                target_fps,
-                capture_fps,
-                encode_fps,
-                sent_fps,
-                gdi,
-                backend,
-                fallback,
-                self.valid_capture,
-                self.invalid_capture,
-                self.would_block,
-                self.encode_calls,
-                self.repeat_encode_calls,
-                self.sent_batches,
-                self.sent_targets,
-                self.empty_send_results,
-                self.wait_frames,
-                self.wait_timeouts,
-                wait_avg_ms,
-                self.wait_max_ms
-            );
-            self.last_log = Instant::now();
-        }
-        self.last_monitor = Instant::now();
-        self.valid_capture = 0;
-        self.invalid_capture = 0;
-        self.would_block = 0;
-        self.encode_calls = 0;
-        self.repeat_encode_calls = 0;
-        self.sent_batches = 0;
-        self.sent_targets = 0;
-        self.empty_send_results = 0;
-        self.wait_frames = 0;
-        self.wait_timeouts = 0;
-        self.wait_total_ms = 0;
-        self.wait_max_ms = 0;
+        log::info!(
+            "diag host fps: service={}, source={:?}, display_idx={}, codec={:?}, hardware={}, bitrate={}, quality={:.3}, target_fps={:.1}, gdi={}, valid_capture={}, invalid_capture={}, would_block={}, encode_calls={}, repeat_encode_calls={}, sent_batches={}, sent_targets={}, empty_send_results={}, wait_frames={}, wait_timeouts={}, wait_avg_ms={}, wait_max_ms={}",
+            service_name,
+            source,
+            display_idx,
+            negotiated_codec,
+            hardware,
+            bitrate,
+            quality,
+            target_fps,
+            gdi,
+            self.valid_capture,
+            self.invalid_capture,
+            self.would_block,
+            self.encode_calls,
+            self.repeat_encode_calls,
+            self.sent_batches,
+            self.sent_targets,
+            self.empty_send_results,
+            self.wait_frames,
+            self.wait_timeouts,
+            wait_avg_ms,
+            self.wait_max_ms
+        );
+        *self = Self::new();
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum VideoSource {
+    #[default]
     Monitor,
     Camera,
 }
@@ -457,10 +551,11 @@ pub fn get_service_name(source: VideoSource, idx: usize) -> String {
 }
 
 pub fn new(source: VideoSource, idx: usize) -> GenericService {
+    let stream_key = VideoStreamKey::new(source, idx);
     let _ = FRAME_FETCHED_NOTIFIERS
         .lock()
         .unwrap()
-        .entry(idx)
+        .entry(stream_key)
         .or_insert_with(|| {
             let (tx, rx) = unbounded_channel();
             (tx, Arc::new(TokioMutex::new(rx)))
@@ -475,12 +570,417 @@ pub fn new(source: VideoSource, idx: usize) -> GenericService {
 }
 
 // Capturer object is expensive, avoiding to create it frequently.
+#[cfg(windows)]
+fn should_use_user_capture_helper(portable_service_running: bool, privacy_mode_id: i32) -> bool {
+    let privacy_mode_ok = privacy_mode_id == INVALID_PRIVACY_MODE_CONN_ID;
+    let helper_disabled = USER_CAPTURE_HELPER_DISABLED.load(Ordering::Relaxed);
+    let is_root = crate::platform::is_root();
+    let installed = is_installed();
+    let prelogin = crate::platform::windows::is_prelogin();
+    let locked = crate::platform::windows::is_locked();
+    let desktop_changed = crate::platform::windows::desktop_changed();
+    let use_helper = privacy_mode_ok
+        && !helper_disabled
+        && !portable_service_running
+        && is_root
+        && installed
+        && !prelogin
+        && !locked
+        && !desktop_changed;
+    let mut blocked_by = Vec::new();
+    if !privacy_mode_ok {
+        blocked_by.push("privacy_mode");
+    }
+    if helper_disabled {
+        blocked_by.push("helper_disabled");
+    }
+    if portable_service_running {
+        blocked_by.push("portable_service");
+    }
+    if !is_root {
+        blocked_by.push("not_service");
+    }
+    if !installed {
+        blocked_by.push("not_installed");
+    }
+    if prelogin {
+        blocked_by.push("prelogin");
+    }
+    if locked {
+        blocked_by.push("locked");
+    }
+    if desktop_changed {
+        blocked_by.push("desktop_changed");
+    }
+    let blocked_by = if blocked_by.is_empty() {
+        "none".to_owned()
+    } else {
+        blocked_by.join(",")
+    };
+    log::info!(
+        "user capture helper decision: use_helper={}, blocked_by={}, privacy_mode_id={}, portable_service_running={}, is_root={}, installed={}, prelogin={}, locked={}, desktop_changed={}",
+        use_helper,
+        blocked_by,
+        privacy_mode_id,
+        portable_service_running,
+        is_root,
+        installed,
+        prelogin,
+        locked,
+        desktop_changed
+    );
+    use_helper
+}
+
+#[cfg(windows)]
+fn can_use_direct_wgc(privacy_mode_id: i32) -> bool {
+    privacy_mode_id == INVALID_PRIVACY_MODE_CONN_ID
+        && !crate::platform::windows::is_prelogin()
+        && !crate::platform::windows::is_locked()
+        && !crate::platform::windows::desktop_changed()
+}
+
+#[cfg(windows)]
+fn create_wgc_priority_capturer(
+    privacy_mode_id: i32,
+    current: usize,
+    portable_service_running: bool,
+    width: usize,
+    height: usize,
+) -> ResultType<Box<dyn TraitCapturer>> {
+    if should_use_user_capture_helper(portable_service_running, privacy_mode_id) {
+        match crate::server::user_capture_helper::client::create_capturer(current, width, height) {
+            Ok(capturer) => {
+                log::info!("Create capturer via user WGC helper");
+                return Ok(capturer);
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to create user WGC helper capturer, falling back to direct WGC: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    if !can_use_direct_wgc(privacy_mode_id) {
+        bail!("direct WGC is not valid for current desktop state");
+    }
+    if !scrap::CapturerWgc::is_supported() {
+        bail!("WGC is not supported");
+    }
+    let mut displays = Display::all().with_context(|| "Failed to enumerate displays for WGC")?;
+    if displays.len() <= current {
+        bail!(
+            "Failed to get display {} for WGC capturer, display_count={}",
+            current,
+            displays.len()
+        );
+    }
+    let wgc_display = displays.remove(current);
+    let capturer = scrap::CapturerWgc::new(wgc_display)
+        .with_context(|| "Failed to create direct WGC capturer")?;
+    log::info!("Create direct WGC capturer");
+    Ok(Box::new(capturer))
+}
+
+#[cfg(windows)]
+fn create_magnifier_priority_capturer(
+    privacy_mode_id: i32,
+    origin: (i32, i32),
+    width: usize,
+    height: usize,
+) -> ResultType<Box<dyn TraitCapturer>> {
+    if privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID {
+        bail!("magnifier priority capture is skipped in privacy mode");
+    }
+    if !can_try_magnifier_fallback("auto_priority") {
+        bail!("magnifier priority capture is not valid for current desktop state");
+    }
+    let mag = scrap::CapturerMag::new(origin, width, height)
+        .with_context(|| "Failed to create magnifier capturer")?;
+    log::info!(
+        "Create magnifier capturer by priority: origin={:?}, width={}, height={}",
+        origin,
+        width,
+        height
+    );
+    Ok(Box::new(mag))
+}
+
+#[cfg(windows)]
+fn create_dxgi_priority_capturer(
+    display: Display,
+    current: usize,
+    portable_service_running: bool,
+) -> ResultType<Box<dyn TraitCapturer>> {
+    log::debug!("Create capturer dxgi|gdi");
+    crate::portable_service::client::create_capturer(current, display, portable_service_running)
+}
+
+#[cfg(any(windows, test))]
+fn should_force_portable_secure_capturer(
+    portable_service_running: bool,
+    prelogin: bool,
+    locked: bool,
+    desktop_changed: bool,
+) -> bool {
+    portable_service_running && (prelogin || locked || desktop_changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        should_force_portable_secure_capturer, stamp_video_frame, HqReferenceRefreshPolicy,
+        ReferenceRefreshReason, VideoFrameController, VideoSource, VideoStreamKey,
+        DELIVERY_REFERENCE_REFRESH_COOLDOWN, HQ_REFERENCE_REFRESH_COOLDOWN,
+    };
+    use hbb_common::message_proto::VideoFrame;
+    use std::{
+        collections::HashSet,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn test_portable_secure_capture_routing_requires_secure_desktop() {
+        assert!(!should_force_portable_secure_capturer(
+            false, true, true, true
+        ));
+        assert!(!should_force_portable_secure_capturer(
+            true, false, false, false
+        ));
+        assert!(should_force_portable_secure_capturer(
+            true, true, false, false
+        ));
+        assert!(should_force_portable_secure_capturer(
+            true, false, true, false
+        ));
+        assert!(should_force_portable_secure_capturer(
+            true, false, false, true
+        ));
+    }
+
+    #[test]
+    fn video_frame_stamp_is_monotonic_and_capture_relative() {
+        let mut next_frame_id = 1;
+        let mut first = VideoFrame::new();
+        let mut second = VideoFrame::new();
+
+        assert_eq!(stamp_video_frame(&mut first, 17, &mut next_frame_id, 42), 1);
+        assert_eq!(
+            stamp_video_frame(&mut second, 17, &mut next_frame_id, 57),
+            2
+        );
+        assert_eq!(
+            (first.stream_id, first.frame_id, first.capture_time_ms),
+            (17, 1, 42)
+        );
+        assert_eq!(
+            (second.stream_id, second.frame_id, second.capture_time_ms),
+            (17, 2, 57)
+        );
+    }
+
+    #[test]
+    fn frame_delivery_key_isolates_monitor_and_camera_indices() {
+        let monitor = VideoStreamKey::new(VideoSource::Monitor, 0);
+        let camera = VideoStreamKey::new(VideoSource::Camera, 0);
+        let second_monitor = VideoStreamKey::new(VideoSource::Monitor, 1);
+
+        assert_ne!(monitor, camera);
+        assert_ne!(monitor, second_monitor);
+    }
+
+    #[test]
+    fn shared_stream_advances_when_one_expected_viewer_fetches_frame() {
+        let mut controller = VideoFrameController::new(VideoSource::Monitor, 0);
+        controller.set_send(Instant::now(), [10, 20].into_iter().collect());
+
+        assert!(!controller.delivery_ready(&HashSet::new()));
+        assert!(controller.delivery_ready(&HashSet::from([10])));
+        assert!(controller.delivery_ready(&HashSet::from([10, 20])));
+        assert!(!controller.delivery_ready(&HashSet::from([99])));
+    }
+
+    #[test]
+    fn single_viewer_stream_still_waits_for_its_viewer() {
+        let mut controller = VideoFrameController::new(VideoSource::Monitor, 0);
+        controller.set_send(Instant::now(), HashSet::from([10]));
+
+        assert!(!controller.delivery_ready(&HashSet::new()));
+        assert!(!controller.delivery_ready(&HashSet::from([99])));
+        assert!(controller.delivery_ready(&HashSet::from([10])));
+    }
+
+    #[test]
+    fn hq_reference_refreshes_when_startup_safe_mode_ends() {
+        let now = Instant::now();
+        let mut policy = HqReferenceRefreshPolicy::new(true, 1_000);
+
+        assert_eq!(policy.evaluate(true, true, 1_000, now), None);
+        assert_eq!(
+            policy.evaluate(true, false, 4_000, now),
+            Some(ReferenceRefreshReason::StartupSafeEnded)
+        );
+        policy.record_refresh(4_000, now);
+        assert_eq!(policy.evaluate(true, false, 4_000, now), None);
+    }
+
+    #[test]
+    fn hq_reference_refresh_requires_material_bitrate_growth_and_cooldown() {
+        let now = Instant::now();
+        let mut policy = HqReferenceRefreshPolicy::new(false, 2_000);
+
+        assert_eq!(policy.evaluate(true, false, 2_999, now), None);
+        assert_eq!(
+            policy.evaluate(true, false, 3_000, now),
+            Some(ReferenceRefreshReason::SignificantBitrateIncrease)
+        );
+        policy.record_refresh(3_000, now);
+        assert_eq!(policy.evaluate(true, false, 4_500, now), None);
+        assert_eq!(
+            policy.evaluate(true, false, 4_500, now + HQ_REFERENCE_REFRESH_COOLDOWN),
+            Some(ReferenceRefreshReason::SignificantBitrateIncrease)
+        );
+    }
+
+    #[test]
+    fn hq_reference_refresh_policy_ignores_ineligible_encoder() {
+        let now = Instant::now();
+        let mut policy = HqReferenceRefreshPolicy::new(true, 1_000);
+
+        assert_eq!(policy.evaluate(false, false, 4_000, now), None);
+        assert_eq!(
+            policy.evaluate(false, false, 8_000, now + Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[test]
+    fn delivery_reference_refresh_requests_are_coalesced_per_service() {
+        let now = Instant::now();
+        let mut policy = HqReferenceRefreshPolicy::new(false, 1_000);
+
+        assert_eq!(
+            policy.request_delivery_refresh(true, now),
+            Some(ReferenceRefreshReason::DeliveryRecovery)
+        );
+        assert_eq!(
+            policy.request_delivery_refresh(true, now + Duration::from_millis(500)),
+            None
+        );
+        assert_eq!(
+            policy.request_delivery_refresh(true, now + DELIVERY_REFERENCE_REFRESH_COOLDOWN),
+            Some(ReferenceRefreshReason::DeliveryRecovery)
+        );
+        assert_eq!(policy.request_delivery_refresh(false, now), None);
+    }
+}
+
+#[cfg(windows)]
+fn create_gdi_priority_capturer(current: usize) -> ResultType<Box<dyn TraitCapturer>> {
+    let mut displays = Display::all().with_context(|| "Failed to enumerate displays for GDI")?;
+    if displays.len() <= current {
+        bail!(
+            "Failed to get display {} for GDI capturer, display_count={}",
+            current,
+            displays.len()
+        );
+    }
+    let display = displays.remove(current);
+    let mut capturer =
+        Capturer::new(display).with_context(|| "Failed to create fallback GDI capturer")?;
+    if !capturer.set_gdi() {
+        bail!("Failed to enable fallback GDI capturer");
+    }
+    log::info!("Create GDI capturer by final priority fallback");
+    Ok(Box::new(capturer))
+}
+
+#[cfg(windows)]
+fn create_windows_capturer(
+    privacy_mode_id: i32,
+    display: Display,
+    current: usize,
+    portable_service_running: bool,
+) -> ResultType<Box<dyn TraitCapturer>> {
+    let origin = display.origin();
+    let width = display.width();
+    let height = display.height();
+    log::info!(
+        "capture auto backend priority requested: display={}, size={}x{}, priority=WGC,WinMag,DXGI,GDI",
+        current,
+        width,
+        height
+    );
+
+    let prelogin = crate::platform::windows::is_prelogin();
+    let locked = crate::platform::windows::is_locked();
+    let desktop_changed = crate::platform::windows::desktop_changed();
+    if should_force_portable_secure_capturer(
+        portable_service_running,
+        prelogin,
+        locked,
+        desktop_changed,
+    ) {
+        log::info!(
+            "capture auto backend selected: Portable SYSTEM helper before WGC/WinMag, prelogin={}, locked={}, desktop_changed={}",
+            prelogin,
+            locked,
+            desktop_changed
+        );
+        return create_dxgi_priority_capturer(display, current, portable_service_running);
+    }
+
+    match create_wgc_priority_capturer(
+        privacy_mode_id,
+        current,
+        portable_service_running,
+        width,
+        height,
+    ) {
+        Ok(capturer) => {
+            log::info!("capture auto backend selected: WGC");
+            return Ok(capturer);
+        }
+        Err(err) => {
+            log::info!("capture auto backend WGC skipped: {}", err);
+        }
+    }
+
+    match create_magnifier_priority_capturer(privacy_mode_id, origin, width, height) {
+        Ok(capturer) => {
+            log::info!("capture auto backend selected: WinMag");
+            return Ok(capturer);
+        }
+        Err(err) => {
+            log::info!("capture auto backend WinMag skipped: {}", err);
+        }
+    }
+
+    match create_dxgi_priority_capturer(display, current, portable_service_running) {
+        Ok(capturer) => {
+            log::info!(
+                "capture auto backend selected: {}",
+                capturer.capture_backend()
+            );
+            Ok(capturer)
+        }
+        Err(dxgi_err) => {
+            log::warn!("capture auto backend DXGI/GDI failed: {}", dxgi_err);
+            create_gdi_priority_capturer(current)
+        }
+    }
+}
+
 fn create_capturer(
     privacy_mode_id: i32,
     display: Display,
-    _current: usize,
-    _portable_service_running: bool,
+    current: usize,
+    portable_service_running: bool,
 ) -> ResultType<Box<dyn TraitCapturer>> {
+    #[cfg(not(windows))]
+    let _ = (current, portable_service_running);
     #[cfg(not(windows))]
     let c: Option<Box<dyn TraitCapturer>> = None;
     #[cfg(windows)]
@@ -504,11 +1004,11 @@ fn create_capturer(
         None => {
             #[cfg(windows)]
             {
-                log::debug!("Create capturer dxgi|gdi");
-                return crate::portable_service::client::create_capturer(
-                    _current,
+                return create_windows_capturer(
+                    privacy_mode_id,
                     display,
-                    _portable_service_running,
+                    current,
+                    portable_service_running,
                 );
             }
             #[cfg(not(windows))]
@@ -657,6 +1157,15 @@ fn get_capturer_monitor(
         if capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID
             && is_current_privacy_mode_impl(PRIVACY_MODE_IMPL_WIN_MAG)
         {
+            if crate::platform::windows::is_prelogin()
+                || crate::platform::windows::desktop_changed()
+                || (crate::platform::is_root() && crate::platform::windows::is_locked())
+            {
+                log::warn!(
+                    "WinMag privacy capture disabled on prelogin/service-locked/changed desktop; using normal service capture"
+                );
+                capturer_privacy_mode_id = INVALID_PRIVACY_MODE_CONN_ID;
+            }
             if !is_installed() {
                 if is_process_consent_running()? {
                     capturer_privacy_mode_id = INVALID_PRIVACY_MODE_CONN_ID;
@@ -671,7 +1180,9 @@ fn get_capturer_monitor(
 
     if privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID {
         if privacy_mode_id != capturer_privacy_mode_id {
-            log::info!("In privacy mode, but show UAC prompt window for now");
+            log::info!(
+                "In privacy mode, but current desktop requires normal service capture for now"
+            );
         } else {
             log::info!("In privacy mode, the peer side cannot watch the screen");
         }
@@ -682,7 +1193,7 @@ fn get_capturer_monitor(
         current,
         portable_service_running,
     )?;
-    Ok(CapturerInfo {
+    let mut c = CapturerInfo {
         origin,
         width,
         height,
@@ -691,7 +1202,10 @@ fn get_capturer_monitor(
         privacy_mode_id,
         _capturer_privacy_mode_id: capturer_privacy_mode_id,
         capturer,
-    })
+    };
+    #[cfg(windows)]
+    apply_capture_backend_preference(&mut c);
+    Ok(c)
 }
 
 fn get_capturer_camera(current: usize) -> ResultType<CapturerInfo> {
@@ -750,7 +1264,10 @@ fn display_for_current(c: &CapturerInfo) -> Option<Display> {
     let mut displays = match Display::all() {
         Ok(displays) => displays,
         Err(err) => {
-            log::warn!("capture backend override failed to enumerate displays: {}", err);
+            log::warn!(
+                "capture backend override failed to enumerate displays: {}",
+                err
+            );
             return None;
         }
     };
@@ -766,27 +1283,46 @@ fn display_for_current(c: &CapturerInfo) -> Option<Display> {
 }
 
 #[cfg(windows)]
-fn apply_capture_backend_preference(
-    c: &mut CapturerInfo,
-    capture_fallback_reason: &mut String,
-) {
+fn apply_capture_backend_preference(c: &mut CapturerInfo) {
     if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID {
         return;
     }
     let preference = *CAPTURE_BACKEND_PREFERENCE.lock().unwrap();
     match preference {
         CaptureBackend::CaptureBackendAuto | CaptureBackend::CaptureBackendNotSet => {}
+        CaptureBackend::CaptureBackendDxgi
+        | CaptureBackend::CaptureBackendWgc
+        | CaptureBackend::CaptureBackendWinMag
+        | CaptureBackend::CaptureBackendGdi => {
+            if crate::platform::windows::is_prelogin()
+                || crate::platform::windows::desktop_changed()
+                || (crate::platform::is_root() && crate::platform::windows::is_locked())
+            {
+                log::info!(
+                    "capture backend override deferred on secure desktop: requested={:?}",
+                    preference
+                );
+                return;
+            }
+        }
+    }
+
+    match preference {
+        CaptureBackend::CaptureBackendAuto | CaptureBackend::CaptureBackendNotSet => {}
         CaptureBackend::CaptureBackendDxgi => {
             let Some(display) = display_for_current(c) else {
                 return;
             };
-            match scrap::Capturer::new(display) {
+            match create_dxgi_priority_capturer(
+                display,
+                c.current,
+                crate::portable_service::client::running(),
+            ) {
                 Ok(capturer) => {
-                    c.capturer = Box::new(capturer);
-                    *capture_fallback_reason = "manual_dxgi".to_owned();
+                    c.capturer = capturer;
                     log::info!(
-                        "capture backend override applied: DXGI, effective_gdi={}",
-                        c.is_gdi()
+                        "capture backend override applied: DXGI, effective_backend={}",
+                        c.capture_backend()
                     );
                 }
                 Err(err) => {
@@ -795,17 +1331,19 @@ fn apply_capture_backend_preference(
             }
         }
         CaptureBackend::CaptureBackendWgc => {
-            if !scrap::CapturerWgc::is_supported() {
-                log::warn!("capture backend override WGC skipped: unsupported");
-                return;
-            }
-            let Some(display) = display_for_current(c) else {
-                return;
-            };
-            match scrap::CapturerWgc::new(display) {
+            log::info!(
+                "capture backend override requested: WGC, current_backend={}",
+                c.capture_backend()
+            );
+            match create_wgc_priority_capturer(
+                c._capturer_privacy_mode_id,
+                c.current,
+                crate::portable_service::client::running(),
+                c.width,
+                c.height,
+            ) {
                 Ok(wgc) => {
-                    c.capturer = Box::new(wgc);
-                    *capture_fallback_reason = "manual_wgc".to_owned();
+                    c.capturer = wgc;
                     log::info!("capture backend override applied: WGC");
                 }
                 Err(err) => {
@@ -814,10 +1352,14 @@ fn apply_capture_backend_preference(
             }
         }
         CaptureBackend::CaptureBackendWinMag => {
-            match scrap::CapturerMag::new(c.origin, c.width, c.height) {
+            match create_magnifier_priority_capturer(
+                c._capturer_privacy_mode_id,
+                c.origin,
+                c.width,
+                c.height,
+            ) {
                 Ok(mag) => {
-                    c.capturer = Box::new(mag);
-                    *capture_fallback_reason = "manual_winmag".to_owned();
+                    c.capturer = mag;
                     log::info!(
                         "capture backend override applied: WinMag, origin={:?}, width={}, height={}",
                         c.origin,
@@ -830,87 +1372,49 @@ fn apply_capture_backend_preference(
                 }
             }
         }
-        CaptureBackend::CaptureBackendGdi => {
-            if c.set_gdi() {
-                *capture_fallback_reason = "manual_gdi".to_owned();
+        CaptureBackend::CaptureBackendGdi => match create_gdi_priority_capturer(c.current) {
+            Ok(gdi) => {
+                c.capturer = gdi;
                 log::info!("capture backend override applied: GDI");
-            } else {
-                log::warn!("capture backend override GDI failed");
             }
-        }
+            Err(err) => {
+                log::warn!("capture backend override GDI failed: {}", err);
+            }
+        },
     }
 }
 
 #[cfg(windows)]
-fn try_set_wgc_fallback(
-    c: &mut CapturerInfo,
-    capture_fallback_reason: &mut String,
-    reason: &str,
-) -> bool {
-    if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID || c.is_wgc() {
-        return false;
-    }
-    if !scrap::CapturerWgc::is_supported() {
-        log::warn!(
-            "capture wgc fallback skipped: reason={}, unsupported",
-            reason
-        );
-        return false;
-    }
-
-    let mut displays = match Display::all() {
-        Ok(displays) => displays,
-        Err(err) => {
-            log::warn!(
-                "capture wgc fallback failed to enumerate displays: reason={}, err={}",
-                reason,
-                err
-            );
-            return false;
-        }
-    };
-    if displays.len() <= c.current {
-        log::warn!(
-            "capture wgc fallback failed: reason={}, current={}, display_count={}",
+fn can_try_magnifier_fallback(reason: &str) -> bool {
+    let prelogin = crate::platform::windows::is_prelogin();
+    let locked = crate::platform::windows::is_locked();
+    let desktop_changed = crate::platform::windows::desktop_changed();
+    let local_system = crate::platform::is_root();
+    let can_try = !prelogin && !desktop_changed && !(local_system && locked);
+    if !can_try {
+        log::info!(
+            "capture magnifier fallback skipped: reason={}, prelogin={}, locked={}, desktop_changed={}, local_system={}",
             reason,
-            c.current,
-            displays.len()
+            prelogin,
+            locked,
+            desktop_changed,
+            local_system
         );
-        return false;
     }
-
-    let display = displays.remove(c.current);
-    match scrap::CapturerWgc::new(display) {
-        Ok(wgc) => {
-            c.capturer = Box::new(wgc);
-            *capture_fallback_reason = reason.to_owned();
-            log::info!("capture wgc fallback enabled: reason={}", reason);
-            true
-        }
-        Err(err) => {
-            log::warn!(
-                "capture wgc fallback failed to create capturer: reason={}, err={}",
-                reason,
-                err
-            );
-            false
-        }
-    }
+    can_try
 }
 
 #[cfg(windows)]
-fn try_set_magnifier_fallback(
-    c: &mut CapturerInfo,
-    capture_fallback_reason: &mut String,
-    reason: &str,
-) -> bool {
+fn try_set_magnifier_fallback(c: &mut CapturerInfo, reason: &str) -> bool {
     if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID || c.is_mag() {
+        return false;
+    }
+    if !can_try_magnifier_fallback(reason) {
         return false;
     }
     match scrap::CapturerMag::new(c.origin, c.width, c.height) {
         Ok(mag) => {
             c.capturer = Box::new(mag);
-            *capture_fallback_reason = reason.to_owned();
             log::info!(
                 "capture magnifier fallback enabled: reason={}, origin={:?}, width={}, height={}",
                 reason,
@@ -935,17 +1439,54 @@ fn try_set_magnifier_fallback(
 }
 
 #[cfg(windows)]
-fn try_set_gdi_fallback(
-    c: &mut CapturerInfo,
-    capture_fallback_reason: &mut String,
-    reason: &str,
-) -> bool {
+fn try_recreate_magnifier_capture(c: &mut CapturerInfo, reason: &str) -> bool {
+    if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID || !c.is_mag() {
+        return false;
+    }
+    let prelogin = crate::platform::windows::is_prelogin();
+    let locked_service = crate::platform::is_root() && crate::platform::windows::is_locked();
+    if prelogin || locked_service {
+        log::info!(
+            "capture magnifier recreate skipped: reason={}, prelogin={}, locked_service={}",
+            reason,
+            prelogin,
+            locked_service
+        );
+        return false;
+    }
+    match scrap::CapturerMag::new(c.origin, c.width, c.height) {
+        Ok(mag) => {
+            c.capturer = Box::new(mag);
+            log::info!(
+                "capture magnifier recreated: reason={}, origin={:?}, width={}, height={}",
+                reason,
+                c.origin,
+                c.width,
+                c.height
+            );
+            true
+        }
+        Err(err) => {
+            log::warn!(
+                "capture magnifier recreate failed: reason={}, origin={:?}, width={}, height={}, err={}",
+                reason,
+                c.origin,
+                c.width,
+                c.height,
+                err
+            );
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_set_gdi_fallback(c: &mut CapturerInfo, reason: &str) -> bool {
     if c.is_gdi() {
-        *capture_fallback_reason = reason.to_owned();
         return true;
     }
     if c.set_gdi() {
-        *capture_fallback_reason = reason.to_owned();
+        log::info!("capture gdi fallback enabled: reason={}", reason);
         return true;
     }
 
@@ -980,7 +1521,6 @@ fn try_set_gdi_fallback(
                 return false;
             }
             c.capturer = Box::new(capturer);
-            *capture_fallback_reason = reason.to_owned();
             log::info!("capture gdi fallback enabled: reason={}", reason);
             true
         }
@@ -996,7 +1536,7 @@ fn try_set_gdi_fallback(
 }
 
 fn run(vs: VideoService) -> ResultType<()> {
-    let mut _raii = Raii::new(vs.idx, vs.sp.name());
+    let mut _raii = Raii::new(vs.source, vs.idx, vs.sp.name());
     // Wayland only support one video capturer for now. It is ok to call ensure_inited() here.
     //
     // ensure_inited() is needed because clear() may be called.
@@ -1028,22 +1568,13 @@ fn run(vs: VideoService) -> ResultType<()> {
 
     let display_idx = vs.idx;
     let sp = vs.sp;
+    let service_name = sp.name();
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
-    #[cfg(windows)]
-    let mut capture_fallback_reason = c.gdi_fallback_reason();
     #[cfg(windows)]
     if !scrap::codec::enable_directx_capture() && !c.is_gdi() {
         log::info!("disable dxgi with option, fall back to gdi");
-        if c.set_gdi() {
-            capture_fallback_reason = "directx_disabled".to_owned();
-        }
+        c.set_gdi();
     }
-    #[cfg(windows)]
-    if c.is_gdi() && capture_fallback_reason.is_empty() {
-        capture_fallback_reason = "capturer_init_gdi".to_owned();
-    }
-    #[cfg(windows)]
-    apply_capture_backend_preference(&mut c, &mut capture_fallback_reason);
     #[cfg(windows)]
     let capturer_is_gdi = c.is_gdi();
     #[cfg(not(windows))]
@@ -1060,18 +1591,24 @@ fn run(vs: VideoService) -> ResultType<()> {
         c.height,
         capturer_is_gdi
     );
+    #[cfg(windows)]
+    let mut capture_backend = c.capture_backend();
+    #[cfg(not(windows))]
+    let capture_backend = "Unknown";
+    let subscriber_ids = sp.subscriber_ids();
     let mut video_qos = VIDEO_QOS.lock().unwrap();
-    let mut spf = video_qos.spf();
-    let mut quality = video_qos.ratio();
+    video_qos.sync_subscribers(&service_name, subscriber_ids);
+    let mut spf = video_qos.spf(&service_name);
+    let mut quality = video_qos.ratio(&service_name);
     let record_incoming = config::option2bool(
         "allow-auto-record-incoming",
         &Config::get_option("allow-auto-record-incoming"),
     );
-    let client_record = video_qos.record();
+    let client_record = video_qos.record(&service_name);
     drop(video_qos);
     let (mut encoder, encoder_cfg, codec_format, use_i444, recorder) = match setup_encoder(
         &c,
-        sp.name(),
+        service_name.clone(),
         quality,
         client_record,
         record_incoming,
@@ -1091,7 +1628,7 @@ fn run(vs: VideoService) -> ResultType<()> {
             }));
             setup_encoder(
                 &c,
-                sp.name(),
+                service_name.clone(),
                 quality,
                 client_record,
                 record_incoming,
@@ -1105,13 +1642,22 @@ fn run(vs: VideoService) -> ResultType<()> {
     let encoder_input_texture = encoder.input_texture();
     #[cfg(not(feature = "vram"))]
     let encoder_input_texture = false;
+    let encoder_backend = Encoder::backend_label(&encoder_cfg);
+    let encoder_input = if encoder_input_texture {
+        "GPU texture"
+    } else {
+        "CPU YUV frame"
+    };
     log::info!(
-        "diag video service encoder ready: service={}, source={:?}, display_idx={}, negotiated={:?}, cfg={:?}, hardware={}, input_texture={}, bitrate={}, use_i444={}, quality={:?}",
+        "diag video service encoder ready: service={}, source={:?}, display_idx={}, negotiated={:?}, cfg={:?}, capture_backend={}, encoder_backend={}, encoder_input={}, hardware={}, input_texture={}, bitrate={}, use_i444={}, quality={:?}",
         sp.name(),
         vs.source,
         display_idx,
         codec_format,
         encoder_cfg,
+        capture_backend,
+        encoder_backend,
+        encoder_input,
         encoder.is_hardware(),
         encoder_input_texture,
         encoder.bitrate(),
@@ -1127,37 +1673,50 @@ fn run(vs: VideoService) -> ResultType<()> {
             bail!(e);
         }
     }
-    VIDEO_QOS.lock().unwrap().store_bitrate(encoder.bitrate());
-    VIDEO_QOS
-        .lock()
-        .unwrap()
-        .set_support_changing_quality(&sp.name(), encoder.support_changing_quality());
+    {
+        let mut video_qos = VIDEO_QOS.lock().unwrap();
+        video_qos.store_bitrate(&service_name, encoder.bitrate());
+        video_qos.store_pipeline_status(
+            &service_name,
+            capture_backend,
+            encoder_backend,
+            encoder_input,
+        );
+        video_qos.set_support_changing_quality(&service_name, encoder.support_changing_quality());
+    }
     log::info!("initial quality: {quality:?}");
 
     if sp.is_option_true(OPTION_REFRESH) {
         sp.set_option_bool(OPTION_REFRESH, false);
     }
+    if sp.is_option_true(OPTION_REFERENCE_REFRESH) {
+        sp.set_option_bool(OPTION_REFERENCE_REFRESH, false);
+    }
 
-    let mut frame_controller = VideoFrameController::new(display_idx);
+    let mut frame_controller = VideoFrameController::new(vs.source, display_idx);
 
     let start = time::Instant::now();
     let mut last_check_displays = time::Instant::now();
     #[cfg(windows)]
     let mut try_gdi = 1;
     #[cfg(windows)]
-    let mut dxgi_first_valid_frame = c.is_gdi();
+    let mut user_capture_helper_no_frame_since: Option<Instant> = None;
     #[cfg(windows)]
-    let mut dxgi_startup_gdi_snapshot = false;
+    let mut mag_no_frame_count = 0u32;
     #[cfg(windows)]
-    let mut dxgi_startup_gdi_snapshot_done = c.is_gdi();
+    let mut last_desktop_capture_state = (
+        crate::platform::windows::is_prelogin(),
+        crate::platform::windows::is_locked(),
+        crate::platform::windows::desktop_changed(),
+    );
     #[cfg(windows)]
-    let mut dxgi_no_frame_since: Option<Instant> = None;
-    #[cfg(windows)]
-    let mut wgc_first_valid_frame = c.is_wgc();
-    #[cfg(windows)]
-    let mut wgc_no_frame_since: Option<Instant> = None;
-    #[cfg(windows)]
-    log::info!("gdi: {}", c.is_gdi());
+    log::info!(
+        "gdi: {}, mag: {}, user_helper: {}, cpu_only: {}",
+        c.is_gdi(),
+        c.is_mag(),
+        c.is_user_capture_helper(),
+        c.is_cpu_only()
+    );
     #[cfg(windows)]
     start_uac_elevation_check();
 
@@ -1170,6 +1729,13 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut encode_fail_counter = 0;
     let mut hw_no_valid_frame_since: Option<Instant> = None;
     let mut first_frame = true;
+    let stream_id = next_video_stream_id();
+    let mut next_frame_id = 1;
+    let mut reference_refresh_pending = None;
+    let mut reference_refresh_policy = HqReferenceRefreshPolicy::new(
+        VIDEO_QOS.lock().unwrap().startup_safe_mode(&service_name),
+        encoder.bitrate(),
+    );
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
@@ -1178,15 +1744,75 @@ fn run(vs: VideoService) -> ResultType<()> {
     while sp.ok() {
         #[cfg(windows)]
         check_uac_switch(c.privacy_mode_id, c._capturer_privacy_mode_id)?;
-        check_qos(
+        let qos_update = check_qos(
             &mut encoder,
             &mut quality,
             &mut spf,
             client_record,
             &mut send_counter,
             &mut second_instant,
-            &sp.name(),
+            &service_name,
+            &sp,
         )?;
+        let reference_refresh_eligible = hq_reference_refresh_eligible(&encoder_cfg, codec_format);
+        let policy_refresh_reason = reference_refresh_policy.evaluate(
+            reference_refresh_eligible,
+            qos_update.startup_safe,
+            qos_update.current_bitrate,
+            Instant::now(),
+        );
+        let delivery_refresh_requested = sp.is_option_true(OPTION_REFERENCE_REFRESH);
+        if delivery_refresh_requested {
+            sp.set_option_bool(OPTION_REFERENCE_REFRESH, false);
+        }
+        let delivery_refresh_reason = reference_refresh_policy
+            .request_delivery_refresh(delivery_refresh_requested, Instant::now());
+        if let Some(reason) = delivery_refresh_reason.or(policy_refresh_reason) {
+            let refresh_started = Instant::now();
+            match recreate_encoder_at_quality(&encoder_cfg, use_i444, quality) {
+                Ok(refreshed_encoder) => {
+                    let refreshed_bitrate = refreshed_encoder.bitrate();
+                    log::info!(
+                        "diag video reference refresh: service={}, display={}, codec={:?}, reason={:?}, ratio={}, bitrate_before={}, bitrate_after={}, qos_previous_bitrate={}, ratio_changed={}, startup_safe={}",
+                        sp.name(),
+                        display_idx,
+                        codec_format,
+                        reason,
+                        quality,
+                        encoder.bitrate(),
+                        refreshed_bitrate,
+                        qos_update.previous_bitrate,
+                        qos_update.ratio_changed,
+                        qos_update.startup_safe
+                    );
+                    encoder = refreshed_encoder;
+                    VIDEO_QOS
+                        .lock()
+                        .unwrap()
+                        .store_bitrate(&service_name, refreshed_bitrate);
+                    reference_refresh_policy.record_refresh(refreshed_bitrate, refresh_started);
+                    reference_refresh_pending = Some(PendingReferenceRefresh {
+                        reason,
+                        requested_at: refresh_started,
+                    });
+                    repeat_encode_counter = 0;
+                    encode_fail_counter = 0;
+                    hw_no_valid_frame_since = None;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "diag video reference refresh failed: service={}, display={}, codec={:?}, reason={:?}, ratio={}, bitrate={}, err={:?}",
+                        sp.name(),
+                        display_idx,
+                        codec_format,
+                        reason,
+                        quality,
+                        encoder.bitrate(),
+                        err
+                    );
+                }
+            }
+        }
         if sp.is_option_true(OPTION_REFRESH) {
             if vs.source.is_monitor() {
                 let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
@@ -1220,8 +1846,12 @@ fn run(vs: VideoService) -> ResultType<()> {
             bail!("SWITCH");
         }
         #[cfg(all(windows, feature = "vram"))]
-        if (c.is_gdi() || c.is_wgc() || c.is_mag()) && encoder.input_texture() {
-            log::info!("changed to pixel-buffer capture when using vram");
+        if (c.is_gdi() || c.is_cpu_only()) && encoder.input_texture() {
+            log::info!(
+                "changed to gdi/cpu-only capture when using vram, gdi={}, cpu_only={}",
+                c.is_gdi(),
+                c.is_cpu_only()
+            );
             VRamEncoder::set_fallback_gdi(sp.name(), true);
             bail!("SWITCH");
         }
@@ -1230,9 +1860,62 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
         #[cfg(windows)]
         {
-            if crate::platform::windows::desktop_changed()
-                && !crate::portable_service::client::running()
-            {
+            let desktop_state = (
+                crate::platform::windows::is_prelogin(),
+                crate::platform::windows::is_locked(),
+                crate::platform::windows::desktop_changed(),
+            );
+            let desktop_changed = desktop_state.2;
+            let portable_service_running = crate::portable_service::client::running();
+            if portable_service_running && desktop_state != last_desktop_capture_state {
+                log::info!(
+                    "portable capture desktop state changed: prelogin {}->{}, locked {}->{}, desktop_changed {}->{}",
+                    last_desktop_capture_state.0,
+                    desktop_state.0,
+                    last_desktop_capture_state.1,
+                    desktop_state.1,
+                    last_desktop_capture_state.2,
+                    desktop_state.2
+                );
+                last_desktop_capture_state = desktop_state;
+                if c.is_mag() {
+                    if should_force_portable_secure_capturer(
+                        portable_service_running,
+                        desktop_state.0,
+                        desktop_state.1,
+                        desktop_state.2,
+                    ) {
+                        log::info!(
+                            "portable secure desktop while using magnifier; switch to helper capture"
+                        );
+                        bail!("SWITCH");
+                    }
+                    if !desktop_state.0 && !desktop_state.1 && !desktop_state.2 {
+                        log::info!(
+                            "portable returned to user desktop while using magnifier; switch capture backend"
+                        );
+                        bail!("SWITCH");
+                    }
+                    if try_recreate_magnifier_capture(&mut c, "desktop_state_mag_recreate") {
+                        log::info!(
+                            "portable desktop state changed while using magnifier; recreated magnifier"
+                        );
+                    } else {
+                        log::warn!(
+                            "portable desktop state changed while using magnifier; keep magnifier on locked/secure desktop"
+                        );
+                    }
+                } else {
+                    if desktop_changed {
+                        log::info!(
+                            "portable input desktop changed; switch capture backend from current backend"
+                        );
+                    }
+                    log::info!("portable desktop state changed; switch capture backend");
+                    bail!("SWITCH");
+                }
+            }
+            if desktop_changed && !portable_service_running {
                 bail!("Desktop changed");
             }
         }
@@ -1244,31 +1927,59 @@ fn run(vs: VideoService) -> ResultType<()> {
             try_broadcast_display_changed(&sp, display_idx, &c, false)?;
         }
 
+        #[cfg(windows)]
+        {
+            let current_capture_backend = c.capture_backend();
+            if current_capture_backend != capture_backend {
+                capture_backend = current_capture_backend;
+                log::info!(
+                    "diag video service capture backend changed: service={}, source={:?}, display_idx={}, capture_backend={}, encoder_backend={}, encoder_input={}",
+                    sp.name(),
+                    vs.source,
+                    display_idx,
+                    capture_backend,
+                    encoder_backend,
+                    encoder_input
+                );
+                VIDEO_QOS.lock().unwrap().store_pipeline_status(
+                    &service_name,
+                    capture_backend,
+                    encoder_backend,
+                    encoder_input,
+                );
+            }
+        }
+
         frame_controller.reset();
 
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
-        #[cfg(windows)]
-        let frame_from_gdi = c.is_gdi();
-        #[cfg(windows)]
-        let frame_from_wgc = c.is_wgc();
-        #[cfg(windows)]
-        let frame_from_mag = c.is_mag();
         let res = match c.frame(spf) {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
                     #[cfg(windows)]
                     {
-                        if frame_from_wgc {
-                            wgc_first_valid_frame = true;
-                            wgc_no_frame_since = None;
-                        } else if !frame_from_gdi && !frame_from_mag {
-                            dxgi_first_valid_frame = true;
-                            dxgi_no_frame_since = None;
-                        }
+                        user_capture_helper_no_frame_since = None;
+                        mag_no_frame_count = 0;
                     }
                     host_diag.valid_capture += 1;
+                    let capture_frame = capture_frame_label(&frame);
+                    let capture_frame_changed = {
+                        let mut video_qos = VIDEO_QOS.lock().unwrap();
+                        video_qos.store_capture_frame(&service_name, capture_frame)
+                    };
+                    if capture_frame_changed {
+                        log::info!(
+                            "diag video service capture frame: service={}, source={:?}, display_idx={}, capture_backend={}, capture_frame={}, encoder_input={}",
+                            sp.name(),
+                            vs.source,
+                            display_idx,
+                            capture_backend,
+                            capture_frame,
+                            encoder_input
+                        );
+                    }
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&display_idx);
                     if let Some(mut screenshot) = screenshot {
                         let restore_vram = screenshot.restore_vram;
@@ -1323,34 +2034,25 @@ fn run(vs: VideoService) -> ResultType<()> {
                         &mut encode_fail_counter,
                         &mut hw_no_valid_frame_since,
                         &mut first_frame,
+                        stream_id,
+                        &mut next_frame_id,
+                        &mut reference_refresh_pending,
                         capture_width,
                         capture_height,
                     )?;
                     host_diag.record_send_result(send_conn_ids.len());
                     frame_controller.set_send(now, send_conn_ids);
                     send_counter += 1;
-                    #[cfg(windows)]
-                    if dxgi_startup_gdi_snapshot && frame_from_gdi {
-                        if c.cancel_gdi() {
-                            capture_fallback_reason.clear();
-                            dxgi_startup_gdi_snapshot = false;
-                            try_gdi = 1;
-                            dxgi_no_frame_since = Some(Instant::now());
-                            log::info!("startup gdi snapshot sent; returning to dxgi capture");
-                        }
-                    }
                 } else {
                     host_diag.invalid_capture += 1;
                 }
                 #[cfg(windows)]
                 {
-                    if dxgi_first_valid_frame {
-                        #[cfg(feature = "vram")]
-                        if try_gdi == 1 && !c.is_gdi() {
-                            VRamEncoder::set_fallback_gdi(sp.name(), false);
-                        }
-                        try_gdi = 0;
+                    #[cfg(feature = "vram")]
+                    if try_gdi == 1 && !c.is_gdi() {
+                        VRamEncoder::set_fallback_gdi(sp.name(), false);
                     }
+                    try_gdi = 0;
                 }
                 Ok(())
             }
@@ -1361,152 +2063,63 @@ fn run(vs: VideoService) -> ResultType<()> {
             Err(ref e) if e.kind() == WouldBlock => {
                 host_diag.would_block += 1;
                 #[cfg(windows)]
-                if c.is_wgc() {
-                    let no_frame_elapsed = wgc_no_frame_since
-                        .get_or_insert_with(Instant::now)
-                        .elapsed();
-                    if !wgc_first_valid_frame
-                        && no_frame_elapsed >= DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
-                    {
-                        if try_set_magnifier_fallback(
-                            &mut c,
-                            &mut capture_fallback_reason,
-                            "wgc_no_frame_mag",
-                        ) {
-                            wgc_no_frame_since = None;
-                            try_gdi = 0;
-                            log::info!(
-                                "wgc returned no valid startup frame for {:?}; fall back to magnifier capture",
-                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
-                            );
-                            continue;
-                        }
-                        if try_set_gdi_fallback(
-                            &mut c,
-                            &mut capture_fallback_reason,
-                            "wgc_no_frame",
-                        ) {
-                            wgc_no_frame_since = None;
-                            try_gdi = 0;
-                            log::info!(
-                                "wgc returned no valid startup frame for {:?}; fall back to gdi",
-                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
-                            );
-                            continue;
-                        }
-                    }
-                    if wgc_first_valid_frame
-                        && repeat_encode_counter >= repeat_encode_max
-                        && no_frame_elapsed >= WGC_STALLED_NO_FRAME_FALLBACK_TIMEOUT
-                    {
-                        if try_set_magnifier_fallback(
-                            &mut c,
-                            &mut capture_fallback_reason,
-                            "wgc_stalled_mag",
-                        ) {
-                            wgc_no_frame_since = None;
-                            try_gdi = 0;
-                            log::info!(
-                                "wgc returned no new frame for {:?}; fall back to magnifier capture",
-                                WGC_STALLED_NO_FRAME_FALLBACK_TIMEOUT
-                            );
-                            continue;
-                        }
-                        if try_set_gdi_fallback(&mut c, &mut capture_fallback_reason, "wgc_stalled")
-                        {
-                            wgc_no_frame_since = None;
-                            try_gdi = 0;
-                            log::info!(
-                                "wgc returned no new frame for {:?}; fall back to gdi",
-                                WGC_STALLED_NO_FRAME_FALLBACK_TIMEOUT
-                            );
-                            continue;
-                        }
-                    }
-                    if try_gdi == 1 {
-                        log::info!("wgc returned no new image; keeping wgc active before fallback");
-                    } else if try_gdi % 30 == 0 {
+                if c.is_mag() {
+                    mag_no_frame_count = mag_no_frame_count.saturating_add(1);
+                    let portable_service_running = crate::portable_service::client::running();
+                    let prelogin = crate::platform::windows::is_prelogin();
+                    let locked = crate::platform::windows::is_locked();
+                    let desktop_changed = crate::platform::windows::desktop_changed();
+                    if should_force_portable_secure_capturer(
+                        portable_service_running,
+                        prelogin,
+                        locked,
+                        desktop_changed,
+                    ) {
                         log::info!(
-                            "wgc still has no new image after {} would-block samples",
-                            try_gdi
+                            "portable magnifier produced no frames on secure desktop; switch to helper capture, no_frame_count={}",
+                            mag_no_frame_count
                         );
+                        bail!("SWITCH");
                     }
-                    try_gdi += 1;
-                } else if try_gdi > 0 && !c.is_gdi() {
-                    let no_frame_elapsed = dxgi_no_frame_since
-                        .get_or_insert_with(Instant::now)
-                        .elapsed();
-                    if !dxgi_first_valid_frame
-                        && !dxgi_startup_gdi_snapshot_done
-                        && start.elapsed() >= DXGI_STARTUP_GDI_SNAPSHOT_TIMEOUT
+                    if portable_service_running
+                        && (locked || desktop_changed)
+                        && (mag_no_frame_count == 10 || mag_no_frame_count % 60 == 0)
+                        && try_recreate_magnifier_capture(&mut c, "mag_no_frame_recreate")
                     {
-                        if c.set_gdi() {
-                            capture_fallback_reason = "dxgi_startup_gdi_snapshot".to_owned();
-                            dxgi_startup_gdi_snapshot = true;
-                            dxgi_startup_gdi_snapshot_done = true;
-                            try_gdi = 0;
-                            log::info!(
-                                "dxgi returned no valid startup frame for {:?}; taking one gdi snapshot before returning to dxgi",
-                                DXGI_STARTUP_GDI_SNAPSHOT_TIMEOUT
-                            );
-                            continue;
-                        }
-                    }
-                    if !dxgi_first_valid_frame
-                        && dxgi_startup_gdi_snapshot_done
-                        && !dxgi_startup_gdi_snapshot
-                        && no_frame_elapsed >= DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
-                    {
-                        if try_set_wgc_fallback(
-                            &mut c,
-                            &mut capture_fallback_reason,
-                            "dxgi_no_frame_after_snapshot_wgc",
-                        ) {
-                            dxgi_no_frame_since = Some(Instant::now());
-                            wgc_first_valid_frame = false;
-                            wgc_no_frame_since = Some(Instant::now());
-                            try_gdi = 1;
-                            log::info!(
-                                "dxgi returned no valid frame for {:?} after startup snapshot; fall back to wgc capture",
-                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
-                            );
-                            continue;
-                        } else if try_set_magnifier_fallback(
-                            &mut c,
-                            &mut capture_fallback_reason,
-                            "dxgi_no_frame_after_snapshot_mag",
-                        ) {
-                            dxgi_no_frame_since = None;
-                            try_gdi = 0;
-                            log::info!(
-                                "dxgi returned no valid frame for {:?} after startup snapshot; fall back to magnifier capture",
-                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
-                            );
-                            continue;
-                        }
-                        if try_set_gdi_fallback(
-                            &mut c,
-                            &mut capture_fallback_reason,
-                            "dxgi_no_frame_after_snapshot",
-                        ) {
-                            dxgi_no_frame_since = None;
-                            try_gdi = 0;
-                            log::info!(
-                                "dxgi returned no valid frame for {:?} after startup snapshot; fall back to gdi",
-                                DXGI_POST_SNAPSHOT_NO_FRAME_FALLBACK_TIMEOUT
-                            );
-                            continue;
-                        }
-                    }
-                    if try_gdi == 1 {
                         log::info!(
-                            "dxgi returned no new image; keeping dxgi active instead of falling back to gdi"
+                            "portable magnifier produced no frames; recreated magnifier, no_frame_count={}",
+                            mag_no_frame_count
                         );
-                    } else if try_gdi % 30 == 0 {
-                        log::info!(
-                            "dxgi still has no new image after {} would-block samples; keeping dxgi active",
-                            try_gdi
+                        mag_no_frame_count = 0;
+                        continue;
+                    }
+                }
+                #[cfg(windows)]
+                if c.is_user_capture_helper() && first_frame {
+                    let first_no_frame = *user_capture_helper_no_frame_since.get_or_insert(now);
+                    if first_no_frame.elapsed() >= USER_CAPTURE_HELPER_STARTUP_TIMEOUT {
+                        USER_CAPTURE_HELPER_DISABLED.store(true, Ordering::Relaxed);
+                        log::warn!(
+                            "User capture helper did not produce startup frame after {:?}; switching to direct dxgi|gdi",
+                            USER_CAPTURE_HELPER_STARTUP_TIMEOUT
                         );
+                        bail!("SWITCH");
+                    }
+                }
+                #[cfg(windows)]
+                if try_gdi > 0 && !c.is_gdi() && !c.is_cpu_only() {
+                    if try_gdi > 3 {
+                        if try_set_magnifier_fallback(&mut c, "no_image_mag") {
+                            try_gdi = 0;
+                            log::info!("No image, fall back to magnifier capture");
+                            continue;
+                        }
+                        if try_set_gdi_fallback(&mut c, "no_image") {
+                            log::info!("No image, fall back to gdi");
+                        } else {
+                            log::warn!("No image, failed to fall back to gdi");
+                        }
+                        try_gdi = 0;
                     }
                     try_gdi += 1;
                 }
@@ -1541,6 +2154,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                             &mut encode_fail_counter,
                             &mut hw_no_valid_frame_since,
                             &mut first_frame,
+                            stream_id,
+                            &mut next_frame_id,
+                            &mut reference_refresh_pending,
                             capture_width,
                             capture_height,
                         )?;
@@ -1558,52 +2174,65 @@ fn run(vs: VideoService) -> ResultType<()> {
                 }
 
                 #[cfg(windows)]
-                if c.is_wgc() {
-                    if try_set_magnifier_fallback(
-                        &mut c,
-                        &mut capture_fallback_reason,
-                        "wgc_error_mag",
-                    ) {
-                        log::info!("wgc capture error, fall back to magnifier: {:?}", err);
-                        continue;
-                    }
-                    if try_set_gdi_fallback(&mut c, &mut capture_fallback_reason, "wgc_error") {
-                        log::info!("wgc capture error, fall back to gdi: {:?}", err);
-                        continue;
-                    }
-                    return Err(err.into());
+                if c.is_user_capture_helper() {
+                    USER_CAPTURE_HELPER_DISABLED.store(true, Ordering::Relaxed);
+                    log::warn!(
+                        "User capture helper returned capture error; switching to direct dxgi|gdi: {:?}",
+                        err
+                    );
+                    bail!("SWITCH");
                 }
+
                 #[cfg(windows)]
                 if c.is_mag() {
-                    if try_set_gdi_fallback(&mut c, &mut capture_fallback_reason, "mag_error") {
+                    let portable_service_running = crate::portable_service::client::running();
+                    let prelogin = crate::platform::windows::is_prelogin();
+                    let locked = crate::platform::windows::is_locked();
+                    let desktop_changed = crate::platform::windows::desktop_changed();
+                    if should_force_portable_secure_capturer(
+                        portable_service_running,
+                        prelogin,
+                        locked,
+                        desktop_changed,
+                    ) {
+                        log::info!(
+                            "portable magnifier capture error on secure desktop; switch to helper capture: {:?}",
+                            err
+                        );
+                        bail!("SWITCH");
+                    }
+                    if portable_service_running && (locked || desktop_changed) {
+                        if try_recreate_magnifier_capture(&mut c, "mag_error_recreate") {
+                            log::info!(
+                                "portable magnifier capture error; recreated magnifier: {:?}",
+                                err
+                            );
+                            continue;
+                        }
+                        log::warn!(
+                            "portable magnifier capture error; keep magnifier on secure/changed desktop: {:?}",
+                            err
+                        );
+                        continue;
+                    }
+                    if try_set_gdi_fallback(&mut c, "mag_error") {
                         log::info!("magnifier capture error, fall back to gdi: {:?}", err);
                         continue;
                     }
                     return Err(err.into());
                 }
+
                 #[cfg(windows)]
                 if !c.is_gdi() {
-                    if try_set_wgc_fallback(&mut c, &mut capture_fallback_reason, "dxgi_error_wgc")
-                    {
-                        dxgi_no_frame_since = Some(Instant::now());
-                        wgc_first_valid_frame = false;
-                        wgc_no_frame_since = Some(Instant::now());
-                        try_gdi = 1;
-                        log::info!("dxgi error, fall back to wgc: {:?}", err);
+                    if try_set_magnifier_fallback(&mut c, "capture_error_mag") {
+                        log::info!("capture error, fall back to magnifier: {:?}", err);
                         continue;
                     }
-                    if try_set_magnifier_fallback(
-                        &mut c,
-                        &mut capture_fallback_reason,
-                        "dxgi_error_mag",
-                    ) {
-                        log::info!("dxgi error, fall back to magnifier: {:?}", err);
-                        continue;
-                    }
-                    if try_set_gdi_fallback(&mut c, &mut capture_fallback_reason, "dxgi_error") {
+                    if try_set_gdi_fallback(&mut c, "capture_error") {
                         log::info!("dxgi error, fall back to gdi: {:?}", err);
+                        continue;
                     }
-                    continue;
+                    return Err(err.into());
                 }
                 return Err(err.into());
             }
@@ -1616,20 +2245,27 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
 
         let mut fetched_conn_ids = HashSet::new();
+        let timeout_millis = 3_000u64;
         let wait_begin = Instant::now();
-        if vs.source.is_monitor() {
-            check_privacy_mode_changed(&sp, display_idx, &c)?;
+        while wait_begin.elapsed().as_millis() < timeout_millis as _ {
+            if vs.source.is_monitor() {
+                check_privacy_mode_changed(&sp, display_idx, &c)?;
+            }
+            frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
+            // break if all connections have received current frame
+            if frame_controller.delivery_ready(&fetched_conn_ids) {
+                break;
+            }
         }
-        frame_controller.try_wait_next(
-            &mut fetched_conn_ids,
-            video_frame_fetch_wait_timeout_ms(spf),
-        );
         host_diag.record_wait(
             frame_controller.send_conn_ids.len(),
             fetched_conn_ids.len(),
             wait_begin.elapsed(),
         );
-        DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
+        DISPLAY_CONN_IDS
+            .lock()
+            .unwrap()
+            .remove(&VideoStreamKey::new(vs.source, display_idx));
 
         let elapsed = now.elapsed();
         // may need to enable frame(timeout)
@@ -1641,42 +2277,6 @@ fn run(vs: VideoService) -> ResultType<()> {
         let current_gdi = c.is_gdi();
         #[cfg(not(windows))]
         let current_gdi = false;
-        #[cfg(windows)]
-        let current_mag = c.is_mag();
-        #[cfg(windows)]
-        let current_wgc = c.is_wgc();
-        #[cfg(windows)]
-        let capture_backend = if vs.source.is_camera() {
-            "Camera"
-        } else if c._capturer_privacy_mode_id != INVALID_PRIVACY_MODE_CONN_ID {
-            "WinMag"
-        } else if current_wgc {
-            "WGC"
-        } else if current_mag {
-            "WinMag"
-        } else if current_gdi {
-            "GDI"
-        } else {
-            "DXGI"
-        };
-        #[cfg(windows)]
-        let current_fallback_reason = if current_gdi || current_wgc || current_mag {
-            if capture_fallback_reason.is_empty() {
-                "unknown"
-            } else {
-                capture_fallback_reason.as_str()
-            }
-        } else {
-            "none"
-        };
-        #[cfg(not(windows))]
-        let capture_backend = if vs.source.is_camera() {
-            "Camera"
-        } else {
-            "Screen"
-        };
-        #[cfg(not(windows))]
-        let current_fallback_reason = "none";
         let service_name = sp.name();
         host_diag.maybe_log(
             &service_name,
@@ -1688,8 +2288,6 @@ fn run(vs: VideoService) -> ResultType<()> {
             quality,
             spf,
             current_gdi,
-            capture_backend,
-            current_fallback_reason,
         );
     }
 
@@ -1697,16 +2295,18 @@ fn run(vs: VideoService) -> ResultType<()> {
 }
 
 struct Raii {
+    source: VideoSource,
     display_idx: usize,
     name: String,
     try_vram: bool,
 }
 
 impl Raii {
-    fn new(display_idx: usize, name: String) -> Self {
+    fn new(source: VideoSource, display_idx: usize, name: String) -> Self {
         log::info!("new video service: {}", name);
         VIDEO_QOS.lock().unwrap().new_display(name.clone());
         Raii {
+            source,
             display_idx,
             name,
             try_vram: true,
@@ -1724,7 +2324,10 @@ impl Drop for Raii {
         #[cfg(feature = "vram")]
         Encoder::update(scrap::codec::EncodingUpdate::Check);
         VIDEO_QOS.lock().unwrap().remove_display(&self.name);
-        DISPLAY_CONN_IDS.lock().unwrap().remove(&self.display_idx);
+        DISPLAY_CONN_IDS
+            .lock()
+            .unwrap()
+            .remove(&VideoStreamKey::new(self.source, self.display_idx));
     }
 }
 
@@ -1775,6 +2378,43 @@ fn setup_encoder(
     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
 }
 
+fn hq_reference_refresh_eligible(encoder_cfg: &EncoderCfg, codec_format: CodecFormat) -> bool {
+    #[cfg(feature = "hwcodec")]
+    {
+        matches!(codec_format, CodecFormat::H264 | CodecFormat::H265)
+            && matches!(
+                encoder_cfg,
+                EncoderCfg::HWRAM(HwRamEncoderConfig {
+                    profile: HwEncoderProfile::HighQuality,
+                    keyframe_interval: None,
+                    ..
+                })
+            )
+    }
+    #[cfg(not(feature = "hwcodec"))]
+    {
+        let _ = (encoder_cfg, codec_format);
+        false
+    }
+}
+
+fn recreate_encoder_at_quality(
+    encoder_cfg: &EncoderCfg,
+    use_i444: bool,
+    quality: f32,
+) -> ResultType<Encoder> {
+    let mut encoder_cfg = encoder_cfg.clone();
+    match &mut encoder_cfg {
+        EncoderCfg::VPX(config) => config.quality = quality,
+        EncoderCfg::AOM(config) => config.quality = quality,
+        #[cfg(feature = "hwcodec")]
+        EncoderCfg::HWRAM(config) => config.quality = quality,
+        #[cfg(feature = "vram")]
+        EncoderCfg::VRAM(config) => config.quality = quality,
+    }
+    Encoder::new(encoder_cfg, use_i444)
+}
+
 fn get_encoder_config(
     c: &CapturerInfo,
     _name: String,
@@ -1784,8 +2424,13 @@ fn get_encoder_config(
     _source: VideoSource,
 ) -> EncoderCfg {
     #[cfg(all(windows, feature = "vram"))]
-    if _portable_service || c.is_gdi() || _source == VideoSource::Camera {
-        log::info!("gdi:{}, portable:{}", c.is_gdi(), _portable_service);
+    if _portable_service || c.is_gdi() || c.is_cpu_only() || _source == VideoSource::Camera {
+        log::info!(
+            "gdi:{}, cpu_only:{}, portable:{}",
+            c.is_gdi(),
+            c.is_cpu_only(),
+            _portable_service
+        );
         VRamEncoder::set_not_use(_name, true);
     }
     #[cfg(feature = "vram")]
@@ -1795,19 +2440,26 @@ fn get_encoder_config(
     let negotiated_codec = Encoder::negotiated_codec();
     match negotiated_codec {
         CodecFormat::H264 | CodecFormat::H265 => {
+            let high_quality = Encoder::high_quality_profile_required();
             #[cfg(feature = "vram")]
-            if let Some(feature) = VRamEncoder::try_get(&c.device(), negotiated_codec) {
-                return EncoderCfg::VRAM(VRamEncoderConfig {
-                    device: c.device(),
-                    width: c.width,
-                    height: c.height,
-                    quality,
-                    feature,
-                    keyframe_interval,
-                });
+            if !high_quality {
+                if let Some(feature) = VRamEncoder::try_get(&c.device(), negotiated_codec) {
+                    return EncoderCfg::VRAM(VRamEncoderConfig {
+                        device: c.device(),
+                        width: c.width,
+                        height: c.height,
+                        quality,
+                        feature,
+                        keyframe_interval,
+                    });
+                }
             }
             #[cfg(feature = "hwcodec")]
-            if let Some(hw) = HwRamEncoder::try_get(negotiated_codec) {
+            if let Some(hw) = if high_quality {
+                HwRamEncoder::try_get_high_quality(negotiated_codec)
+            } else {
+                HwRamEncoder::try_get(negotiated_codec)
+            } {
                 return EncoderCfg::HWRAM(HwRamEncoderConfig {
                     name: hw.name,
                     mc_name: hw.mc_name,
@@ -1815,7 +2467,18 @@ fn get_encoder_config(
                     height: c.height,
                     quality,
                     keyframe_interval,
+                    profile: if high_quality {
+                        HwEncoderProfile::HighQuality
+                    } else {
+                        HwEncoderProfile::Default
+                    },
                 });
+            }
+            if high_quality {
+                log::warn!(
+                    "high-quality {:?} was negotiated but no matching HQ RAM encoder is available",
+                    negotiated_codec
+                );
             }
             EncoderCfg::VPX(VpxEncoderConfig {
                 width: c.width as _,
@@ -1836,12 +2499,38 @@ fn get_encoder_config(
             },
             keyframe_interval,
         }),
-        CodecFormat::AV1 => EncoderCfg::AOM(AomEncoderConfig {
-            width: c.width as _,
-            height: c.height as _,
-            quality,
-            keyframe_interval,
-        }),
+        CodecFormat::AV1 => {
+            #[cfg(feature = "hwcodec")]
+            if Encoder::av1_hardware_allowed() {
+                if let Some(hw) = HwRamEncoder::try_get(CodecFormat::AV1) {
+                    return EncoderCfg::HWRAM(HwRamEncoderConfig {
+                        name: hw.name,
+                        mc_name: hw.mc_name,
+                        width: c.width,
+                        height: c.height,
+                        quality,
+                        keyframe_interval,
+                        profile: Default::default(),
+                    });
+                }
+                if Encoder::av1_hardware_required() {
+                    log::warn!("AV1 hardware was requested but no hardware encoder is available");
+                    return EncoderCfg::VPX(VpxEncoderConfig {
+                        width: c.width as _,
+                        height: c.height as _,
+                        quality,
+                        codec: VpxVideoCodecId::VP9,
+                        keyframe_interval,
+                    });
+                }
+            }
+            EncoderCfg::AOM(AomEncoderConfig {
+                width: c.width as _,
+                height: c.height as _,
+                quality,
+                keyframe_interval,
+            })
+        }
         _ => EncoderCfg::VPX(VpxEncoderConfig {
             width: c.width as _,
             height: c.height as _,
@@ -1957,6 +2646,9 @@ fn handle_one_frame(
     encode_fail_counter: &mut usize,
     hw_no_valid_frame_since: &mut Option<Instant>,
     first_frame: &mut bool,
+    stream_id: u64,
+    next_frame_id: &mut u64,
+    reference_refresh_pending: &mut Option<PendingReferenceRefresh>,
     width: usize,
     height: usize,
 ) -> ResultType<HashSet<i32>> {
@@ -1977,6 +2669,7 @@ fn handle_one_frame(
             *encode_fail_counter = 0;
             *hw_no_valid_frame_since = None;
             vf.display = display as _;
+            let frame_id = stamp_video_frame(&mut vf, stream_id, next_frame_id, ms);
             let (payload_bytes, frame_count, has_keyframe) =
                 scrap::codec::video_frame_payload_stats(&vf).unwrap_or((0, 0, false));
             let mut msg = Message::new();
@@ -1989,9 +2682,11 @@ fn handle_one_frame(
             send_conn_ids = sp.send_video_frame(msg);
             if first {
                 log::info!(
-                    "diag first video frame encoded: service={}, display={}, width={}, height={}, targets={:?}, negotiated={:?}, hardware={}, bitrate={}, payload_bytes={}, frame_count={}, keyframe={}, capture_ms={}",
+                    "diag first video frame encoded: service={}, display={}, stream_id={}, frame_id={}, width={}, height={}, targets={:?}, negotiated={:?}, hardware={}, bitrate={}, payload_bytes={}, frame_count={}, keyframe={}, capture_ms={}",
                     sp.name(),
                     display,
+                    stream_id,
+                    frame_id,
                     width,
                     height,
                     send_conn_ids,
@@ -2003,6 +2698,27 @@ fn handle_one_frame(
                     has_keyframe,
                     ms
                 );
+            }
+            if let Some(refresh) = reference_refresh_pending.take() {
+                log::info!(
+                    "diag video reference refresh encoded: service={}, display={}, reason={:?}, elapsed_ms={}, bitrate={}, payload_bytes={}, frame_count={}, keyframe={}",
+                    sp.name(),
+                    display,
+                    refresh.reason,
+                    refresh.requested_at.elapsed().as_millis(),
+                    encoder.bitrate(),
+                    payload_bytes,
+                    frame_count,
+                    has_keyframe
+                );
+                if !has_keyframe {
+                    log::warn!(
+                        "diag video reference refresh did not produce a keyframe: service={}, display={}, reason={:?}",
+                        sp.name(),
+                        display,
+                        refresh.reason
+                    );
+                }
             }
         }
         Err(e) => {
@@ -2197,33 +2913,51 @@ fn check_qos(
     send_counter: &mut usize,
     second_instant: &mut Instant,
     name: &str,
-) -> ResultType<()> {
+    sp: &GenericService,
+) -> ResultType<QosUpdate> {
+    let update_display = second_instant.elapsed() > Duration::from_secs(1);
+    let subscriber_ids = update_display.then(|| sp.subscriber_ids());
+    if update_display {
+        *second_instant = Instant::now();
+    }
     let mut video_qos = VIDEO_QOS.lock().unwrap();
-    *spf = video_qos.spf();
-    if *ratio != video_qos.ratio() {
-        *ratio = video_qos.ratio();
+    if let Some(subscriber_ids) = subscriber_ids {
+        video_qos.sync_subscribers(name, subscriber_ids);
+    }
+    *spf = video_qos.spf(name);
+    let startup_safe = video_qos.startup_safe_mode(name);
+    let next_ratio = video_qos.ratio(name);
+    let previous_bitrate = encoder.bitrate();
+    let ratio_changed = *ratio != next_ratio;
+    if ratio_changed {
+        *ratio = next_ratio;
         if encoder.support_changing_quality() {
             allow_err!(encoder.set_quality(*ratio));
-            video_qos.store_bitrate(encoder.bitrate());
+            video_qos.store_bitrate(name, encoder.bitrate());
         } else {
             // Now only vaapi doesn't support changing quality
-            if !video_qos.in_vbr_state() && !video_qos.latest_quality().is_custom() {
+            if !video_qos.in_vbr_state(name) && !video_qos.latest_quality(name).is_custom() {
                 log::info!("switch to change quality");
                 bail!("SWITCH");
             }
         }
     }
-    if client_record != video_qos.record() {
+    if client_record != video_qos.record(name) {
         log::info!("switch due to record changed");
         bail!("SWITCH");
     }
-    if second_instant.elapsed() > Duration::from_secs(1) {
-        *second_instant = Instant::now();
-        video_qos.update_display_data(&name, *send_counter);
+    if update_display {
+        video_qos.update_display_data(name, *send_counter);
         *send_counter = 0;
     }
+    let current_bitrate = encoder.bitrate();
     drop(video_qos);
-    Ok(())
+    Ok(QosUpdate {
+        startup_safe,
+        ratio_changed,
+        previous_bitrate,
+        current_bitrate,
+    })
 }
 
 pub fn set_take_screenshot(display_idx: usize, sid: String, tx: Sender) {

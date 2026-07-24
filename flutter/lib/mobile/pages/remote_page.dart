@@ -1187,7 +1187,8 @@ void showOptions(
       await toolbarCaptureBackend(gFFI);
   List<TRadioMenu<String>> qualityMonitorRadios =
       await toolbarQualityMonitorPosition(gFFI);
-  final qualityMonitorDebugToggle = await toolbarQualityMonitorDebugMode(gFFI);
+  List<TRadioMenu<String>> qualityMonitorDetailsRadios =
+      await toolbarQualityMonitorDetails(gFFI);
   List<TRadioMenu<String>> clipboardRadios =
       await toolbarClipboardDirection(gFFI);
   List<TToggleMenu> cursorToggles = await toolbarCursor(context, id, gFFI);
@@ -1219,7 +1220,10 @@ void showOptions(
             ? qualityMonitorRadios[0].groupValue
             : '')
         .obs;
-    var qualityMonitorDebug = qualityMonitorDebugToggle.value.obs;
+    var qualityMonitorDetails = (qualityMonitorDetailsRadios.isNotEmpty
+            ? qualityMonitorDetailsRadios[0].groupValue
+            : '')
+        .obs;
     var clipboard =
         (clipboardRadios.isNotEmpty ? clipboardRadios[0].groupValue : '').obs;
     final radios = [
@@ -1259,7 +1263,7 @@ void showOptions(
             e.onChanged != null
                 ? (v) {
                     e.onChanged?.call(v);
-                    if (v != null) codec.value = v;
+                    if (v != null && e.enabled) codec.value = v;
                   }
                 : null)),
       if (codecRadios.isNotEmpty) const Divider(color: MyTheme.border),
@@ -1267,9 +1271,8 @@ void showOptions(
         Align(
           alignment: Alignment.centerLeft,
           child: Padding(
-            padding: const EdgeInsets.only(top: 4, bottom: 2),
-            child: Text(translate('Capture'),
-                style: const TextStyle(fontWeight: FontWeight.bold)),
+            padding: const EdgeInsets.only(left: 16, top: 4, bottom: 4),
+            child: Text(translate('Capture')),
           ),
         ),
       for (var e in captureBackendRadios)
@@ -1283,14 +1286,14 @@ void showOptions(
                     if (v != null) captureBackend.value = v;
                   }
                 : null)),
-      if (captureBackendRadios.isNotEmpty) const Divider(color: MyTheme.border),
+      if (captureBackendRadios.isNotEmpty)
+        const Divider(color: MyTheme.border),
       if (qualityMonitorRadios.isNotEmpty)
         Align(
           alignment: Alignment.centerLeft,
           child: Padding(
-            padding: const EdgeInsets.only(top: 4, bottom: 2),
-            child: Text(translate('Quality monitor'),
-                style: const TextStyle(fontWeight: FontWeight.bold)),
+            padding: const EdgeInsets.only(left: 16, top: 4, bottom: 4),
+            child: Text(translate('Quality monitor')),
           ),
         ),
       for (var e in qualityMonitorRadios)
@@ -1304,34 +1307,30 @@ void showOptions(
                     if (v != null) qualityMonitor.value = v;
                   }
                 : null)),
-      if (qualityMonitorRadios.isNotEmpty)
-        Obx(() => CheckboxListTile(
-            contentPadding: EdgeInsets.zero,
-            visualDensity: VisualDensity.compact,
-            side: BorderSide(
-                color:
-                    Theme.of(context).colorScheme.onSurface.withOpacity(0.72),
-                width: 1.5),
-            activeColor: Theme.of(context).colorScheme.primary,
-            checkColor: Theme.of(context).colorScheme.onPrimary,
-            value: qualityMonitorDebug.value,
-            onChanged: qualityMonitorDebugToggle.onChanged != null
-                ? (v) {
-                    qualityMonitorDebugToggle.onChanged?.call(v);
-                    if (v != null) qualityMonitorDebug.value = v;
-                  }
-                : null,
-            title: qualityMonitorDebugToggle.child)),
-      if (qualityMonitorRadios.isNotEmpty) const Divider(color: MyTheme.border),
-      if (clipboardRadios.isNotEmpty)
+      if (qualityMonitorDetailsRadios.isNotEmpty)
+        const Divider(color: MyTheme.border),
+      if (qualityMonitorDetailsRadios.isNotEmpty)
         Align(
           alignment: Alignment.centerLeft,
           child: Padding(
-            padding: const EdgeInsets.only(top: 4, bottom: 2),
-            child: Text(translate('Clipboard direction'),
-                style: const TextStyle(fontWeight: FontWeight.bold)),
+            padding: const EdgeInsets.only(left: 16, top: 4, bottom: 4),
+            child: Text(translate('Quality monitor details')),
           ),
         ),
+      for (var e in qualityMonitorDetailsRadios)
+        Obx(() => getRadio<String>(
+            e.child,
+            e.value,
+            qualityMonitorDetails.value,
+            e.onChanged != null
+                ? (v) {
+                    e.onChanged?.call(v);
+                    if (v != null) qualityMonitorDetails.value = v;
+                  }
+                : null)),
+      if (qualityMonitorRadios.isNotEmpty ||
+          qualityMonitorDetailsRadios.isNotEmpty)
+        const Divider(color: MyTheme.border),
       for (var e in clipboardRadios)
         Obx(() => getRadio<String>(
             e.child,

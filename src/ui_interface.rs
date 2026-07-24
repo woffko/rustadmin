@@ -527,13 +527,16 @@ pub fn set_option(key: String, value: String) {
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let mut options = OPTIONS.lock().unwrap();
-        if value.is_empty() {
-            options.remove(&key);
-        } else {
-            options.insert(key.clone(), value.clone());
-        }
-        ipc::set_options(options.clone()).ok();
+        let options = {
+            let mut options = OPTIONS.lock().unwrap();
+            if value.is_empty() {
+                options.remove(&key);
+            } else {
+                options.insert(key.clone(), value.clone());
+            }
+            options.clone()
+        };
+        ipc::set_options(options).ok();
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
@@ -1168,7 +1171,7 @@ pub fn get_api_server() -> String {
 #[inline]
 pub fn has_hwcodec() -> bool {
     // Has real hardware codec using gpu
-    (cfg!(feature = "hwcodec") && cfg!(not(target_os = "ios"))) || cfg!(feature = "mediacodec")
+    cfg!(feature = "hwcodec") || cfg!(feature = "mediacodec")
 }
 
 #[inline]
@@ -1178,11 +1181,15 @@ pub fn has_vram() -> bool {
 
 #[cfg(feature = "flutter")]
 #[inline]
-pub fn supported_hwdecodings() -> (bool, bool) {
+pub fn supported_hwdecodings() -> (bool, bool, bool) {
     let decoding =
         scrap::codec::Decoder::supported_decodings(None, use_texture_render(), None, &vec![]);
     #[allow(unused_mut)]
-    let (mut h264, mut h265) = (decoding.ability_h264 > 0, decoding.ability_h265 > 0);
+    let (av1, mut h264, mut h265) = (
+        decoding.ability_av1 > 0,
+        decoding.ability_h264 > 0,
+        decoding.ability_h265 > 0,
+    );
     #[cfg(feature = "vram")]
     {
         // supported_decodings check runtime luid
@@ -1194,7 +1201,7 @@ pub fn supported_hwdecodings() -> (bool, bool) {
             h265 = true;
         }
     }
-    (h264, h265)
+    (av1, h264, h265)
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1712,6 +1719,9 @@ pub fn check_hwcodec() {
             scrap::hwcodec::recheck_hwcodec();
         }
     }
+    #[cfg(feature = "hwcodec")]
+    #[cfg(target_os = "ios")]
+    scrap::hwcodec::recheck_hwcodec();
 }
 
 #[cfg(feature = "flutter")]

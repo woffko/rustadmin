@@ -68,7 +68,6 @@ rpassword = "7.2"
 num_cpus = "1.15"
 libc = "0.2"
 bytes = { version = "1.4", features = ["serde"] }
-default-net = "0.14"
 wol-rs = "1.0"
 flutter_rust_bridge = { version = "=1.80.1", features = ["uuid"], optional = true }
 errno = "0.3"
@@ -79,14 +78,20 @@ hex = "0.4"
 chrono = "0.4"
 cidr-utils = "0.5"
 fon = "0.6"
-zip = "0.6"
 shutdown_hooks = "0.1"
 totp-rs = { version = "5.4", default-features = false, features = ["gen_secret", "otpauth"] }
 stunclient = "0.4"
 kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys"}
 reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+default-net = "0.14"
+zip = "0.6"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+zip = { version = "0.6", default-features = false, features = ["aes-crypto", "deflate", "time", "zstd"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "ios")))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
 cpal = { git = "https://github.com/rustdesk-org/cpal", branch = "osx-screencapturekit" }
 ringbuf = "0.3"
@@ -138,6 +143,9 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_UI_Shell",
 ] }
 winreg = "0.11"
@@ -232,7 +240,7 @@ winapi = { version = "0.3", features = [ "winnt", "pdh", "synchapi" ] }
 [build-dependencies]
 bindgen = { version = "=0.69.4", default-features = false, features = ["runtime"] }
 cc = "1.0"
-hbb_common = { path = "../hbb_common" }
+chrono = "0.4"
 os-version = "0.2"
 
 [dev-dependencies]

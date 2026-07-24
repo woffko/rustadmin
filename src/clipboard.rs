@@ -28,6 +28,8 @@ const CLIPBOARD_DEBUG_CATEGORY: &str = "clipboard";
 const CLIPBOARD_DEBUG_MAX_EVENTS: usize = 64;
 #[cfg(not(target_os = "android"))]
 const CLIPBOARD_DEBUG_MAX_LINE: usize = 1200;
+#[cfg(not(target_os = "android"))]
+const REMOTE_CLIPBOARD_ECHO_SUPPRESS_DUR: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClipboardDirectionPolicy {
@@ -226,6 +228,7 @@ const WINDOWS_TEXT_OLE_WRAPPER_FORMATS: &[&str] = &["DataObject", "Ole Private D
 lazy_static::lazy_static! {
     static ref ARBOARD_MTX: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
     static ref CLIPBOARD_TIMING: Arc<Mutex<ClipboardTiming>> = Arc::new(Mutex::new(ClipboardTiming::default()));
+    static ref REMOTE_CLIPBOARD_APPLY_GUARD: Arc<Mutex<RemoteClipboardApplyGuard>> = Arc::new(Mutex::new(RemoteClipboardApplyGuard::default()));
     // cache the clipboard msg
     static ref LAST_MULTI_CLIPBOARDS: Arc<Mutex<MultiClipboards>> = Arc::new(Mutex::new(MultiClipboards::new()));
     // For updating in server and getting content in cm.
@@ -247,6 +250,42 @@ struct ClipboardTiming {
     last_local_change_at: Option<Instant>,
     last_remote_apply_at: Option<Instant>,
     last_external_opaque_signature: Option<String>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct RemoteClipboardApplyGuard {
+    last: Option<RemoteClipboardApplyRecord>,
+}
+
+#[cfg(not(target_os = "android"))]
+struct RemoteClipboardApplyRecord {
+    side: ClipboardSide,
+    signature: Vec<u8>,
+    observed_at: Instant,
+}
+
+#[cfg(not(target_os = "android"))]
+impl RemoteClipboardApplyGuard {
+    fn should_skip(&mut self, side: ClipboardSide, signature: Vec<u8>, now: Instant) -> bool {
+        if let Some(last) = &mut self.last {
+            if last.side == side
+                && last.signature == signature
+                && now.saturating_duration_since(last.observed_at)
+                    < REMOTE_CLIPBOARD_ECHO_SUPPRESS_DUR
+            {
+                last.observed_at = now;
+                return true;
+            }
+        }
+
+        self.last = Some(RemoteClipboardApplyRecord {
+            side,
+            signature,
+            observed_at: now,
+        });
+        false
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -466,6 +505,92 @@ fn remove_remote_owner_markers(data: &mut Vec<ClipboardData>) {
 }
 
 #[cfg(not(target_os = "android"))]
+fn append_signature_bytes(signature: &mut Vec<u8>, bytes: &[u8]) {
+    signature.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    signature.extend_from_slice(bytes);
+}
+
+#[cfg(not(target_os = "android"))]
+fn append_signature_str(signature: &mut Vec<u8>, value: &str) {
+    append_signature_bytes(signature, value.as_bytes());
+}
+
+#[cfg(not(target_os = "android"))]
+fn remote_clipboard_payload_signature(data: &[ClipboardData]) -> Vec<u8> {
+    let mut signature = Vec::new();
+    for item in data {
+        match item {
+            ClipboardData::Unsupported => signature.push(0),
+            ClipboardData::Text(text) => {
+                signature.push(1);
+                append_signature_str(&mut signature, text);
+            }
+            ClipboardData::Html(html) => {
+                signature.push(2);
+                append_signature_str(&mut signature, html);
+            }
+            ClipboardData::Rtf(rtf) => {
+                signature.push(3);
+                append_signature_str(&mut signature, rtf);
+            }
+            ClipboardData::Image(arboard::ImageData::Rgba(image)) => {
+                signature.push(4);
+                signature.extend_from_slice(&(image.width as u64).to_le_bytes());
+                signature.extend_from_slice(&(image.height as u64).to_le_bytes());
+                append_signature_bytes(&mut signature, image.bytes.as_ref());
+            }
+            ClipboardData::Image(arboard::ImageData::Png(png)) => {
+                signature.push(5);
+                append_signature_bytes(&mut signature, png.as_ref());
+            }
+            ClipboardData::Image(arboard::ImageData::Svg(svg)) => {
+                signature.push(6);
+                append_signature_str(&mut signature, svg);
+            }
+            ClipboardData::Special((name, bytes)) => {
+                if name.eq_ignore_ascii_case(RUSTDESK_CLIPBOARD_OWNER_FORMAT) {
+                    continue;
+                }
+                signature.push(7);
+                append_signature_str(&mut signature, name);
+                append_signature_bytes(&mut signature, bytes);
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            ClipboardData::FileUrl(urls) => {
+                signature.push(8);
+                signature.extend_from_slice(&(urls.len() as u64).to_le_bytes());
+                for url in urls {
+                    append_signature_str(&mut signature, url);
+                }
+            }
+            ClipboardData::None => signature.push(9),
+        }
+    }
+    signature
+}
+
+#[cfg(not(target_os = "android"))]
+fn should_skip_repeated_remote_clipboard(data: &[ClipboardData], side: ClipboardSide) -> bool {
+    let signature = remote_clipboard_payload_signature(data);
+    let skip =
+        REMOTE_CLIPBOARD_APPLY_GUARD
+            .lock()
+            .unwrap()
+            .should_skip(side, signature, Instant::now());
+    if skip {
+        log::debug!(
+            "Skip applying duplicate remote {} clipboard because it repeated within {:?}",
+            side,
+            REMOTE_CLIPBOARD_ECHO_SUPPRESS_DUR
+        );
+        emit_clipboard_debug(format!(
+            "skip-remote-apply side={side} reason=duplicate-remote-payload"
+        ));
+    }
+    skip
+}
+
+#[cfg(not(target_os = "android"))]
 fn should_skip_remote_clipboard_update(
     data: &[ClipboardData],
     side: ClipboardSide,
@@ -579,16 +704,15 @@ fn windows_external_opaque_signature_from_format_names(
         .filter(|name| is_windows_opaque_format_name(name))
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let has_text = names
+        .iter()
+        .any(|name| is_windows_text_fallback_format_name(name));
     if opaque_formats.is_empty() {
         return None;
     }
     opaque_formats.sort_unstable();
     opaque_formats.dedup();
-    if names
-        .iter()
-        .any(|name| is_windows_text_fallback_format_name(name))
-        && windows_opaque_formats_are_only_text_ole_wrappers(&opaque_formats)
-    {
+    if has_text && windows_opaque_formats_are_only_text_ole_wrappers(&opaque_formats) {
         return None;
     }
     Some(format!("windows:{sequence}:{}", opaque_formats.join("|")))
@@ -634,12 +758,23 @@ fn contains_external_preserved_native_format_name(names: &[String]) -> bool {
 
 #[cfg(any(test, target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn external_preserved_native_formats_signature(names: &[String]) -> Option<String> {
+    external_preserved_native_formats_signature_with_text_classifier(names, |_| false)
+}
+
+#[cfg(any(test, target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn external_preserved_native_formats_signature_with_text_classifier<F>(
+    names: &[String],
+    is_plain_text: F,
+) -> Option<String>
+where
+    F: Fn(&str) -> bool,
+{
     if contains_rustdesk_owner_format_name(names) {
         return None;
     }
     let mut preserved = names
         .iter()
-        .filter(|name| should_preserve_native_format_name(name))
+        .filter(|name| should_preserve_native_format_name(name) && !is_plain_text(name))
         .map(String::as_str)
         .collect::<Vec<_>>();
     if preserved.is_empty() {
@@ -950,8 +1085,10 @@ mod platform_clipboard {
             .unwrap_or(true)
     }
 
-    fn external_opaque_native_signature() -> ResultType<Option<String>> {
+    fn clipboard_format_snapshot() -> ResultType<(u32, bool, Vec<String>, bool)> {
         let _clipboard = open_clipboard()?;
+        // Safety: The call has no parameters and only reads the OS clipboard generation.
+        let sequence_before = unsafe { GetClipboardSequenceNumber() };
         let owner_format = registered_id(super::RUSTDESK_CLIPBOARD_OWNER_FORMAT);
         let mut has_owner = false;
         let mut format_names = Vec::new();
@@ -969,11 +1106,35 @@ mod platform_clipboard {
             format_names.push(name);
         }
         // Safety: The call has no parameters and only reads the OS clipboard generation.
-        let sequence = unsafe { GetClipboardSequenceNumber() };
-        Ok(super::windows_external_opaque_signature_from_format_names(
-            sequence,
+        let sequence_after = unsafe { GetClipboardSequenceNumber() };
+        Ok((
+            sequence_after,
             has_owner,
-            &format_names,
+            format_names,
+            sequence_before == sequence_after,
+        ))
+    }
+
+    fn external_opaque_native_signature() -> ResultType<Option<String>> {
+        let mut snapshot = clipboard_format_snapshot()?;
+        for retry in 1..super::CLIPBOARD_GET_MAX_RETRY {
+            if snapshot.3 && (snapshot.1 || !snapshot.2.is_empty()) {
+                break;
+            }
+            log::debug!(
+                "Clipboard format list is transitional or changed during enumeration, retrying ({retry}/{})",
+                super::CLIPBOARD_GET_MAX_RETRY - 1
+            );
+            std::thread::sleep(super::CLIPBOARD_GET_RETRY_INTERVAL_DUR);
+            snapshot = clipboard_format_snapshot()?;
+        }
+        if !snapshot.3 {
+            return Ok(Some(format!("windows:{}:unstable-format-list", snapshot.0)));
+        }
+        Ok(super::windows_external_opaque_signature_from_format_names(
+            snapshot.0,
+            snapshot.1,
+            &snapshot.2,
         ))
     }
 
@@ -1041,91 +1202,114 @@ mod platform_clipboard {
 
 #[cfg(target_os = "macos")]
 mod platform_clipboard {
-    use cocoa::{
-        appkit::{NSPasteboard, NSPasteboardItem},
-        base::{id, nil},
-        foundation::{NSArray, NSString},
-    };
     use hbb_common::{bail, log, ResultType};
-    use std::ffi::CStr;
+    use std::{
+        ffi::{CStr, CString},
+        os::raw::{c_char, c_longlong},
+    };
 
-    unsafe fn nsstring_to_string(value: id) -> Option<String> {
-        if value == nil {
-            return None;
-        }
-        // Safety: Cocoa returns a null-terminated UTF-8 view for NSString.
-        let bytes = unsafe { NSString::UTF8String(value) };
-        if bytes.is_null() {
-            None
-        } else {
-            // Safety: bytes is valid for the lifetime of the Objective-C object.
-            Some(
-                unsafe { CStr::from_ptr(bytes) }
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        }
-    }
-
-    unsafe fn append_type_names(types: id, names: &mut Vec<String>) {
-        if types == nil {
-            return;
-        }
-        // Safety: types is an NSArray returned by NSPasteboard APIs.
-        let count = unsafe { NSArray::count(types) };
-        names.reserve(count as usize);
-        for index in 0..count {
-            // Safety: index is below count and NSArray elements are NSString instances.
-            let value = unsafe { NSArray::objectAtIndex(types, index) };
-            if let Some(name) = unsafe { nsstring_to_string(value) } {
-                names.push(name);
-            }
-        }
+    extern "C" {
+        fn MacPasteboardCopyTypeNames() -> *mut c_char;
+        fn MacFreeCString(value: *mut c_char);
+        fn MacPasteboardChangeCount(change_count: *mut c_longlong) -> bool;
+        fn MacPasteboardTypeConformsToPlainText(value: *const c_char) -> bool;
+        fn MacPasteboardCopyPlainText() -> *mut c_char;
     }
 
     fn pasteboard_type_names() -> ResultType<Vec<String>> {
-        let mut names = Vec::new();
         unsafe {
-            // Safety: generalPasteboard is an AppKit singleton and does not require ownership.
-            let pasteboard = NSPasteboard::generalPasteboard(nil);
-            if pasteboard == nil {
-                bail!("failed to get macOS general pasteboard");
+            // Safety: the Objective-C++ wrapper catches NSPasteboard exceptions
+            // and returns a malloc-allocated UTF-8 string that must be freed by
+            // MacFreeCString.
+            let names = MacPasteboardCopyTypeNames();
+            if names.is_null() {
+                bail!("failed to inspect macOS pasteboard type names");
             }
-            // Prefer item-local types because vector editors often attach native
-            // formats to pasteboard items while still publishing plain fallbacks.
-            let items = NSPasteboard::pasteboardItems(pasteboard);
-            if items != nil {
-                let count = NSArray::count(items);
-                for index in 0..count {
-                    let item = NSArray::objectAtIndex(items, index);
-                    let types = NSPasteboardItem::types(item);
-                    append_type_names(types, &mut names);
-                }
-            }
-            if names.is_empty() {
-                append_type_names(NSPasteboard::types(pasteboard), &mut names);
-            }
+            let text = CStr::from_ptr(names).to_string_lossy().into_owned();
+            MacFreeCString(names);
+            Ok(text.lines().map(str::to_owned).collect())
         }
-        Ok(names)
     }
 
     fn pasteboard_change_count() -> ResultType<isize> {
         unsafe {
-            // Safety: generalPasteboard is an AppKit singleton and does not require ownership.
-            let pasteboard = NSPasteboard::generalPasteboard(nil);
-            if pasteboard == nil {
-                bail!("failed to get macOS general pasteboard");
+            // Safety: the Objective-C++ wrapper catches NSPasteboard exceptions
+            // and writes to the provided pointer only when it returns true.
+            let mut change_count = 0;
+            if !MacPasteboardChangeCount(&mut change_count) {
+                bail!("failed to inspect macOS pasteboard change count");
             }
-            // Safety: changeCount only reads the pasteboard generation counter.
-            Ok(NSPasteboard::changeCount(pasteboard) as isize)
+            Ok(change_count as isize)
+        }
+    }
+
+    fn type_conforms_to_plain_text(name: &str) -> bool {
+        let Ok(name) = CString::new(name) else {
+            return false;
+        };
+        unsafe {
+            // Safety: name is a valid null-terminated UTF-8 string and the
+            // Objective-C++ wrapper catches AppKit exceptions.
+            MacPasteboardTypeConformsToPlainText(name.as_ptr())
+        }
+    }
+
+    fn copy_plain_text() -> Option<String> {
+        unsafe {
+            // Safety: the wrapper returns a malloc-allocated UTF-8 string and
+            // MacFreeCString accepts null as well as returned pointers.
+            let raw = MacPasteboardCopyPlainText();
+            if raw.is_null() {
+                return None;
+            }
+            let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
+            MacFreeCString(raw);
+            Some(text)
         }
     }
 
     fn external_opaque_native_signature() -> ResultType<Option<String>> {
-        let names = pasteboard_type_names()?;
-        let change_count = pasteboard_change_count()?;
-        Ok(super::external_preserved_native_formats_signature(&names)
-            .map(|signature| format!("macos:{change_count}:{signature}")))
+        let mut last_change_count = 0;
+        for retry in 0..super::CLIPBOARD_GET_MAX_RETRY {
+            let before = pasteboard_change_count()?;
+            let names = pasteboard_type_names()?;
+            let after = pasteboard_change_count()?;
+            last_change_count = after;
+            if before == after {
+                return Ok(
+                    super::external_preserved_native_formats_signature_with_text_classifier(
+                        &names,
+                        type_conforms_to_plain_text,
+                    )
+                    .map(|signature| format!("macos:{after}:{signature}")),
+                );
+            }
+            log::debug!(
+                "macOS pasteboard changed during format inspection, retrying ({}/{})",
+                retry + 1,
+                super::CLIPBOARD_GET_MAX_RETRY
+            );
+            std::thread::sleep(super::CLIPBOARD_GET_RETRY_INTERVAL_DUR);
+        }
+        Ok(Some(format!(
+            "macos:{last_change_count}:unstable-format-list"
+        )))
+    }
+
+    pub fn plain_text_fallback() -> Option<String> {
+        let before = pasteboard_change_count().ok()?;
+        let names = pasteboard_type_names().ok()?;
+        if pasteboard_change_count().ok()? != before {
+            return None;
+        }
+        if super::contains_rustdesk_owner_format_name(&names)
+            || !names.iter().any(|name| type_conforms_to_plain_text(name))
+        {
+            return None;
+        }
+        let text = copy_plain_text()?;
+        let after = pasteboard_change_count().ok()?;
+        (before == after).then_some(text)
     }
 
     pub fn debug_dump_clipboard_formats(reason: &str) {
@@ -1556,6 +1740,9 @@ fn do_update_clipboard_(
         if to_update_data.is_empty() {
             return;
         }
+        if should_skip_repeated_remote_clipboard(&to_update_data, side) {
+            return;
+        }
         to_update_data.push(ClipboardData::Special((
             RUSTDESK_CLIPBOARD_OWNER_FORMAT.to_owned(),
             side.get_owner_data(),
@@ -1694,6 +1881,25 @@ impl ClipboardContext {
         }
 
         let data = self.get_formats_filter(SUPPORTED_FORMATS, side, force)?;
+        #[cfg(target_os = "macos")]
+        let data = {
+            let mut data = data;
+            if !data
+                .iter()
+                .any(|item| matches!(item, ClipboardData::Text(_)))
+            {
+                if let Some(text) = platform_clipboard::plain_text_fallback() {
+                    if !text.is_empty() {
+                        let bytes = text.len();
+                        data.push(ClipboardData::Text(text));
+                        emit_clipboard_debug(format!(
+                            "plain-text-fallback side={side} platform=macos bytes={bytes}"
+                        ));
+                    }
+                }
+            }
+            data
+        };
         debug_clipboard_data("get-supported-formats", side, &data);
         // We have a separate service named `file-clipboard` to handle file copy-paste.
         // We need to read the file urls because file copy may set the other clipboard formats such as text.
@@ -2046,6 +2252,69 @@ mod clipboard_timing_tests {
     }
 
     #[test]
+    fn remote_payload_signature_ignores_owner_marker() {
+        let without_marker = vec![ClipboardData::Text("remote text".to_owned())];
+        let with_marker = vec![
+            ClipboardData::Text("remote text".to_owned()),
+            ClipboardData::Special((RUSTDESK_CLIPBOARD_OWNER_FORMAT.to_owned(), vec![0b11])),
+        ];
+
+        assert_eq!(
+            remote_clipboard_payload_signature(&without_marker),
+            remote_clipboard_payload_signature(&with_marker)
+        );
+    }
+
+    #[test]
+    fn repeated_remote_payload_is_suppressed_inside_echo_window() {
+        let start = Instant::now();
+        let mut guard = RemoteClipboardApplyGuard::default();
+        let data = vec![ClipboardData::Text(
+            "https://github.com/example/repo".to_owned(),
+        )];
+        let signature = remote_clipboard_payload_signature(&data);
+
+        assert!(!guard.should_skip(ClipboardSide::Client, signature.clone(), start));
+        assert!(guard.should_skip(
+            ClipboardSide::Client,
+            signature,
+            start + REMOTE_CLIPBOARD_ECHO_SUPPRESS_DUR / 2
+        ));
+    }
+
+    #[test]
+    fn repeated_remote_payload_is_allowed_after_quiet_window() {
+        let start = Instant::now();
+        let mut guard = RemoteClipboardApplyGuard::default();
+        let data = vec![ClipboardData::Text(
+            "https://github.com/example/repo".to_owned(),
+        )];
+        let signature = remote_clipboard_payload_signature(&data);
+
+        assert!(!guard.should_skip(ClipboardSide::Client, signature.clone(), start));
+        assert!(!guard.should_skip(
+            ClipboardSide::Client,
+            signature,
+            start + REMOTE_CLIPBOARD_ECHO_SUPPRESS_DUR + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn repeated_remote_payload_is_side_specific() {
+        let start = Instant::now();
+        let mut guard = RemoteClipboardApplyGuard::default();
+        let data = vec![ClipboardData::Text("shared text".to_owned())];
+        let signature = remote_clipboard_payload_signature(&data);
+
+        assert!(!guard.should_skip(ClipboardSide::Client, signature.clone(), start));
+        assert!(!guard.should_skip(
+            ClipboardSide::Host,
+            signature,
+            start + REMOTE_CLIPBOARD_ECHO_SUPPRESS_DUR / 2
+        ));
+    }
+
+    #[test]
     fn remote_unsupported_format_is_not_applied() {
         let data = vec![ClipboardData::Unsupported];
 
@@ -2325,6 +2594,43 @@ mod clipboard_timing_tests {
     }
 
     #[test]
+    fn windows_terminal_canonical_text_formats_are_not_opaque() {
+        let names = vec![
+            "CF_UNICODETEXT".to_owned(),
+            "CF_LOCALE".to_owned(),
+            "HTML Format".to_owned(),
+            "Rich Text Format".to_owned(),
+        ];
+
+        assert!(windows_external_opaque_signature_from_format_names(11, false, &names).is_none());
+    }
+
+    #[test]
+    fn windows_unresolved_format_without_text_remains_opaque() {
+        let names = vec!["format#50123".to_owned()];
+
+        assert_eq!(
+            windows_external_opaque_signature_from_format_names(12, false, &names).as_deref(),
+            Some("windows:12:format#50123")
+        );
+    }
+
+    #[test]
+    fn windows_known_native_format_still_wins_over_terminal_text_formats() {
+        let names = vec![
+            "CF_UNICODETEXT".to_owned(),
+            "HTML Format".to_owned(),
+            "Rich Text Format".to_owned(),
+            "Adobe Illustrator Document".to_owned(),
+        ];
+
+        assert_eq!(
+            windows_external_opaque_signature_from_format_names(13, false, &names).as_deref(),
+            Some("windows:13:Adobe Illustrator Document")
+        );
+    }
+
+    #[test]
     fn windows_text_ole_wrappers_without_text_fallback_are_opaque() {
         let names = vec!["DataObject".to_owned(), "Ole Private Data".to_owned()];
 
@@ -2369,6 +2675,33 @@ mod clipboard_timing_tests {
         assert_eq!(
             external_preserved_native_formats_signature(&names).as_deref(),
             Some("application/pdf|com.adobe.illustrator.aicb")
+        );
+    }
+
+    #[test]
+    fn macos_plain_text_uti_alias_does_not_look_native() {
+        let names = vec!["public.utf16-external-plain-text".to_owned()];
+
+        assert!(
+            external_preserved_native_formats_signature_with_text_classifier(&names, |name| name
+                == "public.utf16-external-plain-text")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn macos_native_format_still_wins_over_plain_text_alias() {
+        let names = vec![
+            "public.utf16-external-plain-text".to_owned(),
+            "public.pdf".to_owned(),
+        ];
+
+        assert_eq!(
+            external_preserved_native_formats_signature_with_text_classifier(&names, |name| {
+                name == "public.utf16-external-plain-text"
+            })
+            .as_deref(),
+            Some("public.pdf")
         );
     }
 

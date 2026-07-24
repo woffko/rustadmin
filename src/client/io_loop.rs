@@ -159,7 +159,6 @@ pub struct Remote<T: InvokeUiSession> {
     last_record_state: bool,
     sent_close_reason: bool,
     last_fps_control_summary_log: Option<Instant>,
-    video_recv_count: usize,
 }
 
 #[derive(Default)]
@@ -218,7 +217,6 @@ impl<T: InvokeUiSession> Remote<T> {
             last_record_state: false,
             sent_close_reason: false,
             last_fps_control_summary_log: None,
-            video_recv_count: 0,
         }
     }
 
@@ -339,7 +337,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                             self.handler.update_received(true);
                                         }
                                         self.data_count.fetch_add(bytes.len(), Ordering::Relaxed);
-                                        if !self.handle_msg_from_peer(bytes, &mut peer, direct).await {
+                                        if !self.handle_msg_from_peer(bytes, &mut peer).await {
                                             log::info!(
                                                 "diag client peer handler requested exit: id={}, is_connected={}, video_packet_seen={}, video_format={:?}",
                                                 self.handler.get_id(),
@@ -459,6 +457,81 @@ impl<T: InvokeUiSession> Remote<T> {
                                 // Correcting the inaccuracy of status_timer
                                 (k.clone(), (*v.frame_count.read().unwrap() as i32) * 1000 / elapsed as i32)
                             }).collect::<HashMap<usize, i32>>();
+                            let decode_fps = self
+                                .video_threads
+                                .iter()
+                                .filter_map(|(display, thread)| {
+                                    thread
+                                        .decode_fps
+                                        .read()
+                                        .unwrap()
+                                        .map(|decode_fps| (*display, decode_fps))
+                                })
+                                .collect::<HashMap<usize, usize>>();
+                            let video_queue = self
+                                .video_threads
+                                .iter()
+                                .map(|(display, thread)| {
+                                    (*display, thread.video_queue.read().unwrap().len())
+                                })
+                                .collect::<HashMap<usize, usize>>();
+                            let frame_resolution = self
+                                .video_threads
+                                .iter()
+                                .filter_map(|(display, thread)| {
+                                    thread
+                                        .frame_resolution
+                                        .read()
+                                        .unwrap()
+                                        .map(|(w, h)| (*display, format!("{w}x{h}")))
+                                })
+                                .collect::<HashMap<usize, String>>();
+                            let feedback_snapshots = self
+                                .video_threads
+                                .iter()
+                                .map(|(display, thread)| {
+                                    (*display, thread.video_feedback.lock().unwrap().snapshot())
+                                })
+                                .collect::<HashMap<usize, client::VideoFeedbackSnapshot>>();
+                            let video_progress = feedback_snapshots
+                                .iter()
+                                .map(|(display, snapshot)| {
+                                    (
+                                        *display,
+                                        format!(
+                                            "{}/{}/{}",
+                                            snapshot.received_frame_id,
+                                            snapshot.decoded_frame_id,
+                                            snapshot.render_submitted_frame_id
+                                        ),
+                                    )
+                                })
+                                .collect::<HashMap<usize, String>>();
+                            let video_dropped = feedback_snapshots
+                                .iter()
+                                .map(|(display, snapshot)| (*display, snapshot.dropped_frames))
+                                .collect::<HashMap<usize, u64>>();
+                            let video_decode_time_us = feedback_snapshots
+                                .iter()
+                                .map(|(display, snapshot)| (*display, snapshot.decode_time_us))
+                                .collect::<HashMap<usize, u32>>();
+                            let video_render_submit_time_us = feedback_snapshots
+                                .iter()
+                                .map(|(display, snapshot)| {
+                                    (*display, snapshot.render_submit_time_us)
+                                })
+                                .collect::<HashMap<usize, u32>>();
+                            let video_feedback_queue = feedback_snapshots
+                                .iter()
+                                .map(|(display, snapshot)| {
+                                    (*display, snapshot.queue_depth_frames)
+                                })
+                                .collect::<HashMap<usize, u32>>();
+                            let decoder = self.video_thread_label(|thread| {
+                                *thread.decoder_backend.read().unwrap()
+                            });
+                            let renderer = self
+                                .video_thread_label(|thread| *thread.renderer.read().unwrap());
                             self.video_threads.iter().for_each(|(_, v)| {
                                 *v.frame_count.write().unwrap() = 0;
                             });
@@ -475,11 +548,33 @@ impl<T: InvokeUiSession> Remote<T> {
                             } else {
                                 Some(self.video_format.clone())
                             };
+                            let lc = self.handler.lc.read().unwrap();
+                            let fixed_fps =
+                                lc.get_option(config::keys::OPTION_CUSTOM_FPS_MODE) == "fixed";
+                            let fps_mode = if fixed_fps { "fixed" } else { "adaptive" }.to_owned();
+                            let auto_fps = if fixed_fps { None } else { lc.last_auto_fps };
+                            drop(lc);
                             self.handler.update_quality_status(QualityStatus {
                                 speed: Some(speed),
                                 fps,
                                 chroma,
                                 codec_format,
+                                connection_type: Some(stream_type.to_owned()),
+                                decoder,
+                                renderer,
+                                decode_fps,
+                                video_queue,
+                                frame_resolution,
+                                video_threads: Some(self.video_threads.len()),
+                                texture_render: Some(crate::ui_interface::use_texture_render()),
+                                direct: Some(direct),
+                                fps_mode: Some(fps_mode),
+                                auto_fps,
+                                video_progress,
+                                video_dropped,
+                                video_decode_time_us,
+                                video_render_submit_time_us,
+                                video_feedback_queue,
                                 ..Default::default()
                             });
                         }
@@ -1358,13 +1453,6 @@ impl<T: InvokeUiSession> Remote<T> {
             .min()
             .flatten();
         let Some(min_decode_fps) = min_decode_fps else {
-            self.handler.update_quality_status(QualityStatus {
-                fps_mode: Some(if fixed_fps { "fixed" } else { "adaptive" }.to_owned()),
-                direct: Some(direct),
-                queue_len: Some(max_queue_len),
-                auto_fps: last_auto_fps,
-                ..Default::default()
-            });
             if log_summary {
                 let (decode_fps_by_display, queue_len_by_display, inactive_by_display) =
                     self.fps_control_snapshot();
@@ -1385,14 +1473,6 @@ impl<T: InvokeUiSession> Remote<T> {
             return;
         };
         if fixed_fps {
-            self.handler.update_quality_status(QualityStatus {
-                fps_mode: Some("fixed".to_owned()),
-                direct: Some(direct),
-                queue_len: Some(max_queue_len),
-                decode_fps: Some(min_decode_fps),
-                auto_fps: Some(custom_fps as _),
-                ..Default::default()
-            });
             if log_summary {
                 let (decode_fps_by_display, queue_len_by_display, inactive_by_display) =
                     self.fps_control_snapshot();
@@ -1412,16 +1492,13 @@ impl<T: InvokeUiSession> Remote<T> {
                 );
             }
         } else {
-            let mut decode_safe_fps = if direct {
+            let mut limited_fps = if direct {
                 min_decode_fps * 9 / 10 // 30 got 27
             } else {
                 min_decode_fps * 4 / 5 // 30 got 24
             };
-            if decode_safe_fps < 1 {
-                decode_safe_fps = 1;
-            }
-            if decode_safe_fps > custom_fps {
-                decode_safe_fps = custom_fps;
+            if limited_fps > custom_fps {
+                limited_fps = custom_fps;
             }
             let displays = self.video_threads.keys().cloned().collect::<Vec<_>>();
             let mut fps_trending = |display: usize| {
@@ -1429,19 +1506,18 @@ impl<T: InvokeUiSession> Remote<T> {
                 let ctl = &mut thread.fps_control;
                 let len = thread.video_queue.read().unwrap().len();
                 let decode_fps = thread.decode_fps.read().unwrap().clone()?;
-                let last_target_fps = last_auto_fps.unwrap_or(custom_fps as _);
+                let last_auto_fps = last_auto_fps.unwrap_or(custom_fps as _);
                 if ctl.inactive_counter > inactive_threshold {
                     return None;
                 }
-                if len > 1 && last_target_fps > decode_safe_fps
-                    || len > std::cmp::max(1, decode_fps / 2)
+                if len > 1 && last_auto_fps > limited_fps || len > std::cmp::max(1, decode_fps / 2)
                 {
                     ctl.idle_counter = 0;
                     return Some(false);
                 }
                 if len <= 1 {
                     ctl.idle_counter += 1;
-                    if ctl.idle_counter > 3 && last_target_fps < custom_fps as _ {
+                    if ctl.idle_counter > 3 && last_auto_fps + 3 <= limited_fps {
                         return Some(true);
                     }
                 }
@@ -1453,31 +1529,14 @@ impl<T: InvokeUiSession> Remote<T> {
             let trendings: Vec<_> = displays.iter().map(|k| fps_trending(*k)).collect();
             let should_decrease = trendings.iter().any(|v| *v == Some(false));
             let should_increase = !should_decrease && trendings.iter().any(|v| *v == Some(true));
-            let last_target_fps = last_auto_fps.unwrap_or(custom_fps as _);
-            let mut auto_fps = if should_decrease {
-                decode_safe_fps.min(last_target_fps)
-            } else if should_increase {
-                (last_target_fps + 3).min(custom_fps as _)
-            } else {
-                last_target_fps
-            };
-            if last_auto_fps.is_none() && !should_decrease {
-                auto_fps = custom_fps as _;
-            }
-            if should_decrease && max_queue_len > 1 && auto_fps > 1 {
-                auto_fps = (auto_fps * 4 / 5).max(1);
+            // limited_fps to ensure decoding is faster than encoding
+            let mut auto_fps = limited_fps;
+            if should_decrease && limited_fps < max_queue_len {
+                auto_fps = limited_fps / 2;
             }
             if auto_fps < 1 {
                 auto_fps = 1;
             }
-            self.handler.update_quality_status(QualityStatus {
-                fps_mode: Some("adaptive".to_owned()),
-                direct: Some(direct),
-                queue_len: Some(max_queue_len),
-                decode_fps: Some(min_decode_fps),
-                auto_fps: Some(auto_fps),
-                ..Default::default()
-            });
             let should_send_auto_fps =
                 (last_auto_fps.is_none() || should_decrease || should_increase)
                     && Some(auto_fps) != last_auto_fps;
@@ -1486,7 +1545,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.fps_control_snapshot();
                 if log_summary {
                     log::info!(
-                        "diag fps control: id={}, mode=adaptive, direct={}, codec={:?}, custom_fps={}, last_auto_fps={:?}, real_fps={:?}, decode_fps={:?}, min_decode_fps={}, limited_fps={}, auto_fps={}, max_queue_len={}, queue_len={:?}, inactive={:?}, trendings={:?}, decrease={}, increase={}",
+                        "diag fps control: id={}, mode=adaptive, direct={}, codec={:?}, custom_fps={}, last_auto_fps={:?}, real_fps={:?}, decode_fps={:?}, min_decode_fps={}, limited_fps={}, max_queue_len={}, queue_len={:?}, inactive={:?}, trendings={:?}, decrease={}, increase={}",
                         self.handler.get_id(),
                         direct,
                         self.video_format,
@@ -1495,8 +1554,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         real_fps_map,
                         decode_fps_by_display,
                         min_decode_fps,
-                        decode_safe_fps,
-                        auto_fps,
+                        limited_fps,
                         max_queue_len,
                         queue_len_by_display,
                         inactive_by_display,
@@ -1523,7 +1581,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.video_format,
                         custom_fps,
                         min_decode_fps,
-                        decode_safe_fps,
+                        limited_fps,
                         max_queue_len,
                         real_fps_map,
                         decode_fps_by_display,
@@ -1591,6 +1649,29 @@ impl<T: InvokeUiSession> Remote<T> {
         )
     }
 
+    fn video_thread_label<F>(&self, mut get: F) -> Option<String>
+    where
+        F: FnMut(&VideoThread) -> Option<&'static str>,
+    {
+        let mut labels = self
+            .video_threads
+            .iter()
+            .filter_map(|(display, thread)| get(thread).map(|label| (*display, label)))
+            .collect::<Vec<_>>();
+        labels.sort_by_key(|(display, _)| *display);
+        match labels.len() {
+            0 => None,
+            1 => Some(labels[0].1.to_owned()),
+            _ => Some(
+                labels
+                    .iter()
+                    .map(|(display, label)| format!("{display}:{label}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+        }
+    }
+
     fn check_view_camera_support(&self, peer_version: &str, peer_platform: &str) -> bool {
         if self.peer_info.support_view_camera {
             return true;
@@ -1628,42 +1709,20 @@ impl<T: InvokeUiSession> Remote<T> {
         return false;
     }
 
-    async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream, direct: bool) -> bool {
+    async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream) -> bool {
         if let Ok(msg_in) = Message::parse_from_bytes(&data) {
             match msg_in.union {
                 Some(message::Union::VideoFrame(vf)) => {
-                    self.video_recv_count += 1;
-                    let display = vf.display as usize;
-                    let queue_len_before_enqueue = self
-                        .video_threads
-                        .get(&display)
-                        .map(|thread| thread.video_queue.read().unwrap().len())
-                        .unwrap_or_default();
-                    let format = CodecFormat::from(&vf);
-                    let (payload_bytes, frame_count, has_keyframe) =
-                        scrap::codec::video_frame_payload_stats(&vf).unwrap_or((0, 0, false));
-                    let should_log_frame = self.video_recv_count <= 5
-                        || self.video_recv_count % 30 == 0
-                        || has_keyframe;
-                    if should_log_frame {
-                        log::info!(
-                            "diag video frame received: id={}, display={}, direct={}, codec={:?}, payload_bytes={}, encoded_frames={}, keyframe={}, queue_len_before_enqueue={}, packet_count={}",
-                            self.handler.get_id(),
-                            display,
-                            direct,
-                            format,
-                            payload_bytes,
-                            frame_count,
-                            has_keyframe,
-                            queue_len_before_enqueue,
-                            self.video_recv_count
-                        );
-                    }
                     if !self.first_frame {
+                        let (payload_bytes, frame_count, has_keyframe) =
+                            scrap::codec::video_frame_payload_stats(&vf).unwrap_or((0, 0, false));
                         log::info!(
-                            "diag first video frame received from stream: display={}, format={:?}, payload_bytes={}, frame_count={}, keyframe={}",
+                            "diag first video frame received from stream: display={}, stream_id={}, frame_id={}, capture_ms={}, format={:?}, payload_bytes={}, frame_count={}, keyframe={}",
                             vf.display,
-                            format,
+                            vf.stream_id,
+                            vf.frame_id,
+                            vf.capture_time_ms,
+                            CodecFormat::from(&vf),
                             payload_bytes,
                             frame_count,
                             has_keyframe
@@ -1674,14 +1733,17 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.send_toggle_virtual_display_msg(peer).await;
                         self.send_toggle_privacy_mode_msg(peer).await;
                     }
-                    self.video_format = format;
+                    self.video_format = CodecFormat::from(&vf);
 
+                    let display = vf.display as usize;
                     if !self.video_threads.contains_key(&display) {
                         self.new_video_thread(display);
                     }
                     let Some(thread) = self.video_threads.get_mut(&display) else {
                         return true;
                     };
+                    let new_feedback_stream =
+                        thread.video_feedback.lock().unwrap().record_received(&vf);
                     if Self::contains_key_frame(&vf) {
                         thread
                             .video_sender
@@ -1691,11 +1753,22 @@ impl<T: InvokeUiSession> Remote<T> {
                         let video_queue = thread.video_queue.read().unwrap();
                         if video_queue.force_push(vf).is_some() {
                             drop(video_queue);
+                            thread.video_feedback.lock().unwrap().record_drop();
                             self.handler.refresh_video(display as _);
                         } else {
                             thread.video_sender.send(MediaData::VideoQueue).ok();
                         }
                     }
+                    thread
+                        .video_feedback
+                        .lock()
+                        .unwrap()
+                        .record_queue_depth(thread.video_queue.read().unwrap().len());
+                    client::send_video_feedback(
+                        &self.handler,
+                        &thread.video_feedback,
+                        new_feedback_stream,
+                    );
                 }
                 Some(message::Union::Hash(hash)) => {
                     self.handler
@@ -2138,7 +2211,10 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.handler.new_message(c.text);
                     }
                     Some(misc::Union::DebugEvent(event)) => {
+                        #[cfg(not(target_os = "ios"))]
                         crate::clipboard::log_remote_debug_event(event);
+                        #[cfg(target_os = "ios")]
+                        let _ = event;
                     }
                     Some(misc::Union::PermissionInfo(p)) => {
                         log::info!(
@@ -2821,13 +2897,23 @@ impl<T: InvokeUiSession> Remote<T> {
         let video_queue = Arc::new(RwLock::new(ArrayQueue::new(client::VIDEO_QUEUE_SIZE)));
         let (video_sender, video_receiver) = std::sync::mpsc::channel::<MediaData>();
         let decode_fps = Arc::new(RwLock::new(None));
+        let decoder_backend = Arc::new(RwLock::new(None));
+        let renderer = Arc::new(RwLock::new(None));
+        let frame_resolution = Arc::new(RwLock::new(None));
         let frame_count = Arc::new(RwLock::new(0));
         let discard_queue = Arc::new(RwLock::new(false));
+        let video_feedback = Arc::new(std::sync::Mutex::new(
+            client::VideoFeedbackTracker::default(),
+        ));
         let video_thread = VideoThread {
             video_queue: video_queue.clone(),
             video_sender,
             decode_fps: decode_fps.clone(),
+            decoder_backend: decoder_backend.clone(),
+            renderer: renderer.clone(),
+            frame_resolution: frame_resolution.clone(),
             frame_count: frame_count.clone(),
+            video_feedback: video_feedback.clone(),
             fps_control: Default::default(),
             discard_queue: discard_queue.clone(),
         };
@@ -2838,8 +2924,12 @@ impl<T: InvokeUiSession> Remote<T> {
             video_receiver,
             video_queue,
             decode_fps,
+            decoder_backend,
+            renderer,
+            frame_resolution,
             self.chroma.clone(),
             discard_queue,
+            video_feedback,
             move |display: usize,
                   data: &mut scrap::ImageRgb,
                   _texture: *mut c_void,
@@ -2931,7 +3021,11 @@ struct VideoThread {
     video_queue: Arc<RwLock<ArrayQueue<VideoFrame>>>,
     video_sender: MediaSender,
     decode_fps: Arc<RwLock<Option<usize>>>,
+    decoder_backend: Arc<RwLock<Option<&'static str>>>,
+    renderer: Arc<RwLock<Option<&'static str>>>,
+    frame_resolution: Arc<RwLock<Option<(usize, usize)>>>,
     frame_count: Arc<RwLock<usize>>,
+    video_feedback: Arc<std::sync::Mutex<client::VideoFeedbackTracker>>,
     discard_queue: Arc<RwLock<bool>>,
     fps_control: FpsControl,
 }

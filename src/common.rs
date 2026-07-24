@@ -1,10 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     future::Future,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex, RwLock},
     task::Poll,
 };
+
+#[cfg(not(target_os = "ios"))]
+use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 
@@ -1161,6 +1164,7 @@ pub struct NetworkModeInfo {
     pub trust_phrase: String,
     pub direct_endpoints: Vec<String>,
     pub pairing_required: bool,
+    pub known_contacts_only: bool,
 }
 
 const TRUST_PHRASE_WORDS: [&str; 64] = [
@@ -1225,6 +1229,7 @@ pub fn get_network_mode_info() -> NetworkModeInfo {
     let trust_phrase = fingerprint_to_trust_phrase(&crate::ui_interface::get_fingerprint());
     let direct_endpoints = get_direct_access_endpoints();
     let pairing_required = has_effective_direct_access_pairing_passphrase();
+    let known_contacts_only = !allow_unverified_peer_trust() && !pairing_required;
     let detail = if !rendezvous_server.is_empty() {
         rendezvous_server
     } else if !relay_server.is_empty() {
@@ -1241,6 +1246,7 @@ pub fn get_network_mode_info() -> NetworkModeInfo {
             trust_phrase,
             direct_endpoints,
             pairing_required,
+            known_contacts_only,
         }
     } else if has_remote {
         NetworkModeInfo {
@@ -1250,6 +1256,7 @@ pub fn get_network_mode_info() -> NetworkModeInfo {
             trust_phrase,
             direct_endpoints,
             pairing_required,
+            known_contacts_only,
         }
     } else if is_local_network_mode_enabled() {
         NetworkModeInfo {
@@ -1259,6 +1266,7 @@ pub fn get_network_mode_info() -> NetworkModeInfo {
             trust_phrase,
             direct_endpoints,
             pairing_required,
+            known_contacts_only,
         }
     } else {
         NetworkModeInfo {
@@ -1268,6 +1276,7 @@ pub fn get_network_mode_info() -> NetworkModeInfo {
             trust_phrase,
             direct_endpoints,
             pairing_required,
+            known_contacts_only,
         }
     }
 }
@@ -1432,41 +1441,132 @@ pub fn direct_access_endpoint_for_peer_ip(endpoints: &[String], peer_ip: IpAddr)
     })
 }
 
+#[cfg(not(target_os = "ios"))]
+fn direct_access_endpoints_from_ips(
+    ips: impl IntoIterator<Item = IpAddr>,
+    port: i32,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    ips.into_iter()
+        .filter(|ip| is_usable_direct_access_ip(*ip))
+        .filter_map(|ip| {
+            let endpoint = format_direct_access_endpoint(ip, port);
+            seen.insert(endpoint.clone()).then_some(endpoint)
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn get_windows_direct_access_ips() -> Vec<IpAddr> {
+    use std::mem::size_of;
+    use windows::Win32::{
+        Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR},
+        NetworkManagement::IpHelper::{
+            GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+            GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+        },
+        Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6},
+    };
+
+    const INITIAL_BUFFER_BYTES: usize = 15 * 1024;
+    const MAX_TRIES: usize = 3;
+
+    let words_for_bytes = |bytes: usize| bytes.div_ceil(size_of::<usize>());
+    let mut storage = vec![0usize; words_for_bytes(INITIAL_BUFFER_BYTES)];
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+
+    for _ in 0..MAX_TRIES {
+        let mut size = (storage.len() * size_of::<usize>()) as u32;
+        let result = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC.0 as u32,
+                flags,
+                None,
+                Some(storage.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
+                &mut size,
+            )
+        };
+        if result == ERROR_BUFFER_OVERFLOW.0 {
+            storage.resize(words_for_bytes(size as usize), 0);
+            continue;
+        }
+        if result != NO_ERROR.0 {
+            log::warn!("GetAdaptersAddresses failed with error {}", result);
+            return Vec::new();
+        }
+
+        let mut ips = Vec::new();
+        let mut adapter = storage.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        while let Some(current_adapter) = unsafe { adapter.as_ref() } {
+            let mut unicast = current_adapter.FirstUnicastAddress;
+            while let Some(current_unicast) = unsafe { unicast.as_ref() } {
+                let sockaddr_ptr = current_unicast.Address.lpSockaddr;
+                if let Some(sockaddr) = unsafe { sockaddr_ptr.as_ref() } {
+                    if sockaddr.sa_family == AF_INET {
+                        let addr = unsafe { &*sockaddr_ptr.cast::<SOCKADDR_IN>() };
+                        let octets = unsafe { addr.sin_addr.S_un.S_addr }.to_ne_bytes();
+                        ips.push(IpAddr::V4(octets.into()));
+                    } else if sockaddr.sa_family == AF_INET6 {
+                        let addr = unsafe { &*sockaddr_ptr.cast::<SOCKADDR_IN6>() };
+                        let octets = unsafe { addr.sin6_addr.u.Byte };
+                        ips.push(IpAddr::V6(octets.into()));
+                    }
+                }
+                unicast = current_unicast.Next;
+            }
+            adapter = current_adapter.Next;
+        }
+        return ips;
+    }
+
+    log::warn!("GetAdaptersAddresses buffer changed too often");
+    Vec::new()
+}
+
 pub fn get_direct_access_endpoints() -> Vec<String> {
     if !is_local_network_mode_enabled() {
         return Vec::new();
     }
     let port = get_direct_access_port();
-    let default_name = default_net::interface::get_default_interface_name();
-    let mut interfaces = default_net::get_interfaces();
-    if let Some(default_name) = default_name {
-        interfaces.sort_by_key(|iface| iface.name != default_name);
+    #[cfg(target_os = "ios")]
+    {
+        return vec![format!("{}:{}", hostname(), port)];
     }
-    let mut seen = HashSet::new();
-    let mut endpoints = Vec::new();
-    for iface in interfaces {
-        if iface.if_type == default_net::interface::InterfaceType::Loopback {
-            continue;
-        }
-        for ip in iface
-            .ipv4
-            .iter()
-            .map(|net| IpAddr::V4(net.addr))
-            .chain(iface.ipv6.iter().map(|net| IpAddr::V6(net.addr)))
-        {
-            if !is_usable_direct_access_ip(ip) {
-                continue;
-            }
-            let endpoint = format_direct_access_endpoint(ip, port);
-            if seen.insert(endpoint.clone()) {
-                endpoints.push(endpoint);
-            }
+    #[cfg(windows)]
+    {
+        let endpoints = direct_access_endpoints_from_ips(get_windows_direct_access_ips(), port);
+        if endpoints.is_empty() {
+            vec![format!("{}:{}", hostname(), port)]
+        } else {
+            endpoints
         }
     }
-    if endpoints.is_empty() {
-        endpoints.push(format!("{}:{}", hostname(), port));
+    #[cfg(not(any(target_os = "ios", windows)))]
+    {
+        let default_name = default_net::interface::get_default_interface_name();
+        let mut interfaces = default_net::get_interfaces();
+        if let Some(default_name) = default_name {
+            interfaces.sort_by_key(|iface| iface.name != default_name);
+        }
+        let endpoints = direct_access_endpoints_from_ips(
+            interfaces
+                .into_iter()
+                .filter(|iface| iface.if_type != default_net::interface::InterfaceType::Loopback)
+                .flat_map(|iface| {
+                    iface
+                        .ipv4
+                        .into_iter()
+                        .map(|net| IpAddr::V4(net.addr))
+                        .chain(iface.ipv6.into_iter().map(|net| IpAddr::V6(net.addr)))
+                }),
+            port,
+        );
+        if endpoints.is_empty() {
+            vec![format!("{}:{}", hostname(), port)]
+        } else {
+            endpoints
+        }
     }
-    endpoints
 }
 
 fn get_api_server_(api: String, custom: String) -> String {
@@ -5161,6 +5261,27 @@ mod tests {
         assert_eq!(
             format_direct_access_endpoint(IpAddr::V6("fd00::5".parse().unwrap()), 21118),
             "[fd00::5]:21118"
+        );
+    }
+
+    #[test]
+    fn test_direct_access_endpoints_from_ips_filters_and_deduplicates() {
+        let endpoints = direct_access_endpoints_from_ips(
+            [
+                "192.168.1.10".parse().unwrap(),
+                "169.254.1.10".parse().unwrap(),
+                "192.168.1.10".parse().unwrap(),
+                "fd00::10".parse().unwrap(),
+                "fe80::10".parse().unwrap(),
+            ],
+            21118,
+        );
+        assert_eq!(
+            endpoints,
+            vec![
+                "192.168.1.10:21118".to_owned(),
+                "[fd00::10]:21118".to_owned()
+            ]
         );
     }
 

@@ -47,12 +47,14 @@ class TRadioMenu<T> {
   final T value;
   final T groupValue;
   final ValueChanged<T?>? onChanged;
+  final bool enabled;
 
   TRadioMenu(
       {required this.child,
       required this.value,
       required this.groupValue,
-      required this.onChanged});
+      required this.onChanged,
+      this.enabled = true});
 }
 
 class TToggleMenu {
@@ -476,23 +478,26 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
   final groupValue = await bind.sessionGetOption(
           sessionId: sessionId, arg: kOptionCodecPreference) ??
       '';
-  final List<bool> codecs = [];
+  bool vp8 = false;
+  bool av1 = false;
+  bool av1Hw = false;
+  bool h264 = false;
+  bool h265 = false;
+  bool h264Hq = false;
+  bool h265Hq = false;
   try {
     final Map codecsJson = jsonDecode(alternativeCodecs);
-    final vp8 = codecsJson['vp8'] ?? false;
-    final av1 = codecsJson['av1'] ?? false;
-    final h264 = codecsJson['h264'] ?? false;
-    final h265 = codecsJson['h265'] ?? false;
-    codecs.add(vp8);
-    codecs.add(av1);
-    codecs.add(h264);
-    codecs.add(h265);
+    vp8 = codecsJson['vp8'] ?? false;
+    av1 = codecsJson['av1'] ?? false;
+    av1Hw = codecsJson['av1Hw'] ?? false;
+    h264 = codecsJson['h264'] ?? false;
+    h265 = codecsJson['h265'] ?? false;
+    h264Hq = codecsJson['h264Hq'] ?? false;
+    h265Hq = codecsJson['h265Hq'] ?? false;
   } catch (e) {
     debugPrint("Show Codec Preference err=$e");
   }
-  final visible =
-      codecs.length == 4 && (codecs[0] || codecs[1] || codecs[2] || codecs[3]);
-  if (!visible) return [];
+
   onChanged(String? value) async {
     if (value == null) return;
     await bind.sessionPeerOption(
@@ -500,12 +505,22 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
     bind.sessionChangePreferCodec(sessionId: sessionId);
   }
 
+  Widget codecLabel(String label, bool enabled) {
+    return Text(
+      label,
+      style: TextStyle(color: enabled ? null : Theme.of(context).disabledColor),
+    );
+  }
+
   TRadioMenu<String> radio(String label, String value, bool enabled) {
     return TRadioMenu<String>(
-        child: Text(label),
+        child: codecLabel(label, enabled),
         value: value,
         groupValue: groupValue,
-        onChanged: enabled ? onChanged : null);
+        enabled: enabled,
+        onChanged: enabled
+            ? onChanged
+            : (_) => showCodecUnavailableDialog(ffi.dialogManager, label));
   }
 
   var autoLabel = translate('Auto');
@@ -515,11 +530,14 @@ Future<List<TRadioMenu<String>>> toolbarCodec(
   }
   return [
     radio(autoLabel, 'auto', true),
-    if (codecs[0]) radio('VP8', 'vp8', codecs[0]),
+    radio('VP8', 'vp8', vp8),
     radio('VP9', 'vp9', true),
-    if (codecs[1]) radio('AV1', 'av1', codecs[1]),
-    if (codecs[2]) radio('H264', 'h264', codecs[2]),
-    if (codecs[3]) radio('H265', 'h265', codecs[3]),
+    radio('AV1', 'av1', av1),
+    radio('AV1 HW', 'av1-hw', av1Hw),
+    radio('H264', 'h264', h264),
+    radio('H264 HQ', 'h264-hq', h264Hq),
+    radio('H265', 'h265', h265),
+    radio('H265 HQ', 'h265-hq', h265Hq),
   ];
 }
 
@@ -556,8 +574,8 @@ Future<List<TRadioMenu<String>>> toolbarCaptureBackend(FFI ffi) async {
 
   var autoLabel = translate('Auto');
   if (groupValue == 'auto' &&
-      ffi.qualityMonitorModel.data.hostVideoBackend != null) {
-    autoLabel = '$autoLabel (${ffi.qualityMonitorModel.data.hostVideoBackend})';
+      ffi.qualityMonitorModel.data.captureBackend != null) {
+    autoLabel = '$autoLabel (${ffi.qualityMonitorModel.data.captureBackend})';
   }
   return [
     radio(autoLabel, 'auto'),
@@ -839,6 +857,7 @@ Future<List<TRadioMenu<String>>> toolbarQualityMonitorPosition(FFI ffi) async {
           sessionId: sessionId,
           name: kOptionQualityMonitorPosition,
           value: normalizeQualityMonitorPosition(value));
+      await ffi.qualityMonitorModel.clearFloatingPosition(sessionId);
       if (!showQualityMonitor) {
         await bind.sessionToggleOption(
             sessionId: sessionId, value: 'show-quality-monitor');
@@ -869,23 +888,36 @@ Future<List<TRadioMenu<String>>> toolbarQualityMonitorPosition(FFI ffi) async {
   ];
 }
 
-Future<TToggleMenu> toolbarQualityMonitorDebugMode(FFI ffi) async {
+Future<List<TRadioMenu<String>>> toolbarQualityMonitorDetails(FFI ffi) async {
   final sessionId = ffi.sessionId;
-  final debugMode = (await bind.sessionGetOption(
-          sessionId: sessionId, arg: kOptionQualityMonitorDebugMode)) ==
-      'Y';
-  return TToggleMenu(
-    value: debugMode,
-    onChanged: (value) async {
-      if (value == null) return;
-      await bind.sessionPeerOption(
-          sessionId: sessionId,
-          name: kOptionQualityMonitorDebugMode,
-          value: value ? 'Y' : 'N');
-      ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
-    },
-    child: Text(translate('Debug mode')),
-  );
+  final details = normalizeQualityMonitorDetails(await bind.sessionGetOption(
+          sessionId: sessionId, arg: kOptionQualityMonitorDetails) ??
+      '');
+
+  Future<void> onChanged(String? value) async {
+    if (value == null || value == details) return;
+    await bind.sessionPeerOption(
+        sessionId: sessionId,
+        name: kOptionQualityMonitorDetails,
+        value: normalizeQualityMonitorDetails(value));
+    ffi.qualityMonitorModel.checkShowQualityMonitor(sessionId);
+  }
+
+  TRadioMenu<String> item(String value, String label) {
+    return TRadioMenu<String>(
+      value: value,
+      groupValue: details,
+      onChanged: onChanged,
+      child: Text(translate(label)),
+    );
+  }
+
+  return [
+    item(kQualityMonitorDetailsBasic,
+        qualityMonitorDetailsLabel(kQualityMonitorDetailsBasic)),
+    item(kQualityMonitorDetailsExtended,
+        qualityMonitorDetailsLabel(kQualityMonitorDetailsExtended)),
+  ];
 }
 
 Future<List<TRadioMenu<String>>> toolbarClipboardDirection(FFI ffi) async {

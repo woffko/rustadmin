@@ -437,6 +437,8 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'connection_ready') {
         setConnectionType(peerId, evt['secure'] == 'true',
             evt['direct'] == 'true', evt['stream_type'] ?? '');
+        parent.target?.qualityMonitorModel
+            .updateConnectionInfo(evt['stream_type'], evt['direct']);
       } else if (name == 'switch_display') {
         // switch display is kept for backward compatibility
         handleSwitchDisplay(evt, sessionId, peerId);
@@ -603,7 +605,7 @@ class FfiModel with ChangeNotifier {
         close();
         Future.delayed(Duration.zero, () async {
           final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-          String? outputFile = await FilePicker.platform.saveFile(
+          String? outputFile = await FilePicker.saveFile(
             dialogTitle: '${translate('Save as')}...',
             fileName: 'screenshot_$ts.png',
             allowedExtensions: ['png'],
@@ -1103,13 +1105,7 @@ class FfiModel with ChangeNotifier {
     final fingerprint = (details['fingerprint'] ?? '').toString();
     final trustPhrase = (details['trust_phrase'] ?? '').toString();
     final direct = details['direct'] == true;
-    final allowUnverifiedPeerTrust =
-        details['allow_unverified_peer_trust'] == true;
-    final mustEnableUnverifiedPeerTrust = !allowUnverifiedPeerTrust;
     final controller = TextEditingController();
-    var enableUnverifiedPeerTrust = !mustEnableUnverifiedPeerTrust;
-    var enablingUnverifiedPeerTrust = false;
-    var enableUnverifiedPeerTrustError = '';
     String normalizePhrase(String value) =>
         value.trim().toLowerCase().split(RegExp(r'\s+')).join(' ');
     final normalizedTrustPhrase = normalizePhrase(trustPhrase);
@@ -1131,24 +1127,6 @@ class FfiModel with ChangeNotifier {
 
         void approve() {
           () async {
-            if (mustEnableUnverifiedPeerTrust &&
-                !mainGetBoolOptionSync(kOptionAllowUnverifiedPeerTrust)) {
-              setState(() {
-                enablingUnverifiedPeerTrust = true;
-                enableUnverifiedPeerTrustError = '';
-              });
-              await mainSetBoolOption(kOptionAllowUnverifiedPeerTrust, true);
-              final enabled =
-                  mainGetBoolOptionSync(kOptionAllowUnverifiedPeerTrust);
-              if (!enabled) {
-                setState(() {
-                  enablingUnverifiedPeerTrust = false;
-                  enableUnverifiedPeerTrustError =
-                      'Could not enable Allow unverified peer trust. Check administrator privileges or policy.';
-                });
-                return;
-              }
-            }
             await bind.sessionConfirmDirectTrust(
                 sessionId: sessionId, approved: true);
             close();
@@ -1212,30 +1190,6 @@ class FfiModel with ChangeNotifier {
                   'The trust information from the remote side is missing or invalid. Reject this connection.',
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ).marginOnly(bottom: 12),
-              if (mustEnableUnverifiedPeerTrust)
-                CheckboxListTile(
-                  contentPadding: EdgeInsets.zero,
-                  visualDensity: VisualDensity.compact,
-                  controlAffinity: ListTileControlAffinity.leading,
-                  value: enableUnverifiedPeerTrust,
-                  onChanged: enablingUnverifiedPeerTrust
-                      ? null
-                      : (value) {
-                          setState(() {
-                            enableUnverifiedPeerTrust = value == true;
-                            enableUnverifiedPeerTrustError = '';
-                          });
-                        },
-                  title: Text(translate('Allow unverified peer trust')),
-                  subtitle: const Text(
-                    'This enables first-contact trust-on-use for this pairing path before the device key is saved.',
-                  ),
-                ),
-              if (enableUnverifiedPeerTrustError.isNotEmpty)
-                Text(
-                  enableUnverifiedPeerTrustError,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ).marginOnly(bottom: 12),
               TextField(
                 controller: controller,
                 autofocus: true,
@@ -1249,13 +1203,7 @@ class FfiModel with ChangeNotifier {
           ),
           actions: [
             dialogButton('Reject', onPressed: reject, isOutline: true),
-            dialogButton(
-                mustEnableUnverifiedPeerTrust ? 'Enable & Trust' : 'Trust',
-                onPressed: phraseConfirmed &&
-                        enableUnverifiedPeerTrust &&
-                        !enablingUnverifiedPeerTrust
-                    ? approve
-                    : null),
+            dialogButton('Trust', onPressed: phraseConfirmed ? approve : null),
           ],
           onCancel: reject,
         );
@@ -1367,6 +1315,7 @@ class FfiModel with ChangeNotifier {
                 obscureText: obscure,
                 autocorrect: false,
                 maxLength: bind.mainMaxEncryptLen(),
+                selectAllOnFocus: false,
                 onChanged: (_) => setState(() {}),
                 decoration: InputDecoration(
                   labelText: direct
@@ -4127,33 +4076,41 @@ class QualityMonitorData {
   String? targetBitrate;
   String? codecFormat;
   String? chroma;
-  String? codecPath;
-  String? renderPath;
-  String? frameResolution;
-  String? queueLen;
-  String? decodeFps;
-  String? autoFps;
-  String? fpsMode;
-  String? direct;
-  String? mediacodecInputQueueMs;
-  String? mediacodecOutputDequeueMs;
-  String? yuvToRgbaMs;
-  String? mediacodecDecodeMs;
-  String? handleFrameMs;
-  String? flutterHandoffMs;
-  String? endToEndMs;
-  String? rgbaBytes;
-  String? rgbaReallocated;
-  String? outputBufferBytes;
-  String? mediaFormat;
-  String? hostVideoFps;
-  String? hostVideoCodec;
-  String? hostVideoQos;
-  String? hostVideoWait;
-  String? hostVideoBackend;
-  String? hostVideoFallback;
+  String? connectionType;
   String? hostVersion;
   String? clientVersion;
+  String? decoder;
+  String? renderer;
+  String? captureBackend;
+  String? captureFrame;
+  String? encoderBackend;
+  String? encoderInput;
+  String? frameResolution;
+  String? decodeFps;
+  String? videoQueue;
+  String? videoThreads;
+  String? textureRender;
+  String? direct;
+  String? fpsMode;
+  String? autoFps;
+  String? videoProgress;
+  String? videoDropped;
+  String? videoDecodeTimeUs;
+  String? videoRenderSubmitTimeUs;
+  String? videoFeedbackQueue;
+  String? videoDeliveryPhase;
+  String? videoRecoveryCount;
+  String? videoStallMs;
+
+  String? get codecLabel {
+    final codec = codecFormat;
+    if ((codec == 'H264' || codec == 'H265') &&
+        (encoderBackend == 'Hardware NVIDIA NVENC p5 via FFmpeg' ||
+            encoderBackend == 'Hardware VideoToolbox HQ via FFmpeg')) {
+      return '$codec HQ';
+    }
+    return codec;
+  }
 }
 
 class QualityMonitorModel with ChangeNotifier {
@@ -4162,42 +4119,141 @@ class QualityMonitorModel with ChangeNotifier {
   QualityMonitorModel(this.parent);
   var _show = false;
   var _position = kQualityMonitorPositionTopRight;
-  var _debugMode = false;
+  var _details = kQualityMonitorDetailsBasic;
+  Offset? _floatingPosition;
+  Timer? _floatingPositionStoreTimer;
+  SessionID? _sessionId;
   final _data = QualityMonitorData();
-  DateTime? _lastPipelineUpdate;
 
   bool get show => _show;
   String get position => _position;
-  bool get debugMode => _debugMode;
+  String get details => _details;
+  bool get extendedDetails => _details == kQualityMonitorDetailsExtended;
+  Offset? get floatingPosition => _floatingPosition;
   QualityMonitorData get data => _data;
 
-  Future<bool> _refreshVersionInfo() async {
-    var changed = false;
-    final hostVersion = parent.target?.ffiModel.pi.fullVersion;
-    if (hostVersion != null &&
-        hostVersion.isNotEmpty &&
-        _data.hostVersion != hostVersion) {
-      _data.hostVersion = hostVersion;
-      changed = true;
-    }
+  Future<void> setDetails(String value) async {
+    final details = normalizeQualityMonitorDetails(value);
+    if (_details == details) return;
+    final sessionId = parent.target?.sessionId;
+    if (sessionId == null) return;
+    _details = details;
+    notifyListeners();
+    await bind.sessionPeerOption(
+        sessionId: sessionId,
+        name: kOptionQualityMonitorDetails,
+        value: details);
+  }
 
-    var clientVersion = '';
+  String? _directLabel(dynamic direct) {
+    if (direct == null) return null;
+    if (direct is bool) return direct ? 'yes' : 'no';
+    final value = direct.toString();
+    if (value.isEmpty) return null;
+    return value == 'true' ? 'yes' : 'no';
+  }
+
+  Future<String?> _clientVersion() async {
+    var value = '';
     try {
-      clientVersion = await bind.mainGetVersion();
+      value = await bind.mainGetVersion();
     } catch (_) {
       //
     }
-    if (clientVersion.isEmpty) {
-      clientVersion = version;
+    if (value.isEmpty) {
+      value = version;
     }
-    if (clientVersion.isNotEmpty && _data.clientVersion != clientVersion) {
-      _data.clientVersion = clientVersion;
-      changed = true;
+    return value.isEmpty ? null : value;
+  }
+
+  String? _hostVersion() {
+    final value = parent.target?.ffiModel.pi.fullVersion;
+    return value == null || value.isEmpty ? null : value;
+  }
+
+  bool _resetDataForSession(SessionID sessionId) {
+    if (_sessionId == sessionId) return false;
+    _sessionId = sessionId;
+    _data.speed = null;
+    _data.fps = null;
+    _data.delay = null;
+    _data.targetBitrate = null;
+    _data.codecFormat = null;
+    _data.chroma = null;
+    _data.connectionType = null;
+    _data.hostVersion = null;
+    _data.clientVersion = null;
+    _data.decoder = null;
+    _data.renderer = null;
+    _data.captureBackend = null;
+    _data.captureFrame = null;
+    _data.encoderBackend = null;
+    _data.encoderInput = null;
+    _data.frameResolution = null;
+    _data.decodeFps = null;
+    _data.videoQueue = null;
+    _data.videoThreads = null;
+    _data.textureRender = null;
+    _data.direct = null;
+    _data.fpsMode = null;
+    _data.autoFps = null;
+    _data.videoProgress = null;
+    _data.videoDropped = null;
+    _data.videoDecodeTimeUs = null;
+    _data.videoRenderSubmitTimeUs = null;
+    _data.videoFeedbackQueue = null;
+    _data.videoDeliveryPhase = null;
+    _data.videoRecoveryCount = null;
+    _data.videoStallMs = null;
+    return true;
+  }
+
+  updateConnectionInfo(dynamic streamType, [dynamic direct]) {
+    final value = streamType?.toString();
+    final connectionType = value == null || value.isEmpty ? null : value;
+    final directLabel = _directLabel(direct);
+    if (_data.connectionType == connectionType && _data.direct == directLabel) {
+      return;
     }
-    return changed;
+    _data.connectionType = connectionType;
+    _data.direct = directLabel;
+    notifyListeners();
+  }
+
+  Future<void> clearFloatingPosition(SessionID sessionId) async {
+    _floatingPositionStoreTimer?.cancel();
+    _floatingPositionStoreTimer = null;
+    if (_floatingPosition == null) {
+      return;
+    }
+    _floatingPosition = null;
+    await bind.sessionPeerOption(
+        sessionId: sessionId,
+        name: kOptionQualityMonitorFloatingPosition,
+        value: '');
+    notifyListeners();
+  }
+
+  void updateFloatingPosition(Offset position) {
+    final sessionId = parent.target?.sessionId;
+    if (sessionId == null) return;
+    final rounded =
+        Offset(position.dx.roundToDouble(), position.dy.roundToDouble());
+    if (_floatingPosition == rounded) return;
+    _floatingPosition = rounded;
+    notifyListeners();
+    _floatingPositionStoreTimer?.cancel();
+    _floatingPositionStoreTimer =
+        Timer(const Duration(milliseconds: 300), () {
+      bind.sessionPeerOption(
+          sessionId: sessionId,
+          name: kOptionQualityMonitorFloatingPosition,
+          value: _formatFloatingPosition(rounded));
+    });
   }
 
   checkShowQualityMonitor(SessionID sessionId) async {
+    final dataReset = _resetDataForSession(sessionId);
     final show = await bind.sessionGetToggleOption(
             sessionId: sessionId, arg: 'show-quality-monitor') ==
         true;
@@ -4205,42 +4261,78 @@ class QualityMonitorModel with ChangeNotifier {
         await bind.sessionGetOption(
                 sessionId: sessionId, arg: kOptionQualityMonitorPosition) ??
             '');
-    final debugMode = (await bind.sessionGetOption(
-            sessionId: sessionId, arg: kOptionQualityMonitorDebugMode)) ==
-        'Y';
-    var changed = false;
-    if (_show != show || _position != position || _debugMode != debugMode) {
+    final details = normalizeQualityMonitorDetails(
+        await bind.sessionGetOption(
+                sessionId: sessionId, arg: kOptionQualityMonitorDetails) ??
+            '');
+    final floatingPosition = _parseFloatingPosition(
+        await bind.sessionGetOption(
+                sessionId: sessionId,
+                arg: kOptionQualityMonitorFloatingPosition) ??
+            '');
+    final hostVersion = _hostVersion();
+    final clientVersion = await _clientVersion();
+    if (_show != show ||
+        _position != position ||
+        _details != details ||
+        _floatingPosition != floatingPosition ||
+        _data.hostVersion != hostVersion ||
+        _data.clientVersion != clientVersion ||
+        dataReset) {
       _show = show;
       _position = position;
-      _debugMode = debugMode;
-      changed = true;
-    }
-    if (show) {
-      changed = await _refreshVersionInfo() || changed;
-    }
-    if (changed) {
+      _details = details;
+      _floatingPosition = floatingPosition;
+      _data.hostVersion = hostVersion;
+      _data.clientVersion = clientVersion;
       notifyListeners();
     }
   }
 
-  setDebugMode(bool value) async {
-    final sessionId = parent.target?.sessionId;
-    if (sessionId == null) return;
-    _debugMode = value;
-    notifyListeners();
-    await bind.sessionPeerOption(
-        sessionId: sessionId,
-        name: kOptionQualityMonitorDebugMode,
-        value: value ? 'Y' : 'N');
+  static String _formatFloatingPosition(Offset position) {
+    return '${position.dx.round()},${position.dy.round()}';
+  }
+
+  static Offset? _parseFloatingPosition(String value) {
+    if (value.isEmpty) return null;
+    final parts = value.split(',');
+    if (parts.length != 2) return null;
+    final x = double.tryParse(parts[0]);
+    final y = double.tryParse(parts[1]);
+    if (x == null || y == null) return null;
+    return Offset(x, y);
+  }
+
+  String? _displayMetricFromMap(String value) {
+    if (value.isEmpty) return null;
+    final values = jsonDecode(value) as Map<String, dynamic>;
+    if (values.isEmpty) return null;
+    final pi = parent.target?.ffiModel.pi;
+    if (pi != null) {
+      final currentDisplay = pi.currentDisplay;
+      if (currentDisplay != kAllDisplayValue) {
+        return values[currentDisplay.toString()]?.toString();
+      }
+      if (pi.displays.isNotEmpty) {
+        final displayValues = <String>[];
+        for (var i = 0; i < pi.displays.length; i++) {
+          displayValues.add((values[i.toString()] ?? '-').toString());
+        }
+        return displayValues.join(' ');
+      }
+    }
+    final entries = values.entries.toList()
+      ..sort((a, b) {
+        final aKey = int.tryParse(a.key);
+        final bKey = int.tryParse(b.key);
+        if (aKey != null && bKey != null) return aKey.compareTo(bKey);
+        return a.key.compareTo(b.key);
+      });
+    if (entries.length == 1) return entries.first.value.toString();
+    return entries.map((e) => '${e.key}:${e.value}').join(' ');
   }
 
   updateQualityStatus(Map<String, dynamic> evt) {
-    String? nonEmptyString(String key) {
-      final value = evt[key];
-      if (value is! String || value.isEmpty) return null;
-      return value;
-    }
-
     try {
       if (evt.containsKey('speed') && (evt['speed'] as String).isNotEmpty) {
         _data.speed = evt['speed'];
@@ -4280,68 +4372,122 @@ class QualityMonitorModel with ChangeNotifier {
       if (evt.containsKey('chroma') && (evt['chroma'] as String).isNotEmpty) {
         _data.chroma = evt['chroma'];
       }
-      final hostVersion = parent.target?.ffiModel.pi.fullVersion;
-      if (hostVersion != null && hostVersion.isNotEmpty) {
+      if (evt.containsKey('connection_type') &&
+          (evt['connection_type'] as String).isNotEmpty) {
+        _data.connectionType = evt['connection_type'];
+      }
+      final hostVersion = _hostVersion();
+      if (hostVersion != null) {
         _data.hostVersion = hostVersion;
       }
-      _data.hostVideoFps =
-          nonEmptyString('host_video_fps') ?? _data.hostVideoFps;
-      _data.hostVideoCodec =
-          nonEmptyString('host_video_codec') ?? _data.hostVideoCodec;
-      _data.hostVideoQos =
-          nonEmptyString('host_video_qos') ?? _data.hostVideoQos;
-      _data.hostVideoWait =
-          nonEmptyString('host_video_wait') ?? _data.hostVideoWait;
-      _data.hostVideoBackend =
-          nonEmptyString('host_video_backend') ?? _data.hostVideoBackend;
-      _data.hostVideoFallback =
-          nonEmptyString('host_video_fallback') ?? _data.hostVideoFallback;
-
-      final hasPipelineUpdate =
-          evt.containsKey('codec_path') || evt.containsKey('decode_fps');
-      final now = DateTime.now();
-      final shouldUpdatePipeline = !hasPipelineUpdate ||
-          _lastPipelineUpdate == null ||
-          now.difference(_lastPipelineUpdate!).inMilliseconds >= 1000;
-      if (shouldUpdatePipeline) {
-        if (hasPipelineUpdate) {
-          _lastPipelineUpdate = now;
-        }
-        _data.codecPath = nonEmptyString('codec_path') ?? _data.codecPath;
-        _data.renderPath = nonEmptyString('render_path') ?? _data.renderPath;
+      if ((_data.clientVersion == null || _data.clientVersion!.isEmpty) &&
+          version.isNotEmpty) {
+        _data.clientVersion = version;
+      }
+      if (evt.containsKey('decoder') &&
+          (evt['decoder'] as String).isNotEmpty) {
+        _data.decoder = evt['decoder'];
+      }
+      if (evt.containsKey('renderer') &&
+          (evt['renderer'] as String).isNotEmpty) {
+        _data.renderer = evt['renderer'];
+      }
+      if (evt.containsKey('capture_backend') &&
+          (evt['capture_backend'] as String).isNotEmpty) {
+        _data.captureBackend = evt['capture_backend'];
+      }
+      if (evt.containsKey('capture_frame') &&
+          (evt['capture_frame'] as String).isNotEmpty) {
+        _data.captureFrame = evt['capture_frame'];
+      }
+      if (evt.containsKey('encoder_backend') &&
+          (evt['encoder_backend'] as String).isNotEmpty) {
+        _data.encoderBackend = evt['encoder_backend'];
+      }
+      if (evt.containsKey('encoder_input') &&
+          (evt['encoder_input'] as String).isNotEmpty) {
+        _data.encoderInput = evt['encoder_input'];
+      }
+      if (evt.containsKey('decode_fps')) {
+        _data.decodeFps = _displayMetricFromMap(evt['decode_fps'] as String);
+      }
+      if (evt.containsKey('video_queue')) {
+        _data.videoQueue = _displayMetricFromMap(evt['video_queue'] as String);
+      }
+      if (evt.containsKey('frame_resolution')) {
         _data.frameResolution =
-            nonEmptyString('frame_resolution') ?? _data.frameResolution;
-        _data.queueLen = nonEmptyString('queue_len') ?? _data.queueLen;
-        _data.decodeFps = nonEmptyString('decode_fps') ?? _data.decodeFps;
-        _data.autoFps = nonEmptyString('auto_fps') ?? _data.autoFps;
-        _data.fpsMode = nonEmptyString('fps_mode') ?? _data.fpsMode;
-        _data.direct = nonEmptyString('direct') ?? _data.direct;
-        _data.mediacodecInputQueueMs =
-            nonEmptyString('mediacodec_input_queue_ms') ??
-                _data.mediacodecInputQueueMs;
-        _data.mediacodecOutputDequeueMs =
-            nonEmptyString('mediacodec_output_dequeue_ms') ??
-                _data.mediacodecOutputDequeueMs;
-        _data.yuvToRgbaMs =
-            nonEmptyString('yuv_to_rgba_ms') ?? _data.yuvToRgbaMs;
-        _data.mediacodecDecodeMs =
-            nonEmptyString('mediacodec_decode_ms') ?? _data.mediacodecDecodeMs;
-        _data.handleFrameMs =
-            nonEmptyString('handle_frame_ms') ?? _data.handleFrameMs;
-        _data.flutterHandoffMs =
-            nonEmptyString('flutter_handoff_ms') ?? _data.flutterHandoffMs;
-        _data.endToEndMs = nonEmptyString('end_to_end_ms') ?? _data.endToEndMs;
-        _data.rgbaBytes = nonEmptyString('rgba_bytes') ?? _data.rgbaBytes;
-        _data.rgbaReallocated =
-            nonEmptyString('rgba_reallocated') ?? _data.rgbaReallocated;
-        _data.outputBufferBytes =
-            nonEmptyString('output_buffer_bytes') ?? _data.outputBufferBytes;
-        _data.mediaFormat = nonEmptyString('media_format') ?? _data.mediaFormat;
+            _displayMetricFromMap(evt['frame_resolution'] as String);
+      }
+      if (evt.containsKey('video_threads') &&
+          (evt['video_threads'] as String).isNotEmpty) {
+        _data.videoThreads = evt['video_threads'];
+      }
+      if (evt.containsKey('texture_render') &&
+          (evt['texture_render'] as String).isNotEmpty) {
+        _data.textureRender =
+            evt['texture_render'] == 'true' ? 'enabled' : 'disabled';
+      }
+      if (evt.containsKey('direct') && (evt['direct'] as String).isNotEmpty) {
+        _data.direct = _directLabel(evt['direct']);
+      }
+      if (evt.containsKey('fps_mode') &&
+          (evt['fps_mode'] as String).isNotEmpty) {
+        _data.fpsMode = evt['fps_mode'];
+      }
+      if (evt.containsKey('auto_fps') &&
+          (evt['auto_fps'] as String).isNotEmpty) {
+        _data.autoFps = evt['auto_fps'];
+      }
+      if (evt.containsKey('video_progress') &&
+          (evt['video_progress'] as String).isNotEmpty) {
+        _data.videoProgress =
+            _displayMetricFromMap(evt['video_progress'] as String);
+      }
+      if (evt.containsKey('video_dropped') &&
+          (evt['video_dropped'] as String).isNotEmpty) {
+        _data.videoDropped =
+            _displayMetricFromMap(evt['video_dropped'] as String);
+      }
+      if (evt.containsKey('video_decode_time_us') &&
+          (evt['video_decode_time_us'] as String).isNotEmpty) {
+        _data.videoDecodeTimeUs =
+            _displayMetricFromMap(evt['video_decode_time_us'] as String);
+      }
+      if (evt.containsKey('video_render_submit_time_us') &&
+          (evt['video_render_submit_time_us'] as String).isNotEmpty) {
+        _data.videoRenderSubmitTimeUs = _displayMetricFromMap(
+            evt['video_render_submit_time_us'] as String);
+      }
+      if (evt.containsKey('video_feedback_queue') &&
+          (evt['video_feedback_queue'] as String).isNotEmpty) {
+        _data.videoFeedbackQueue =
+            _displayMetricFromMap(evt['video_feedback_queue'] as String);
+      }
+      if (evt.containsKey('video_delivery_phase') &&
+          (evt['video_delivery_phase'] as String).isNotEmpty) {
+        final phase = evt['video_delivery_phase'] as String;
+        _data.videoDeliveryPhase = phase.isEmpty
+            ? null
+            : '${phase[0].toUpperCase()}${phase.substring(1)}';
+      }
+      if (evt.containsKey('video_recovery_count') &&
+          (evt['video_recovery_count'] as String).isNotEmpty) {
+        _data.videoRecoveryCount = evt['video_recovery_count'];
+      }
+      if (evt.containsKey('video_stall_ms') &&
+          (evt['video_stall_ms'] as String).isNotEmpty) {
+        _data.videoStallMs = evt['video_stall_ms'];
       }
       notifyListeners();
     } catch (e) {
       //
     }
+  }
+
+  @override
+  void dispose() {
+    _floatingPositionStoreTimer?.cancel();
+    super.dispose();
   }
 }
 

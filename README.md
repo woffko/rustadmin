@@ -48,6 +48,7 @@ RustAdmin currently contains upstream RustDesk code plus fork-specific work in t
 * toolbar auto-hide settings and toolbar behavior prototyping
 * edge-acceleration scrolling and pointer tracking improvements
 * custom scale presets in the desktop toolbar
+* Windows service launch and capture routing compatible with Administrator Protection
 * cross-platform local build wrappers for Linux, Windows, and macOS
 * macOS build, entitlement, and codesigning workflow improvements
 
@@ -148,6 +149,9 @@ Use the serial `cargo test --lib -- --test-threads=1` command for the full
 client library suite; running it in parallel can produce false failures.
 
 Hardware codec and platform-specific features may require additional SDKs, libraries, or driver components.
+
+For Windows capture, input-desktop, portable-elevation, and service-mode
+constraints, see [Windows development notes](docs/WINDOWS_DEVELOPMENT.md).
 
 ## Project structure
 

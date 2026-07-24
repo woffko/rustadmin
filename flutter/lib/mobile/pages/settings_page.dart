@@ -391,6 +391,21 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 });
               },
       ),
+      _getPopupDialogRadioEntry(
+        title: 'Clipboard direction',
+        list: clipboardDirectionMenuKeys()
+            .map((key) => _RadioEntry(clipboardDirectionPolicyLabel(key), key))
+            .toList(),
+        getter: () => normalizeClipboardDirectionPolicy(
+          bind.mainGetOptionSync(key: kOptionClipboardDirection),
+        ),
+        asyncSetter: isOptionFixed(kOptionClipboardDirection)
+            ? null
+            : (value) async {
+                await bind.mainSetOption(
+                    key: kOptionClipboardDirection, value: value);
+              },
+      ),
       SettingsTile.switchTile(
         title: Row(children: [
           Expanded(child: Text(translate('Use IP Whitelisting'))),
@@ -1215,50 +1230,46 @@ void showAbout(OverlayDialogManager dialogManager) {
     final appName = bind.mainGetAppNameSync();
     return CustomAlertDialog(
       title: Text('${translate('About')} $appName'),
-      content: FutureBuilder<String>(
-        future: bind.mainGetVersion(),
-        initialData: version,
-        builder: (context, snapshot) {
-          final appVersion =
-              (snapshot.data != null && snapshot.data!.isNotEmpty)
-                  ? snapshot.data!
-                  : version;
-          return SingleChildScrollView(
-            child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Version: $appVersion'),
-                  Padding(
-                    padding: EdgeInsets.symmetric(vertical: 12),
-                    child: Text(kRustAdminForkSummary),
-                  ),
-                  Text(rustAdminLegalNotice()),
-                  InkWell(
-                      onTap: () async {
-                        await launchUrl(Uri.parse(kRustAdminSourceUrl));
-                      },
-                      child: Padding(
-                        padding: EdgeInsets.only(top: 12, bottom: 8),
-                        child: Text('Source code',
-                            style: TextStyle(
-                              decoration: TextDecoration.underline,
-                            )),
-                      )),
-                  InkWell(
-                      onTap: () async {
-                        await launchUrl(Uri.parse(kRustDeskUpstreamUrl));
-                      },
-                      child: Padding(
-                        padding: EdgeInsets.symmetric(vertical: 8),
-                        child: Text('Upstream project',
-                            style: TextStyle(
-                              decoration: TextDecoration.underline,
-                            )),
-                      )),
-                ]),
-          );
-        },
+      content: SingleChildScrollView(
+        child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              FutureBuilder<String>(
+                  future: bind.mainGetVersion(),
+                  initialData: version,
+                  builder: (context, snapshot) {
+                    final appVersion = (snapshot.data ?? version);
+                    return Text('Version: $appVersion');
+                  }),
+              Padding(
+                padding: EdgeInsets.symmetric(vertical: 12),
+                child: Text(kRustAdminForkSummary),
+              ),
+              Text(rustAdminLegalNotice()),
+              InkWell(
+                  onTap: () async {
+                    await launchUrl(Uri.parse(kRustAdminSourceUrl));
+                  },
+                  child: Padding(
+                    padding: EdgeInsets.only(top: 12, bottom: 8),
+                    child: Text('Source code',
+                        style: TextStyle(
+                          decoration: TextDecoration.underline,
+                        )),
+                  )),
+              InkWell(
+                  onTap: () async {
+                    await launchUrl(Uri.parse(kRustDeskUpstreamUrl));
+                  },
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: Text('Upstream project',
+                        style: TextStyle(
+                          decoration: TextDecoration.underline,
+                        )),
+                  )),
+            ]),
       ),
       actions: [],
     );
@@ -1293,6 +1304,7 @@ class __DisplayPageState extends State<_DisplayPage> {
   @override
   Widget build(BuildContext context) {
     final Map codecsJson = jsonDecode(bind.mainSupportedHwdecodings());
+    final av1 = codecsJson['av1'] ?? false;
     final h264 = codecsJson['h264'] ?? false;
     final h265 = codecsJson['h265'] ?? false;
     var codecList = [
@@ -1300,8 +1312,11 @@ class __DisplayPageState extends State<_DisplayPage> {
       _RadioEntry('VP8', 'vp8'),
       _RadioEntry('VP9', 'vp9'),
       _RadioEntry('AV1', 'av1'),
-      if (h264) _RadioEntry('H264', 'h264'),
-      if (h265) _RadioEntry('H265', 'h265')
+      _RadioEntry('AV1 HW', 'av1-hw', enabled: av1),
+      _RadioEntry('H264', 'h264', enabled: h264),
+      _RadioEntry('H264 HQ', 'h264-hq', enabled: h264),
+      _RadioEntry('H265', 'h265', enabled: h265),
+      _RadioEntry('H265 HQ', 'h265-hq', enabled: h265)
     ];
     RxBool showCustomImageQuality = false.obs;
     return Scaffold(
@@ -1489,7 +1504,8 @@ class __ManagePairedViewersState extends State<_ManagePairedViewers> {
 class _RadioEntry {
   final String label;
   final String value;
-  _RadioEntry(this.label, this.value);
+  final bool enabled;
+  _RadioEntry(this.label, this.value, {this.enabled = true});
 }
 
 typedef _RadioEntryGetter = String Function();
@@ -1523,6 +1539,11 @@ SettingsTile _getPopupDialogRadioEntry({
           ? null
           : (String? value) async {
               if (value == null) return;
+              final entry = list.firstWhereOrNull((e) => e.value == value);
+              if (entry != null && !entry.enabled) {
+                showCodecUnavailableDialog(gFFI.dialogManager, entry.label);
+                return;
+              }
               await asyncSetter(value);
               init();
               if (value != notCloseValue) {
@@ -1534,8 +1555,13 @@ SettingsTile _getPopupDialogRadioEntry({
           content: Obx(
         () => Column(children: [
           ...list
-              .map((e) => getRadio(Text(translate(e.label)), e.value,
-                  groupValue.value, onChanged))
+              .map((e) => getRadio(
+                  Text(translate(e.label),
+                      style: TextStyle(
+                          color: disabledTextColor(context, e.enabled))),
+                  e.value,
+                  groupValue.value,
+                  onChanged))
               .toList(),
           Offstage(
             offstage:

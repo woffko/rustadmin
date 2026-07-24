@@ -112,8 +112,8 @@ impl WakeLock {
                     }
                 };
                 let guard = unsafe {
-                    // SAFETY: `guard` borrows data inside `lock`, and the boxed lock is stored in
-                    // the same struct. Field order drops `_guard` before `_lock`.
+                    // SAFETY: `guard` borrows data inside `lock`, and the boxed lock is
+                    // stored in the same struct. Field order drops `_guard` before `_lock`.
                     std::mem::transmute::<
                         android_wakelock::Guard<'_>,
                         android_wakelock::Guard<'static>,
