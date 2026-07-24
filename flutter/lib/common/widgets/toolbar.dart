@@ -137,6 +137,15 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
       ),
     );
   }
+  // show sign-in
+  if (isDefaultConn &&
+      pi.platform == kPeerPlatformWindows &&
+      perms['keyboard'] != false &&
+      !ffiModel.viewOnly) {
+    v.add(TTextMenu(
+        child: Text(translate('Show sign-in')),
+        onPressed: () => bind.sessionShowSignIn(sessionId: sessionId)));
+  }
   // paste
   if (isDefaultConn &&
       pi.platform != kPeerPlatformAndroid &&

@@ -4134,6 +4134,16 @@ fn activate_os(interface: &impl Interface, send_left_click: bool) {
     */
 }
 
+fn send_show_sign_in_key(interface: &impl Interface) {
+    let mut key_event = KeyEvent::new();
+    key_event.mode = KeyboardMode::Legacy.into();
+    key_event.press = true;
+    key_event.set_control_key(ControlKey::Return);
+    let mut msg_out = Message::new();
+    msg_out.set_key_event(key_event);
+    interface.send(Data::Message(msg_out));
+}
+
 /// Input the OS's password.
 ///
 /// # Arguments
@@ -4144,6 +4154,14 @@ fn activate_os(interface: &impl Interface, send_left_click: bool) {
 pub fn input_os_password(p: String, activate: bool, interface: impl Interface) {
     std::thread::spawn(move || {
         _input_os_password(p, activate, interface);
+    });
+}
+
+pub fn show_sign_in(interface: impl Interface) {
+    std::thread::spawn(move || {
+        activate_os(&interface, false);
+        std::thread::sleep(Duration::from_millis(150));
+        send_show_sign_in_key(&interface);
     });
 }
 

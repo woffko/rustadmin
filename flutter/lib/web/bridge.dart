@@ -526,6 +526,10 @@ class RustadminImpl {
         () => js.context.callMethod('setByName', ['input_os_password', value]));
   }
 
+  Future<void> sessionShowSignIn({required UuidValue sessionId, dynamic hint}) {
+    return Future(() => js.context.callMethod('setByName', ['show_sign_in', '']));
+  }
+
   Future<void> sessionReadRemoteDir(
       {required UuidValue sessionId,
       required String path,

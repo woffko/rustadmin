@@ -899,6 +899,12 @@ pub fn session_input_os_password(session_id: SessionID, value: String) {
     }
 }
 
+pub fn session_show_sign_in(session_id: SessionID) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.show_sign_in();
+    }
+}
+
 // File Action
 pub fn session_read_remote_dir(session_id: SessionID, path: String, include_hidden: bool) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {

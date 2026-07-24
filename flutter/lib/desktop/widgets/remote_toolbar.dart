@@ -408,6 +408,29 @@ EdgeInsets _toolbarItemMargin(
 typedef DismissFunc = void Function();
 
 class RemoteMenuEntry {
+  static MenuEntryButton<String> showSignIn(
+    SessionID sessionId,
+    EdgeInsets? padding, {
+    DismissFunc? dismissFunc,
+    DismissCallback? dismissCallback,
+  }) {
+    return MenuEntryButton<String>(
+      childBuilder: (TextStyle? style) => Text(
+        translate('Show sign-in'),
+        style: style,
+      ),
+      proc: () {
+        bind.sessionShowSignIn(sessionId: sessionId);
+        if (dismissFunc != null) {
+          dismissFunc();
+        }
+      },
+      padding: padding,
+      dismissOnClicked: true,
+      dismissCallback: dismissCallback,
+    );
+  }
+
   static MenuEntryButton<String> insertLock(
     SessionID sessionId,
     EdgeInsets? padding, {
